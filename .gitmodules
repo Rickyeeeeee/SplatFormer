@@ -1,9 +1,9 @@
 [submodule "Pointcept"]
 	path = Pointcept
-	url = git@github.com:ChenYutongTHU/Pointcept.git
+	url = https://github.com/ChenYutongTHU/Pointcept.git
 [submodule "DataGenerator"]
 	path = DataGenerator
-	url = git@github.com:ChenYutongTHU/SplatFormer_DataGenerator.git
+	url = https://github.com/ChenYutongTHU/SplatFormer_DataGenerator.git
 [submodule "SIBR_viewers"]
 	path = SIBR_viewers
 	url = https://gitlab.inria.fr/sibr/sibr_core.git
