@@ -1,4 +1,7 @@
 test-set/
+outputs*/
+data/
+*.pth
 outputs_*/
 # Byte-compiled / optimized / DLL files
 __pycache__/

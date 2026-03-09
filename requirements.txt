@@ -1,3 +1,4 @@
+-f https://data.pyg.org/whl/torch-2.7.1+cu128.html
 torch-geometric
 torch-scatter
 torch-sparse

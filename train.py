@@ -352,7 +352,7 @@ def main(argv):
     os.makedirs(FLAGS.output_dir, exist_ok=True)
     set_seed()
     # 1. Dataloading
-    train_loader = build_trainloader()
+    # train_loader = build_trainloader()
     # 2. Build Model
     model = FeaturePredictor()
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
