@@ -28,6 +28,7 @@ flags.DEFINE_string('wandb_dir', '/cluster/scratch/chenyut/wandb', 'Wandbs Outpu
 flags.DEFINE_boolean('only_eval', False, 'eval or train')
 flags.DEFINE_boolean('compare_with_input', False, 'Compare with input') #for evaluation
 flags.DEFINE_boolean('save_viewer', False, 'Save viewer')
+flags.DEFINE_boolean('save_residuals', False, 'Save per-scene residual tensors and summary stats')
 flags.DEFINE_multi_string(
   'gin_file', None, 'List of paths to the config files.')
 flags.DEFINE_multi_string(
@@ -59,17 +60,41 @@ def make_grid(imgs, nrow=3, ncols=3):
             grid[i*img_h:(i+1)*img_h, j*img_w:(j+1)*img_w] = imgs[i*ncols+j]
     return grid
 
+
+def _to_cpu(data):
+    if torch.is_tensor(data):
+        return data.detach().cpu()
+    if isinstance(data, dict):
+        return {k: _to_cpu(v) for k, v in data.items()}
+    if isinstance(data, list):
+        return [_to_cpu(v) for v in data]
+    if isinstance(data, tuple):
+        return tuple(_to_cpu(v) for v in data)
+    return data
+
+
+def _sanitize_for_filename(value):
+    return str(value).replace('/', '_').replace('\\', '_')
+
+
 @gin.configurable
 def evaluation(model, test_loader, output_dir, output_gt, compare_with_pseudo, 
               compare_with_input=False,
               save_as_single=False,
               save_viewer=False,
-              evaluate_input=False):
+              evaluate_input=False,
+              save_residuals=False):
     model.eval()
     metric_computer = MetricComputer()
+    model_module = model.module if hasattr(model, 'module') else model
+    predicted_keys = list(getattr(model_module, 'output_features', []))
     if compare_with_input:
       metric_computer_input = MetricComputer()
     os.makedirs(output_dir, exist_ok=True)
+    residual_dir = None
+    if save_residuals:
+      residual_dir = os.path.join(output_dir, 'residuals')
+      os.makedirs(residual_dir, exist_ok=True)
     with torch.no_grad():
       cnt = 0
       num_images, num_scenes = 0, 0
@@ -84,14 +109,16 @@ def evaluation(model, test_loader, output_dir, output_gt, compare_with_pseudo,
         forward_kwargs = {'batch_normalized_gs': test_batch_gs, 'batch_scene_idx': test_batch_idx}
 
         out_test_batch_gs = model(**forward_kwargs)
-        for iii, (out_gs, in_gs, cameras, gt_imgs, scene_idx) in enumerate(zip(out_test_batch_gs, test_batch_gs, test_batch_cameras, test_batch_images, test_batch_idx)):
+        for iii, (out_gs, in_gs, cameras, gt_imgs, scene_idx) in enumerate(
+            zip(out_test_batch_gs, test_batch_gs, test_batch_cameras, test_batch_images, test_batch_idx)
+        ):
           if evaluate_input:
             pred_imgs, _ = gs_utils.rasterize_gaussians_to_multiimgs(in_gs, cameras)
           else:
             pred_imgs, _ = gs_utils.rasterize_gaussians_to_multiimgs(out_gs, cameras) # List of torch.tensor([H,W,3])
           pred_imgs = torch.stack(pred_imgs, dim=0) #torch.tensor([N,H,W,3])
           gt_imgs = torch.stack(gt_imgs, dim=0) #torch.tensor([N,H,W,3])
-          
+
           if gt_imgs.shape[-1] == 4:
             # only for real images
             masks = gt_imgs[...,3].unsqueeze(-1)
@@ -107,7 +134,7 @@ def evaluation(model, test_loader, output_dir, output_gt, compare_with_pseudo,
           grid = make_grid(imgs)
           grid = cv2.cvtColor(grid, cv2.COLOR_RGB2BGR)
           cv2.imwrite(os.path.join(output_dir, f'scene{scene_idx}_pred.png'), grid)
-          
+
           if output_gt:
             gt_imgs_ = [im.cpu().numpy().astype(np.uint8) for im in gt_imgs]
             grid = make_grid(gt_imgs_)
@@ -139,16 +166,56 @@ def evaluation(model, test_loader, output_dir, output_gt, compare_with_pseudo,
           if save_as_single:
             output_dir_thisscene_single = os.path.join(output_dir, f'pred/{test_batch_name[iii]}')
             os.makedirs(output_dir_thisscene_single, exist_ok=True)
-            for ii,pred_img in enumerate(pred_imgs):
+            for ii, pred_img in enumerate(pred_imgs):
               pred_img = pred_img.cpu().numpy().astype(np.uint8)
               cv2.imwrite(os.path.join(output_dir_thisscene_single, test_batch_imgname[iii][ii]), pred_img[:,:,::-1])
+
           if save_viewer:
             viewerdir = os.path.join(output_dir, f'viewer/{test_batch_name[iii]}')
             os.makedirs(viewerdir, exist_ok=True)
-            gs_utils.prepare_viewer(cameras, viewerdir, model.module.sh_degree)
+            gs_utils.prepare_viewer(cameras, viewerdir, model_module.sh_degree)
             # Save input 3dgs
             gs_utils.export_ply_forviewer(gs_params=in_gs, filename=os.path.join(viewerdir, 'point_cloud/iteration_0/point_cloud.ply'))
             gs_utils.export_ply_forviewer(gs_params=out_gs, filename=os.path.join(viewerdir, 'point_cloud/iteration_1/point_cloud.ply'))
+
+          if save_residuals:
+            residual_type = 'out_minus_input'
+            residual_keys = [key for key in predicted_keys if key in out_gs and key in in_gs]
+            if len(residual_keys) == 0:
+              residual_keys = sorted([key for key in out_gs.keys() if key in in_gs])
+            residuals = {}
+            residual_stats = {}
+            for key in residual_keys:
+              residual = out_gs[key] - in_gs[key]
+              residuals[key] = residual
+              residual_stats[key] = {
+                  'mean': float(residual.mean().item()),
+                  'abs_mean': float(residual.abs().mean().item()),
+              }
+            scene_name = test_batch_name[iii]
+            scene_stem = f'{int(scene_idx)}_{_sanitize_for_filename(scene_name)}'
+            pt_payload = {
+                'scene_idx': int(scene_idx),
+                'scene_name': scene_name,
+                'residual_type': residual_type,
+                'residual_keys': residual_keys,
+                'residuals': _to_cpu(residuals),
+                'input_gs': _to_cpu(in_gs),
+                'output_gs': _to_cpu(out_gs),
+                'cameras': _to_cpu(cameras),
+            }
+            torch.save(pt_payload, os.path.join(residual_dir, f'{scene_stem}.pt'))
+            stats_payload = {
+                'scene_idx': int(scene_idx),
+                'scene_name': scene_name,
+                'num_gaussians': int(in_gs['means'].shape[0]),
+                'residual_type': residual_type,
+                'residual_keys': residual_keys,
+                'residual_stats': residual_stats,
+            }
+            with open(os.path.join(residual_dir, f'{scene_stem}.json'), 'w') as f:
+              json.dump(stats_payload, f, indent=2)
+
           cnt += 1
           num_images += len(pred_imgs)
       metrics = metric_computer.sum() # We need to sum the metrics
@@ -214,6 +281,8 @@ def training(
     accumulate_step = gin.query_parameter('build_trainloader.accumulate_step')
     if dist.get_rank() == 0:
       logger.info(f'Accumulate step: {accumulate_step}')
+
+    # Training loop
     for step in tqdm(range(resume_from_step*accumulate_step, total_steps*accumulate_step), disable=dist.get_rank()!=0):
       step_consider_accum = step//accumulate_step
       try:
@@ -232,6 +301,7 @@ def training(
 
       loss_dict = {}
       metric_dict = {}
+      # Never happened
       if step_consider_accum < pretrain_steps:
         loss = 0
         for ii, (out_gs, in_gs) in enumerate(zip(out_batch_gs, batch_gs)):
@@ -254,6 +324,7 @@ def training(
         loss = loss/len(out_batch_gs)
         loss_dict['pretrain_loss'] = loss/len(out_batch_gs)
         optimizer, scheduler = optimizer_['pretrain'], scheduler_['pretrain']
+      # 2D supervision
       else:
           loss_dict['image_l1'], metric_dict['train_psnr'] = 0, 0
           if lpips_loss_weight > 0:
@@ -291,10 +362,10 @@ def training(
           optimizer.step()
         optimizer.zero_grad()
         scheduler.step()
-
+      # cache emptying
       if empty_cache_fre > 0 and (step+1) % empty_cache_fre == 0:
         torch.cuda.empty_cache()
-    
+      # logging
       if (step_consider_accum % log_interval == 0) and step%accumulate_step==0:
         for key, value in list(loss_dict.items()) + list(metric_dict.items()):
             torch.distributed.reduce(value, dst=0)
@@ -304,6 +375,8 @@ def training(
               if step_consider_accum % (log_interval*10)==0:
                 logger.info(f'Training-Step {step_consider_accum}: {key}: {value:.3f}')
               wandb.log({'lr': optimizer.param_groups[0]['lr']}, step=step_consider_accum)
+
+      # visualization
       if step_consider_accum % log_image_interval == 0 and step%accumulate_step==0:
         os.makedirs(os.path.join(output_dir, 'train'), exist_ok=True)
         with torch.no_grad():
@@ -314,6 +387,7 @@ def training(
         grid = cv2.cvtColor(grid, cv2.COLOR_RGB2BGR)
         cv2.imwrite(os.path.join(output_dir, f'train/{step_consider_accum:08d}_pred-rank{dist.get_rank()}.png'), grid)
 
+      # evaluation
       if ((step%accumulate_step==0) and ((step_consider_accum % eval_interval == 0) or (step_consider_accum+1)==pretrain_steps)):
         model.eval()
         for test_dataset, test_loader in build_testloader().items():
@@ -325,7 +399,7 @@ def training(
                 metric_str = ' '.join([f'{k}: {v:.4f}' for k,v in metrics.items()])
                 logger.info(f'Test {test_dataset} Step {step_consider_accum}: {metric_str}')
             dist.barrier()
-
+      # Save checkpoint
       if (step%accumulate_step==0) and ((step_consider_accum+1) % save_interval == 0 or (step_consider_accum+1)==pretrain_steps): 
         if dist.get_rank()==0:
             os.makedirs(os.path.join(output_dir, 'checkpoints'), exist_ok=True)
@@ -352,7 +426,7 @@ def main(argv):
     os.makedirs(FLAGS.output_dir, exist_ok=True)
     set_seed()
     # 1. Dataloading
-    # train_loader = build_trainloader()
+    train_loader = build_trainloader()
     # 2. Build Model
     model = FeaturePredictor()
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -395,6 +469,7 @@ def main(argv):
                             compare_with_input=FLAGS.compare_with_input,
                             save_as_single=True,
                             save_viewer=FLAGS.save_viewer,
+                            save_residuals=FLAGS.save_residuals,
                             output_gt=True, compare_with_pseudo=False)
         if dist.get_rank() == 0:
             logger = ProcessSafeLogger(os.path.join(FLAGS.output_dir, FLAGS.eval_subdir, 'eval.log')).get_logger()
