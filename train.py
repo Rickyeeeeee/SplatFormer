@@ -2,14 +2,10 @@ import torch, os
 import torch.nn as nn
 from tqdm import tqdm
 import numpy as np
-import sys
-from torch.optim import SGD
 import wandb, json
-import argparse
 import cv2
 from models.feature_predictor import FeaturePredictor
 
-from collections import OrderedDict
 import random
 import gin 
 from absl import app, flags
@@ -425,8 +421,10 @@ def main(argv):
     gin.parse_config_files_and_bindings(FLAGS.gin_file, FLAGS.gin_param)
     os.makedirs(FLAGS.output_dir, exist_ok=True)
     set_seed()
+
     # 1. Dataloading
     train_loader = build_trainloader()
+
     # 2. Build Model
     model = FeaturePredictor()
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -462,6 +460,7 @@ def main(argv):
         wandb.run.name = '/'.join(FLAGS.output_dir.split('/')[-2:])
       final_step = training(model, optimizer, scheduler, train_loader, output_dir=FLAGS.output_dir)
 
+    # traning
     model.eval()
     for test_dataset, test_loader in build_testloader().items():
         metrics, metrics_input = evaluation(model, test_loader = test_loader, 

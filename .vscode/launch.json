@@ -1,0 +1,28 @@
+{
+    "configurations": [
+        {
+            "name": "Python: Run with args",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/overfit.py",
+            "console": "integratedTerminal",
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "9"
+            },
+            "args": [
+                "--output_dir", "outputs/objaverse_splatformer_overfit/000b76f2b03e44e8ab44e1a1614be0f4",
+                "--scene_name", "000b76f2b03e44e8ab44e1a1614be0f4",
+                "--dataset_type", "splatfacto",
+
+                "--gin_file", "configs/dataset/objaverse.gin",
+                "--gin_file", "configs/model/ptv3.gin",
+                "--gin_file", "configs/train/default.gin",
+
+                "--gin_param", "training.total_steps=200",
+                "--gin_param", "training.save_interval=10",
+                "--gin_param", "training.log_image_interval=10",
+                "--gin_param", "build_trainloader.batch_size=1"
+            ]
+        }
+    ]
+}

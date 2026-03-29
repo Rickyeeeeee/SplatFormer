@@ -94,17 +94,23 @@ class SplatfactoDataset(torch.utils.data.IterableDataset):
         #Generate a new permutation of the folders
         """
         # 1. Split self.folders across processes
+            # Set seed.
         np.random.seed(torch.distributed.get_rank())
         torch.manual_seed(torch.distributed.get_rank())
+
         rng_state = np.random.get_state()
         world_size = torch.cuda.device_count()
         rank = torch.distributed.get_rank()     
+
+            # Temporarily Reseed Start (For global permuation only)
         np.random.seed(self.counter)
-        #Pad to world_size*k
+            # Pad to world_size*k
         permutation = np.random.permutation(len(self.folders))
         pad_num = world_size - len(self.folders)%world_size
         if pad_num > 0 and world_size > 1:
             permutation = np.concatenate([permutation, permutation[:pad_num]])
+            # Temporarily Reseed End
+
         np.random.set_state(rng_state)
 
         chunk_size = len(permutation)//world_size
@@ -116,7 +122,6 @@ class SplatfactoDataset(torch.utils.data.IterableDataset):
         # 2. Split scenes across works
         split_id = self.get_thisworker_split(N=len(remaining_scenes_for_thisprocess))
         self.remaining_scenes = [remaining_scenes_for_thisprocess[i] for i in split_id]
-        worker_info = torch.utils.data.get_worker_info()
         return 
 
     @gin.configurable
@@ -336,6 +341,7 @@ class SplatfactoDataset(torch.utils.data.IterableDataset):
             return scene
 
     def __iter__(self):
+        # Split scenes across workers/processes/ranks/GPUs
         if self.train_or_test == 'train':
             self.refresh_remaining_training()
         if len(self.remaining_scenes) < self.cache_num_scenes:
@@ -351,6 +357,7 @@ class SplatfactoDataset(torch.utils.data.IterableDataset):
 
             total_train_num, total_test_num = len(meta['train_camera_to_worlds']), len(meta['test_camera_to_worlds'])
             cameras = {}
+            # Sample both the trianing and testing set (ID & OOD)
             if self.train_or_test == 'train':
                 sample_test = np.random.rand(self.image_per_scene) < self.sample_ratio_test
                 sample_test_num = min(np.sum(sample_test), total_test_num) #previously here it's max
