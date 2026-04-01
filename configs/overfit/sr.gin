@@ -1,0 +1,63 @@
+set_seed.seed = 42
+total_steps = 200000
+training.total_steps = %total_steps
+training.pretrain_steps = 0
+training.eval_interval = 1000
+training.save_interval = 10000
+training.log_interval = 20
+training.log_image_interval = 1000
+training.grad_clip_norm = 2.0
+training.resume_from_step = 0
+training.enable_amp = True
+training.lpips_loss_weight = 1.0
+training.log_image_interval = 2000
+training.eval_interval = 2000
+training.save_interval = 2000
+
+pretrain/build_optimizer.lr_dict = {
+    "base": 1e-3,
+    "embedding": 1e-3,
+    "backbone": 1e-3,
+    "features_dc": 1e-3,
+    "features_rest": 5e-5,
+    "scales": 1e-3,
+    "opacities": 1e-3,
+    "quats": 1e-3,
+    "means": 1e-3
+}
+pretrain/build_optimizer.optimizer_type = 'adam'
+pretrain/build_optimizer.optimizer_params = {'eps': 1e-15}
+pretrain/build_scheduler.total_step = %total_steps
+pretrain/build_scheduler.schedule = 'constant'
+
+train2D/build_optimizer.lr_dict = {
+    "base": 3e-5,
+    "embedding": 3e-5,
+    "backbone": 3e-5,
+    "features_dc": 3e-5,
+    "features_rest": 1.5e-6,
+    "scales": 3e-5,
+    "opacities": 3e-5,
+    "quats": 3e-5,
+    "means": 3e-5
+}
+train2D/build_optimizer.optimizer_type = 'adam'
+train2D/build_optimizer.optimizer_params = {'eps': 1e-15}
+train2D/build_scheduler.total_step = %total_steps
+train2D/build_scheduler.schedule = 'constant'
+
+SplatFactoMultiLevelDataset.remove_outlier_ndevs = -1
+SplatFactoMultiLevelDataset.image_per_scene = None
+SplatFactoMultiLevelDataset.sample_ratio_test = None
+SplatFactoMultiLevelDataset.max_gs_num = 100000
+SplatFactoMultiLevelDataset.load_pose_src = 'nerfstudio'
+
+train_dataset/SplatFactoMultiLevelDataset.train_or_test = 'train'
+train_dataset/SplatFactoMultiLevelDataset.nerfstudio_folder = '/project/ricky/splatformer-data/overfit-data-128/nerfstudio'
+train_dataset/SplatFactoMultiLevelDataset.colmap_folder = '/project/ricky/splatformer-data/overfit-data-128/colmap'
+train_dataset/SplatFactoMultiLevelDataset.image_per_scene = 128
+train_dataset/SplatFactoMultiLevelDataset.sample_ratio_test = 0.7
+train_dataset/SplatFactoMultiLevelDataset.cache_steps = 1
+train_dataset/SplatFactoMultiLevelDataset.cache_num_scenes = 1
+train_dataset/SplatFactoMultiLevelDataset.split_across_gpus = True
+train_dataset/SplatFactoMultiLevelDataset.factors = [1, 2]

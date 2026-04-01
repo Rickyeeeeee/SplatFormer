@@ -16,19 +16,19 @@ from time import time
 @gin.configurable
 class SplatfactoDataset(torch.utils.data.IterableDataset):
     def __init__(self, 
-                 train_or_test,
-                 nerfstudio_folder,
-                 colmap_folder,
-                 load_pose_src, #[colmap or nerfstudio]
-                 sample_ratio_test: Optional[float],
-                 image_per_scene: Optional[int],
-                 remove_outlier_ndevs: float,
-                 max_gs_num: int,
-                 cache_steps: int,
-                 cache_num_scenes: int, #Default: cache_num_scenes=1, cache_steps=1
-                 split_across_gpus: bool,
-                 background_color: list=[0,0,0],
-                 ):
+        train_or_test,
+        nerfstudio_folder,
+        colmap_folder,
+        load_pose_src, #[colmap or nerfstudio]
+        sample_ratio_test: Optional[float],
+        image_per_scene: Optional[int],
+        remove_outlier_ndevs: float,
+        max_gs_num: int,
+        cache_steps: int,
+        cache_num_scenes: int, #Default: cache_num_scenes=1, cache_steps=1
+        split_across_gpus: bool,
+        background_color: list=[0,0,0],
+        ):
         self.train_or_test = train_or_test
         self.image_per_scene = image_per_scene
         self.sample_ratio_test = sample_ratio_test  

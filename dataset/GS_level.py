@@ -36,7 +36,7 @@ class SplatfactoLevelDataset(torch.utils.data.IterableDataset):
         self.image_per_scene = image_per_scene
         self.sample_ratio_test = sample_ratio_test
         self.level = int(level)
-        self.level_str = f"level-{self.level}"
+        self.level_str = f"df-{self.level}"
         self.images_dirname = "images" if self.level == 1 else f"images_{self.level}"
 
         # Explicitly disable COLMAP camera loading for now (requested behavior).
