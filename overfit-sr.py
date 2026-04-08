@@ -28,7 +28,7 @@ flags.DEFINE_multi_string("gin_param", "", "Newline separated list of Gin parame
 
 FLAGS = flags.FLAGS
 
-INPUT_FACTOR = 2
+INPUT_FACTOR = 4
 TARGET_FACTOR = 1
 
 
@@ -46,13 +46,13 @@ def set_seed(seed):
 @gin.configurable
 def training(
     output_dir=None,
-    total_steps: gin.REQUIRED = gin.REQUIRED,
-    pretrain_steps: gin.REQUIRED = gin.REQUIRED,
-    eval_interval: gin.REQUIRED = gin.REQUIRED,
-    log_interval: gin.REQUIRED = gin.REQUIRED,
-    save_interval: gin.REQUIRED = gin.REQUIRED,
-    log_image_interval: gin.REQUIRED = gin.REQUIRED,
-    grad_clip_norm: gin.REQUIRED = gin.REQUIRED,
+    total_steps = gin.REQUIRED,
+    pretrain_steps = gin.REQUIRED,
+    eval_interval = gin.REQUIRED,
+    log_interval = gin.REQUIRED,
+    save_interval = gin.REQUIRED,
+    log_image_interval = gin.REQUIRED,
+    grad_clip_norm = gin.REQUIRED,
     image_l1_loss_weight=1.0,
     lpips_loss_weight=0.0,
     resume_from_step=0,
@@ -125,7 +125,6 @@ def _find_scene_index(dataset, scene_name):
 
 
 def _build_split_payload(dataset, scene_idx, scene_name, factor_entry, split):
-    del split
     meta = factor_entry["meta"]
     imgs_path = factor_entry["imgs_path"]
     imgs_name = factor_entry["imgs_name"]
@@ -136,11 +135,16 @@ def _build_split_payload(dataset, scene_idx, scene_name, factor_entry, split):
         background = torch.tensor(dataset.background_color, dtype=torch.float32) / 255.0
 
     total_num = len(meta["camera_to_worlds"])
-    if dataset.image_per_scene is None:
-        sample_num = total_num
+    if split == "train":
+        if dataset.image_per_scene is None:
+            sample_num = total_num
+        else:
+            sample_num = min(dataset.image_per_scene, total_num)
+        cam_ids = np.random.permutation(total_num)[:sample_num]
+    elif split == "test":
+        cam_ids = np.arange(total_num)
     else:
-        sample_num = min(dataset.image_per_scene, total_num)
-    cam_ids = np.random.permutation(total_num)[:sample_num]
+        raise ValueError(f"Unsupported split: {split}")
 
     images = [dataset.read_image(imgs_path[i], background=background) for i in cam_ids]
     images_name = [imgs_name[i] for i in cam_ids]
@@ -176,6 +180,8 @@ def evaluate_single_scene(
     eval_cameras,
     image_names,
     output_dir,
+    eval_chunk_size=None,
+    gt_gs=None,
     compare_with_input=False,
     save_viewer=True,
     save_residuals=True,
@@ -186,64 +192,98 @@ def evaluate_single_scene(
     metric_computer_input = MetricComputer() if compare_with_input else None
     predicted_keys = list(getattr(model, "output_features", []))
 
+    device = next(model.parameters()).device
+    num_views = len(eval_images)
+    if num_views == 0:
+        raise ValueError("Evaluation payload has zero views")
+
+    if eval_chunk_size is None or eval_chunk_size <= 0:
+        eval_chunk_size = num_views
+    eval_chunk_size = min(eval_chunk_size, num_views)
+
     os.makedirs(output_dir, exist_ok=True)
     residual_dir = None
     if save_residuals:
         residual_dir = os.path.join(output_dir, "residuals")
         os.makedirs(residual_dir, exist_ok=True)
 
+    pred_single_dir = os.path.join(output_dir, f"pred/{scene_name}")
+    os.makedirs(pred_single_dir, exist_ok=True)
+
+    compare_dir = None
+    if compare_with_input:
+        compare_dir = os.path.join(output_dir, f"compare/{scene_name}")
+        os.makedirs(compare_dir, exist_ok=True)
+
     with torch.no_grad():
         out_gs = model(batch_normalized_gs=[input_gs], batch_scene_idx=[scene_idx])[0]
 
-        pred_imgs, _ = gs_utils.rasterize_gaussians_to_multiimgs(out_gs, eval_cameras)
-        pred_imgs = torch.stack(pred_imgs, dim=0)
-        gt_imgs = torch.stack(eval_images, dim=0)
+        pred_preview = []
+        gt_preview = []
 
-        if gt_imgs.shape[-1] == 4:
-            masks = gt_imgs[..., 3].unsqueeze(-1)
-            pred_imgs = pred_imgs * masks
-            gt_imgs = (gt_imgs[..., :3] * 255).to(torch.uint8)
-            pred_imgs = (pred_imgs * 255).to(torch.uint8)
-        else:
-            masks = None
-            gt_imgs = (gt_imgs * 255).to(torch.uint8)
-            pred_imgs = (pred_imgs * 255).to(torch.uint8)
+        for start in range(0, num_views, eval_chunk_size):
+            end = min(start + eval_chunk_size, num_views)
+            chunk_name = f"{scene_idx}_{start:06d}"
 
-        pred_np = [im.cpu().numpy().astype(np.uint8) for im in pred_imgs]
-        pred_grid = cv2.cvtColor(make_grid(pred_np), cv2.COLOR_RGB2BGR)
-        cv2.imwrite(os.path.join(output_dir, f"scene{scene_idx}_pred.png"), pred_grid)
+            chunk_images = gpu_utils.move_to_device(eval_images[start:end], device)
+            chunk_cameras = {
+                key: (value[start:end] if key == "camera_to_worlds" else value)
+                for key, value in eval_cameras.items()
+            }
+            chunk_cameras = gpu_utils.move_to_device(chunk_cameras, device)
 
-        if output_gt:
-            gt_np = [im.cpu().numpy().astype(np.uint8) for im in gt_imgs]
-            gt_grid = cv2.cvtColor(make_grid(gt_np), cv2.COLOR_RGB2BGR)
-            cv2.imwrite(os.path.join(output_dir, f"scene{scene_idx}_gt.png"), gt_grid)
+            pred_imgs, _ = gs_utils.rasterize_gaussians_to_multiimgs(out_gs, chunk_cameras)
+            pred_imgs = torch.stack(pred_imgs, dim=0)
+            gt_imgs = torch.stack(chunk_images, dim=0)
 
-        metric_computer.update(pred_imgs, gt_imgs, name=f"{scene_idx}")
-
-        pred_single_dir = os.path.join(output_dir, f"pred/{scene_name}")
-        os.makedirs(pred_single_dir, exist_ok=True)
-        for name, pred_img in zip(image_names, pred_imgs):
-            pred_img = pred_img.cpu().numpy().astype(np.uint8)
-            cv2.imwrite(os.path.join(pred_single_dir, name), pred_img[:, :, ::-1])
-
-        if compare_with_input:
-            input_imgs, _ = gs_utils.rasterize_gaussians_to_multiimgs(input_gs, eval_cameras)
-            input_imgs = torch.stack(input_imgs, dim=0)
-            if masks is not None:
-                input_imgs = input_imgs * masks
-                input_imgs = (input_imgs * 255).to(torch.uint8)
+            if gt_imgs.shape[-1] == 4:
+                masks = gt_imgs[..., 3].unsqueeze(-1)
+                pred_imgs = pred_imgs * masks
+                gt_imgs = (gt_imgs[..., :3] * 255).to(torch.uint8)
+                pred_imgs = (pred_imgs * 255).to(torch.uint8)
             else:
-                input_imgs = (input_imgs * 255).to(torch.uint8)
-            metric_computer_input.update(input_imgs, gt_imgs, name=f"{scene_idx}")
+                masks = None
+                gt_imgs = (gt_imgs * 255).to(torch.uint8)
+                pred_imgs = (pred_imgs * 255).to(torch.uint8)
 
-            compare_dir = os.path.join(output_dir, f"compare/{scene_name}")
-            os.makedirs(compare_dir, exist_ok=True)
-            for ii, (gt_img, input_img, pred_img) in enumerate(zip(gt_imgs, input_imgs, pred_imgs)):
-                gt_img = gt_img.cpu().numpy().astype(np.uint8)
-                input_img = input_img.cpu().numpy().astype(np.uint8)
+            preview_slots = 9 - len(pred_preview)
+            if preview_slots > 0:
+                pred_preview.extend([im.cpu().numpy().astype(np.uint8) for im in pred_imgs[:preview_slots]])
+                if output_gt:
+                    gt_preview.extend([im.cpu().numpy().astype(np.uint8) for im in gt_imgs[:preview_slots]])
+
+            metric_computer.update(pred_imgs, gt_imgs, name=chunk_name)
+
+            for name, pred_img in zip(image_names[start:end], pred_imgs):
                 pred_img = pred_img.cpu().numpy().astype(np.uint8)
-                cmp_img = np.concatenate([gt_img, input_img, pred_img], axis=1)
-                cv2.imwrite(os.path.join(compare_dir, f"{ii:02d}.png"), cmp_img[:, :, ::-1])
+                cv2.imwrite(os.path.join(pred_single_dir, name), pred_img[:, :, ::-1])
+
+            if compare_with_input:
+                input_imgs, _ = gs_utils.rasterize_gaussians_to_multiimgs(input_gs, chunk_cameras)
+                input_imgs = torch.stack(input_imgs, dim=0)
+                if masks is not None:
+                    input_imgs = input_imgs * masks
+                    input_imgs = (input_imgs * 255).to(torch.uint8)
+                else:
+                    input_imgs = (input_imgs * 255).to(torch.uint8)
+                metric_computer_input.update(input_imgs, gt_imgs, name=chunk_name)
+
+                for global_idx, (gt_img, input_img, pred_img) in enumerate(
+                    zip(gt_imgs, input_imgs, pred_imgs), start=start
+                ):
+                    gt_img = gt_img.cpu().numpy().astype(np.uint8)
+                    input_img = input_img.cpu().numpy().astype(np.uint8)
+                    pred_img = pred_img.cpu().numpy().astype(np.uint8)
+                    cmp_img = np.concatenate([gt_img, input_img, pred_img], axis=1)
+                    cv2.imwrite(os.path.join(compare_dir, f"{global_idx:04d}.png"), cmp_img[:, :, ::-1])
+
+        if len(pred_preview) > 0:
+            pred_grid = cv2.cvtColor(make_grid(pred_preview), cv2.COLOR_RGB2BGR)
+            cv2.imwrite(os.path.join(output_dir, f"scene{scene_idx}_pred.png"), pred_grid)
+
+        if output_gt and len(gt_preview) > 0:
+            gt_grid = cv2.cvtColor(make_grid(gt_preview), cv2.COLOR_RGB2BGR)
+            cv2.imwrite(os.path.join(output_dir, f"scene{scene_idx}_gt.png"), gt_grid)
 
         if save_viewer:
             viewerdir = os.path.join(output_dir, f"viewer/{scene_name}")
@@ -257,6 +297,11 @@ def evaluate_single_scene(
                 gs_params=out_gs,
                 filename=os.path.join(viewerdir, "point_cloud/iteration_1/point_cloud.ply"),
             )
+            if gt_gs is not None:
+                gs_utils.export_ply_forviewer(
+                    gs_params=gt_gs,
+                    filename=os.path.join(viewerdir, "point_cloud/iteration_2/point_cloud.ply"),
+                )
 
         if save_residuals:
             residual_type = "out_minus_input"
@@ -345,8 +390,11 @@ def main(argv):
     batch_gs = gpu_utils.move_to_device([input_factor_entry["gs_params"]], device)
     batch_scene_idx = [scene["idx"]]
 
-    eval_images = gpu_utils.move_to_device(eval_payload["images"], device)
-    eval_cameras = gpu_utils.move_to_device(eval_payload["cameras"], device)
+    eval_images = eval_payload["images"]
+    eval_cameras = eval_payload["cameras"]
+    eval_chunk_size = dataset.image_per_scene if dataset.image_per_scene is not None else len(eval_images)
+    if eval_chunk_size <= 0:
+        eval_chunk_size = len(eval_images)
 
     model = FeaturePredictor().to(device)
     if model.resume_ckpt is not None:
@@ -469,12 +517,14 @@ def main(argv):
             metrics, metrics_input = evaluate_single_scene(
                 model=model,
                 input_gs=batch_gs[0],
+                gt_gs=target_factor_entry["gs_params"],
                 scene_idx=eval_payload["scene_idx"],
                 scene_name=eval_payload["scene_name"],
                 eval_images=eval_images,
                 eval_cameras=eval_cameras,
                 image_names=eval_payload["images_name"],
                 output_dir=eval_dir,
+                eval_chunk_size=eval_chunk_size,
                 compare_with_input=FLAGS.compare_with_input,
                 save_viewer=FLAGS.save_viewer,
                 save_residuals=FLAGS.save_residuals,
@@ -495,12 +545,14 @@ def main(argv):
     metrics, metrics_input = evaluate_single_scene(
         model=model,
         input_gs=batch_gs[0],
+        gt_gs=target_factor_entry["gs_params"],
         scene_idx=eval_payload["scene_idx"],
         scene_name=eval_payload["scene_name"],
         eval_images=eval_images,
         eval_cameras=eval_cameras,
         image_names=eval_payload["images_name"],
         output_dir=final_eval_dir,
+        eval_chunk_size=eval_chunk_size,
         compare_with_input=FLAGS.compare_with_input,
         save_viewer=FLAGS.save_viewer,
         save_residuals=FLAGS.save_residuals,

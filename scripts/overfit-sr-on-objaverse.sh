@@ -11,14 +11,16 @@ fi
 
 echo "Using GPU: $GPU_ID"
 
-scene_name=${1:-first_scene}
-total_steps=${2:-1000}
-save_interval=${3:-100}
-eval_interval=${4:-100}
-log_image_interval=${5:-10}
+for scene_name in $(ls /project/ricky/splatformer-data/overfit-data-256/colmap)
+do
+
+total_steps=${1:-1000}
+save_interval=${2:-200}
+eval_interval=${3:-200}
+log_image_interval=${4:-200}
 
 out_name=${scene_name}
-output_dir=outputs/objaverse_splatformer_overfit_sr_128/${out_name}
+output_dir=outputs/objaverse_splatformer_overfit_sr256-new/${out_name}
 
 CUDA_VISIBLE_DEVICES=$GPU_ID python overfit-sr.py \
     --output_dir=${output_dir} \
@@ -29,3 +31,4 @@ CUDA_VISIBLE_DEVICES=$GPU_ID python overfit-sr.py \
     --gin_param="training.save_interval=${save_interval}" \
     --gin_param="training.eval_interval=${eval_interval}" \
     --gin_param="training.log_image_interval=${log_image_interval}"
+done
