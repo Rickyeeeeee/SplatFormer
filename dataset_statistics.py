@@ -45,11 +45,24 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Analyze generated dataset statistics for multi-factor nerfstudio scenes."
     )
-    parser.add_argument("--colmap_root", type=Path, required=True, help="Root directory of COLMAP scenes.")
     parser.add_argument(
-        "--nerfstudio_root", type=Path, required=True, help="Root directory of nerfstudio scene outputs."
+        "--colmap_root", 
+        type=Path, 
+        default="/project2/ricky/splatformer-data/train-set-512/objaverse/colmap/",
+        help="Root directory of COLMAP scenes."
     )
-    parser.add_argument("--output_csv", type=Path, required=True, help="Path to write the scene-level CSV report.")
+    parser.add_argument(
+        "--nerfstudio_root",
+        type=Path,
+        default="/project2/ricky/splatformer-data/train-set-512/objaverse/nerfstudio/",
+        help="Root directory of nerfstudio scene outputs."
+    )
+    parser.add_argument(
+        "--output_csv",
+        type=Path,
+        default="objaverse_stats.csv",
+        help="Path to write the scene-level CSV report."
+    )
     parser.add_argument(
         "--device",
         type=str,

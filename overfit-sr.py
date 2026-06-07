@@ -29,7 +29,7 @@ flags.DEFINE_multi_string("gin_param", "", "Newline separated list of Gin parame
 FLAGS = flags.FLAGS
 
 INPUT_FACTOR = 4
-TARGET_FACTOR = 1
+TARGET_FACTOR = 2
 
 
 @gin.configurable

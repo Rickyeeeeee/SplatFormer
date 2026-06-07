@@ -60,4 +60,4 @@ train_dataset/SplatFactoMultiLevelDataset.sample_ratio_test = 0.7
 train_dataset/SplatFactoMultiLevelDataset.cache_steps = 1
 train_dataset/SplatFactoMultiLevelDataset.cache_num_scenes = 1
 train_dataset/SplatFactoMultiLevelDataset.split_across_gpus = True
-train_dataset/SplatFactoMultiLevelDataset.factors = [1, 4]
+train_dataset/SplatFactoMultiLevelDataset.factors = [2, 4]
