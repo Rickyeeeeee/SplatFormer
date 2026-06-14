@@ -23,7 +23,7 @@ def build_optimizer(model,
                     optimizer_type: gin.REQUIRED,
                     optimizer_params):  
     params_lr = []
-    if type(model) == FeaturePredictor:
+    if isinstance(model, FeaturePredictor) or hasattr(model, "features_outputhead"):
         if model.backbone_type != 'empty':
             params_lr.append({'params': model.backbone.parameters(), 'lr': lr_dict['backbone']})
         for feature in model.features_outputhead.keys():

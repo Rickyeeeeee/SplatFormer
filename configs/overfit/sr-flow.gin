@@ -1,0 +1,111 @@
+set_seed.seed = 42
+total_steps = 200000
+training.total_steps = %total_steps
+training.pretrain_steps = 0
+training.eval_interval = 1000
+training.save_interval = 10000
+training.log_interval = 20
+training.log_image_interval = 1000
+training.grad_clip_norm = 2.0
+training.resume_from_step = 0
+training.enable_amp = True
+training.flow_loss_weight = 1.0
+training.flow_loss_type = 'mse'
+training.flow_eval_steps = 10
+training.flow_trajectory_mode = 'optimized_target_discrete'
+training.flow_num_timesteps = 10
+training.flow_segment_steps = 1000
+training.flow_integration_timestep_mode = 'left'
+
+training.log_image_interval = 2000
+training.eval_interval = 2000
+training.save_interval = 2000
+
+pretrain/build_optimizer.lr_dict = {
+    "base": 1e-3,
+    "embedding": 1e-3,
+    "backbone": 1e-3,
+    "features_dc": 1e-3,
+    "features_rest": 5e-5,
+    "scales": 1e-3,
+    "opacities": 1e-3,
+    "quats": 1e-3,
+    "means": 1e-3
+}
+pretrain/build_optimizer.optimizer_type = 'adam'
+pretrain/build_optimizer.optimizer_params = {'eps': 1e-15}
+pretrain/build_scheduler.total_step = %total_steps
+pretrain/build_scheduler.schedule = 'constant'
+
+
+flow_optim/build_3DGSoptimizer.lr_dict = {
+    "base": 1e-3,
+    "features_dc": 1e-3,
+    "features_rest": 5e-5,
+    "scales": 1e-3,
+    "opacities": 1e-3,
+    "quats": 1e-3,
+    "means": 1e-3
+}
+flow_optim/build_3DGSoptimizer.optimizer_type = 'adam'
+flow_optim/build_3DGSoptimizer.optimizer_params = {'eps': 1e-15}
+
+train2D/build_optimizer.lr_dict = {
+    "base": 3e-4,
+    "embedding": 3e-4,
+    "backbone": 3e-4,
+    "features_dc": 3e-4,
+    "features_rest": 1.5e-6,
+    "scales": 3e-4,
+    "opacities": 3e-4,
+    "quats": 3e-4,
+    "means": 3e-4
+}
+train2D/build_optimizer.optimizer_type = 'adam'
+train2D/build_optimizer.optimizer_params = {'eps': 1e-15}
+train2D/build_scheduler.total_step = %total_steps
+train2D/build_scheduler.schedule = 'constant'
+
+SplatFactoMultiLevelDataset.remove_outlier_ndevs = -1
+SplatFactoMultiLevelDataset.image_per_scene = None
+SplatFactoMultiLevelDataset.sample_ratio_test = None
+SplatFactoMultiLevelDataset.max_gs_num = 100000
+SplatFactoMultiLevelDataset.load_pose_src = 'nerfstudio'
+
+train_dataset/SplatFactoMultiLevelDataset.train_or_test = 'test'
+train_dataset/SplatFactoMultiLevelDataset.nerfstudio_folder = '/project/ricky/splatformer-data/overfit-data-256/nerfstudio'
+train_dataset/SplatFactoMultiLevelDataset.colmap_folder = '/project/ricky/splatformer-data/overfit-data-256/colmap'
+# train_dataset/SplatFactoMultiLevelDataset.image_per_scene = 128
+train_dataset/SplatFactoMultiLevelDataset.sample_ratio_test = 0.7
+train_dataset/SplatFactoMultiLevelDataset.cache_steps = 1
+train_dataset/SplatFactoMultiLevelDataset.cache_num_scenes = 1
+train_dataset/SplatFactoMultiLevelDataset.split_across_gpus = True
+train_dataset/SplatFactoMultiLevelDataset.factors = [2, 4]
+
+# Flow scripts use a separate predictor/backbone path owned by gs_flow.py.
+GSFlowFeaturePredictor.sh_degree = 1
+GSFlowFeaturePredictor.output_head_nlayer = 4
+GSFlowFeaturePredictor.output_head_type = 'mlp-relu'
+GSFlowFeaturePredictor.max_scale_normalized = 1e-2
+GSFlowFeaturePredictor.grid_resolution = 384
+GSFlowFeaturePredictor.resume_ckpt = None
+GSFlowFeaturePredictor.input_features = ['means','scales', 'opacities', 'quats', 'features_dc', 'features_rest']
+GSFlowFeaturePredictor.output_features = ['means','scales', 'opacities', 'quats', 'features_dc', 'features_rest']
+GSFlowFeaturePredictor.output_head_width = 128
+GSFlowFeaturePredictor.zeroinit = True
+GSFlowFeaturePredictor.res_feature_activation = {
+    "means": @Tanh(),
+    "features_dc": @Identity(),
+    "features_rest": @Identity(),
+    "scales": @Identity(),
+    "opacities": @Identity(),
+    "quats": @Identity()
+}
+GSFlowFeaturePredictor.input_embed_to_mlp = False
+GSFlowFeaturePredictor.input_feat_to_mlp = True
+PointTransformerV3FlowModel.enable_flash = True
+PointTransformerV3FlowModel.output_dim = 96
+PointTransformerV3FlowModel.enc_dim = 64
+PointTransformerV3FlowModel.turn_off_bn = False
+PointTransformerV3FlowModel.stride = (1,2,2,2)
+PointTransformerV3FlowModel.T_dim = 128

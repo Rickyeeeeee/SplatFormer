@@ -29,6 +29,10 @@ from pointcept.models.utils.structure import Point
 from pointcept.models.modules import PointModule, PointSequential
 from pointcept.models.point_transformer_v3 import SerializedPooling, Embedding, SerializedUnpooling, Block
 
+
+def swish(x):
+    return x * torch.sigmoid(x)
+
 FEATURE2CHANNEL = {
     'means': 3,
     'offsets': 3,
@@ -253,6 +257,7 @@ class PointTransformerV3(PointModule):
             ln_layer = nn.LayerNorm
         # activation layers
         act_layer = nn.GELU
+
 
         if embedding_type == "PT_embedding":
             self.embedding = Embedding(
