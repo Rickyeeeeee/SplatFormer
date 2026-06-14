@@ -663,6 +663,16 @@ def training(
         log_prefix="pretrain_3dgs_trajectory",
     )
 
+    input_gs_debug_keys = [
+        key for key in flow_keys if key in batch_gs[0] and torch.is_tensor(batch_gs[0][key])
+    ]
+    input_gs_debug_snapshot = {
+        key: batch_gs[0][key].detach().clone() for key in input_gs_debug_keys
+    }
+    for key in input_gs_debug_keys:
+        if batch_gs[0][key].requires_grad:
+            batch_gs[0][key].retain_grad()
+
     optimizer.zero_grad(set_to_none=True)
     pbar = tqdm(range(resume_from_step, total_steps))
     for step in pbar:
@@ -683,6 +693,10 @@ def training(
         gs_loss = path_data_dict.get("last_gs_loss")
 
         # 3. Model prediction and loss.
+        for key in input_gs_debug_keys:
+            if batch_gs[0][key].grad is not None:
+                batch_gs[0][key].grad = None
+
         with torch.cuda.amp.autocast(enabled=enable_amp):
             pred_velocity = model(
                 batch_normalized_gs=[flow_start_gs],
@@ -730,6 +744,36 @@ def training(
         if step % log_interval == 0:
             vel_stats = velocity_alignment_stats(pred_velocity, flow_start_gs, flow_target_gs, flow_keys, time_delta)
             gs_loss_str = "" if gs_loss is None else f" gs_l1={gs_loss.item():.6f}"
+            input_gs_grad_keys = []
+            input_gs_changed_keys = []
+            input_gs_grad_max = 0.0
+            input_gs_change_max = 0.0
+            for key in input_gs_debug_keys:
+                grad = batch_gs[0][key].grad
+                if grad is not None and grad.numel() > 0:
+                    grad_max = float(grad.detach().abs().max().item())
+                    input_gs_grad_max = max(input_gs_grad_max, grad_max)
+                    if grad_max > 0.0:
+                        input_gs_grad_keys.append(key)
+
+                current = batch_gs[0][key].detach()
+                previous = input_gs_debug_snapshot[key]
+                if current.shape != previous.shape:
+                    change_max = float("inf")
+                elif current.numel() > 0:
+                    change_max = float((current - previous).abs().max().item())
+                else:
+                    change_max = 0.0
+                input_gs_change_max = max(input_gs_change_max, change_max)
+                if change_max > 0.0:
+                    input_gs_changed_keys.append(key)
+                input_gs_debug_snapshot[key] = current.clone()
+
+            logger.info(
+                f"input_gs_debug step={step} "
+                f"grad_keys={input_gs_grad_keys} grad_max={input_gs_grad_max:.6e} "
+                f"changed_keys={input_gs_changed_keys} change_max={input_gs_change_max:.6e}"
+            )
             logger.info(
                 f"step={step} mode={flow_trajectory_mode} segment={segment_idx} "
                 f"total={total_loss.item():.6f} flow={flow_loss.item():.6f} "
