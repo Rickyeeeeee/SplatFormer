@@ -68,6 +68,7 @@ def training(
     image_l1_loss_weight=1.0,
     lpips_loss_weight=0.0,
     point_loss_weight=1.0,
+    point_loss_after_activation=False,
     resume_from_step=0,
     enable_amp=False,
     empty_cache_fre=-1,
@@ -85,6 +86,7 @@ def training(
         "image_l1_loss_weight": image_l1_loss_weight,
         "lpips_loss_weight": lpips_loss_weight,
         "point_loss_weight": point_loss_weight,
+        "point_loss_after_activation": point_loss_after_activation,
         "resume_from_step": resume_from_step,
         "enable_amp": enable_amp,
         "empty_cache_fre": empty_cache_fre,
@@ -202,6 +204,13 @@ def _make_optimizable_gs(gs_params, device):
 
 def _detach_gs(gs_params):
     return {key: value.detach() for key, value in gs_params.items()}
+
+def _detach_and_no_grad_gs(gs_params):
+    return {key: value.detach() for key, value in gs_params.items()}
+
+
+def _freeze_gs_for_second_stage(gs_params):
+    return {key: value.detach().requires_grad_(False) for key, value in gs_params.items()}
 
 
 def _normalize_quats_(gs_params):
@@ -357,14 +366,29 @@ def optimize_input_gs_to_images(
             pred_grid = cv2.cvtColor(make_grid(pred_imgs_uint8), cv2.COLOR_RGB2BGR)
             cv2.imwrite(os.path.join(gs_train_dir, f"{step:08d}_pred.png"), pred_grid)
 
-    detached_gs = _detach_gs(optimized_gs)
+    detached_gs = _detach_and_no_grad_gs(optimized_gs)
     torch.save(_to_cpu(detached_gs), os.path.join(gs_train_dir, "optimized_gs.pt"))
     return detached_gs
 
 
-def _compute_point_mse_loss(pred_gs, target_gs, loss_keys, point_loss_weight):
+def _activate_gs_for_point_loss(key, value, gs_params):
+    if key == "scales":
+        return torch.exp(value)
+    if key == "opacities":
+        return torch.sigmoid(value)
+    if key == "quats":
+        return value / value.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+    if key == "features_dc" and (
+        "features_rest" not in gs_params or gs_params["features_rest"].shape[1] == 0
+    ):
+        return torch.sigmoid(value)
+    return value
+
+
+def _compute_point_mse_loss(pred_gs, target_gs, loss_keys, point_loss_weight, after_activation):
     terms = []
     metrics = {}
+    metric_prefix = "point_mse_activated" if after_activation else "point_mse_raw"
     for key in loss_keys:
         if key not in pred_gs or key not in target_gs:
             continue
@@ -374,15 +398,18 @@ def _compute_point_mse_loss(pred_gs, target_gs, loss_keys, point_loss_weight):
             raise ValueError(f"Point loss shape mismatch for {key}: pred={pred.shape}, target={target.shape}")
         if pred.numel() == 0:
             continue
+        if after_activation:
+            pred = _activate_gs_for_point_loss(key, pred, pred_gs)
+            target = _activate_gs_for_point_loss(key, target, target_gs)
         value = F.mse_loss(pred.float(), target.float())
         terms.append(value)
-        metrics[f"point_mse/{key}"] = value.detach()
+        metrics[f"{metric_prefix}/{key}"] = value.detach()
 
     if len(terms) == 0:
         raise ValueError("No matching non-empty GS fields available for point MSE loss")
 
     point_mse = torch.stack(terms).mean()
-    metrics["point_mse"] = point_mse.detach()
+    metrics[metric_prefix] = point_mse.detach()
     return point_mse * point_loss_weight, metrics
 
 
@@ -662,6 +689,8 @@ def main(argv):
         lpips_loss_func=lpips_loss_func,
     )
 
+    batch_gs = [_freeze_gs_for_second_stage(gs) for gs in batch_gs]
+
     log_cameras = gpu_utils.move_to_device(train_payload["cameras"], device)
     with torch.no_grad():
         optimized_imgs, _ = gs_utils.rasterize_gaussians_to_multiimgs(optimized_gs, log_cameras)
@@ -671,8 +700,12 @@ def main(argv):
 
     point_loss_keys = list(model.output_features)
     point_loss_weight = train_cfg["point_loss_weight"]
+    point_loss_after_activation = train_cfg["point_loss_after_activation"]
+    point_loss_metric_key = "point_mse_activated" if point_loss_after_activation else "point_mse_raw"
+    point_loss_domain = "after activation" if point_loss_after_activation else "before activation"
     logger.info(
-        "Training FeaturePredictor with point MSE against optimized input GS fields: "
+        "Training FeaturePredictor with point MSE "
+        f"{point_loss_domain} against optimized input GS fields: "
         + ", ".join(point_loss_keys)
     )
 
@@ -687,6 +720,7 @@ def main(argv):
                 optimized_gs,
                 point_loss_keys,
                 point_loss_weight,
+                point_loss_after_activation,
             )
 
         if enable_amp:
@@ -705,7 +739,7 @@ def main(argv):
         optimizer.zero_grad(set_to_none=True)
         scheduler.step()
 
-        point_mse = point_metrics["point_mse"]
+        point_mse = point_metrics[point_loss_metric_key]
         pbar.set_postfix(
             {
                 "loss": f"{total_loss.item():.6f}",
@@ -721,7 +755,7 @@ def main(argv):
             field_metrics = " ".join(
                 f"{key}={value.item():.6f}"
                 for key, value in point_metrics.items()
-                if key != "point_mse"
+                if key != point_loss_metric_key
             )
             log_msg = (
                 f"step={step} total={total_loss.item():.6f} "
