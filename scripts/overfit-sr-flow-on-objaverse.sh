@@ -1,6 +1,17 @@
 #!/bin/bash
 set -euo pipefail
 
+# Usage: bash scripts/overfit-sr-flow-on-objaverse.sh [total_steps] [save_interval] [eval_interval] [log_image_interval]
+#
+# Examples:
+#   # Point-supervised x1 prediction with a freshly optimized target each training step.
+#   GPU_ID=5 X1_LOSS_MODE=point_mse X1_PREDICTION_TYPE=residual X1_OPTIMIZATION_STEPS=10000 \
+#     bash scripts/overfit-sr-flow-on-objaverse.sh 1000 200 200 200
+#
+#   # Image-supervised x1 prediction without target-GS optimization.
+#   GPU_ID=5 X1_LOSS_MODE=render_l1 X1_PREDICTION_TYPE=velocity_extrapolation \
+#     bash scripts/overfit-sr-flow-on-objaverse.sh 1000 200 200 200
+
 GPU_ID=${GPU_ID:-5}
 
 SCENE_NAME=${SCENE_NAME:-3e288ee8aced4a0797e66d53536112b1}
@@ -38,7 +49,7 @@ fi
 
 NS_ROOT=${NS_ROOT:-/project/ricky/splatformer-data/test-set-512/objaverse/nerfstudio}
 COLMAP_ROOT=${COLMAP_ROOT:-/project/ricky/splatformer-data/test-set-512/objaverse/colmap}
-OUTPUT_ROOT=${OUTPUT_ROOT:-/project/ricky/outputs/objaverse_splatformer_overfit_sr_flow512}
+OUTPUT_ROOT=${OUTPUT_ROOT:-/project/ricky/outputs/objaverse_overfit_sr_512_flow_x1}
 OUTPUT_DIR=${OUTPUT_DIR:-${OUTPUT_ROOT}/${SCENE_NAME}}
 
 echo "Using GPU: ${GPU_ID}"
