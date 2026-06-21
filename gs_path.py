@@ -1,5 +1,6 @@
 import gin
 import torch
+import torch.nn.functional as F
 
 from utils import gs_utils
 from utils.optimizers import build_3DGSoptimizer
@@ -100,6 +101,87 @@ class GSPath:
                 self.logger.info(f"{log_prefix} step={opt_step}/{optim_steps} image_l1={last_loss.item():.6f}")
 
         return self.detach_gs(state), last_loss
+
+    def optimize_target_discrete(
+        self,
+        input_gs,
+        images,
+        cameras,
+        flow_keys,
+        optim_steps,
+        log_prefix="optimized_target_discrete/gs",
+    ):
+        """Optimize a fresh x1 from x0 without retaining either state across calls."""
+        x0 = self.detach_gs(input_gs)
+        x1, _ = self.optimize_gs(
+            input_gs,
+            images,
+            cameras,
+            flow_keys=flow_keys,
+            optim_steps=optim_steps,
+            log_prefix=log_prefix,
+        )
+        return x0, x1
+
+    @staticmethod
+    def extrapolate_x1(x_t, prediction, t, flow_keys, prediction_type="residual"):
+        """Compose an endpoint GS while preserving fields not predicted by the model."""
+        if prediction_type == "residual":
+            scale = 1.0
+        elif prediction_type == "velocity_extrapolation":
+            t_value = torch.as_tensor(
+                t,
+                device=x_t["means"].device,
+                dtype=x_t["means"].dtype,
+            )
+            if t_value.numel() != 1:
+                raise ValueError("x1 extrapolation currently requires a scalar timestep")
+            scale = 1.0 - t_value.reshape(())
+        else:
+            raise ValueError(f"Unsupported x1 prediction type: {prediction_type}")
+
+        x1 = dict(x_t)
+        for key in flow_keys:
+            if key not in prediction or key not in x_t:
+                raise KeyError(f"Missing x1 prediction input for feature '{key}'")
+            if not torch.is_tensor(x_t[key]) or not torch.is_tensor(prediction[key]):
+                raise TypeError(f"x1 feature '{key}' must be tensor-valued")
+            if x_t[key].shape != prediction[key].shape:
+                raise ValueError(
+                    f"x1 feature '{key}' shape mismatch: "
+                    f"state={tuple(x_t[key].shape)} prediction={tuple(prediction[key].shape)}"
+                )
+            x1[key] = x_t[key] + scale * prediction[key]
+        return x1
+
+    @staticmethod
+    def x1_point_mse_loss(pred_x1, target_x1, flow_keys):
+        if len(flow_keys) == 0:
+            raise ValueError("x1 point loss requires at least one predicted feature")
+        feature_losses = {}
+        for key in flow_keys:
+            if key not in pred_x1 or key not in target_x1:
+                raise KeyError(f"Missing x1 point-loss feature '{key}'")
+            if pred_x1[key].shape != target_x1[key].shape:
+                raise ValueError(
+                    f"x1 target '{key}' shape mismatch: "
+                    f"prediction={tuple(pred_x1[key].shape)} target={tuple(target_x1[key].shape)}"
+                )
+            feature_losses[key] = F.mse_loss(pred_x1[key], target_x1[key])
+        return torch.stack(list(feature_losses.values())).mean(), feature_losses
+
+    def predict_x1(self, model, x_t, t, flow_keys, prediction_type="residual"):
+        prediction = model(
+            batch_normalized_gs=[x_t],
+            timestep=t,
+        )[0]
+        return self.extrapolate_x1(
+            x_t,
+            prediction,
+            t,
+            flow_keys,
+            prediction_type=prediction_type,
+        )
 
     def sample_from_timestep(self, device):
         timestep_idx_tensor = torch.randint(self.flow_num_timesteps, (1,), device=device)
