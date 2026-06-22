@@ -1,12 +1,12 @@
 set_seed.seed = 42
 
 # training.total_steps is retained for compatibility. overfit-sr-ar.py derives
-# the actual budget from ar_num_stages * ar_steps_per_stage.
+# the actual budget from ar_num_stages * ar_num_rollouts.
 total_steps = 1000
 training.total_steps = %total_steps
 training.pretrain_steps = 0
 training.ar_num_stages = 10
-training.ar_steps_per_stage = 100
+training.ar_num_rollouts = 100
 training.eval_interval = 200
 training.save_interval = 200
 training.log_interval = 20
@@ -76,4 +76,3 @@ PointTransformerV3FlowModel.enc_dim = 64
 PointTransformerV3FlowModel.turn_off_bn = False
 PointTransformerV3FlowModel.stride = (1,2,2,2)
 PointTransformerV3FlowModel.T_dim = 128
-

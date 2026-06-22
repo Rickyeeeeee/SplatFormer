@@ -60,7 +60,8 @@ def training(
     enable_amp=False,
     empty_cache_fre=-1,
     ar_num_stages=10,
-    ar_steps_per_stage=100,
+    ar_num_rollouts=None,
+    ar_steps_per_stage=None,
     # Accepted for compatibility with configs/overfit/sr-flow.gin. The AR
     # curriculum does not use teacher GS paths or velocity supervision.
     flow_loss_weight=1.0,
@@ -83,14 +84,23 @@ def training(
     )
     if ar_num_stages <= 0:
         raise ValueError("training.ar_num_stages must be positive")
-    if ar_steps_per_stage <= 0:
-        raise ValueError("training.ar_steps_per_stage must be positive")
+    used_legacy_rollout_alias = ar_num_rollouts is None and ar_steps_per_stage is not None
+    if ar_num_rollouts is None:
+        ar_num_rollouts = 100 if ar_steps_per_stage is None else ar_steps_per_stage
+    elif ar_steps_per_stage is not None:
+        raise ValueError(
+            "Configure training.ar_num_rollouts or the deprecated "
+            "training.ar_steps_per_stage, not both"
+        )
+    if ar_num_rollouts <= 0:
+        raise ValueError("training.ar_num_rollouts must be positive")
     return {
         "output_dir": output_dir,
         "legacy_total_steps": total_steps,
-        "total_steps": int(ar_num_stages) * int(ar_steps_per_stage),
+        "total_steps": int(ar_num_stages) * int(ar_num_rollouts),
         "ar_num_stages": int(ar_num_stages),
-        "ar_steps_per_stage": int(ar_steps_per_stage),
+        "ar_num_rollouts": int(ar_num_rollouts),
+        "used_legacy_rollout_alias": used_legacy_rollout_alias,
         "eval_interval": eval_interval,
         "log_interval": log_interval,
         "save_interval": save_interval,
@@ -165,6 +175,14 @@ def build_resolution_schedule(source_size, target_size, num_stages):
         }
         for stage_index in range(num_stages)
     ]
+
+
+def training_position(global_step, num_stages):
+    if global_step < 0:
+        raise ValueError("global_step must be non-negative")
+    if num_stages <= 0:
+        raise ValueError("num_stages must be positive")
+    return global_step // num_stages, global_step % num_stages
 
 
 def resize_images_and_cameras(images, cameras, output_size):
@@ -245,10 +263,40 @@ def rollout_ar(model, input_gs, num_steps, num_stages):
 
 
 def rollout_detached_prefix(model, input_gs, stage_index, num_stages, enable_amp=False):
+    del enable_amp
     current_gs = detach_gs(input_gs)
-    with torch.no_grad(), torch.cuda.amp.autocast(enabled=enable_amp):
-        current_gs = rollout_ar(model, current_gs, num_steps=stage_index, num_stages=num_stages)
+    was_training = model.training
+    model.eval()
+    try:
+        # This spconv build has no suitable eval-mode FP16 implicit-GEMM
+        # algorithm for some sparse shapes. Match full evaluation and run the
+        # detached inference path in FP32.
+        with torch.no_grad():
+            current_gs = rollout_ar(
+                model, current_gs, num_steps=stage_index, num_stages=num_stages
+            )
+    finally:
+        model.train(was_training)
     return detach_gs(current_gs)
+
+
+def recompute_detached_stage(model, current_gs, stage_index, num_stages, enable_amp=False):
+    del enable_amp
+    was_training = model.training
+    model.eval()
+    try:
+        # See rollout_detached_prefix: eval-mode spconv must remain FP32.
+        with torch.no_grad():
+            t = torch.tensor(
+                [stage_timestep(stage_index, num_stages)],
+                device=current_gs["means"].device,
+                dtype=torch.float32,
+            )
+            delta = model(batch_normalized_gs=[current_gs], timestep=t)[0]
+            next_gs = apply_gs_delta(current_gs, delta)
+    finally:
+        model.train(was_training)
+    return detach_gs(next_gs)
 
 
 def _build_dataset():
@@ -551,6 +599,11 @@ def main(argv):
     with open(os.path.join(FLAGS.output_dir, "config.gin"), "w") as file:
         file.writelines(gin.operative_config_str())
     logger = ProcessSafeLogger(os.path.join(FLAGS.output_dir, "overfit.log")).get_logger()
+    if train_cfg["used_legacy_rollout_alias"]:
+        logger.warning(
+            "training.ar_steps_per_stage is deprecated; its value is being used as "
+            "training.ar_num_rollouts"
+        )
     device = torch.device("cuda")
 
     dataset = _build_dataset()
@@ -573,7 +626,8 @@ def main(argv):
                 "source_size": list(source_size),
                 "target_size": list(target_size),
                 "num_stages": train_cfg["ar_num_stages"],
-                "steps_per_stage": train_cfg["ar_steps_per_stage"],
+                "num_rollouts": train_cfg["ar_num_rollouts"],
+                "updates_per_rollout": train_cfg["ar_num_stages"],
                 "total_steps": train_cfg["total_steps"],
                 "legacy_total_steps": train_cfg["legacy_total_steps"],
                 "stages": [
@@ -586,10 +640,10 @@ def main(argv):
 
     if int(train_cfg["legacy_total_steps"]) != train_cfg["total_steps"]:
         logger.info(
-            "Ignoring legacy training.total_steps=%s; AR schedule uses %s stages x %s steps = %s",
+            "Ignoring legacy training.total_steps=%s; AR schedule uses %s rollouts x %s stages = %s",
             train_cfg["legacy_total_steps"],
+            train_cfg["ar_num_rollouts"],
             train_cfg["ar_num_stages"],
-            train_cfg["ar_steps_per_stage"],
             train_cfg["total_steps"],
         )
 
@@ -600,6 +654,12 @@ def main(argv):
         eval_hr_payload = _build_split_payload(
             dataset, scene["idx"], scene["scene_name"], target_factor_entry, split="train"
         )
+    full_eval_payload = _resize_payload(eval_hr_payload, target_size)
+    full_eval_chunk_size = (
+        dataset.image_per_scene
+        if dataset.image_per_scene is not None
+        else len(full_eval_payload["images"])
+    )
 
     batch_gs = gpu_utils.move_to_device([input_factor_entry["gs_params"]], device)
     model = GSFlowModel().to(device)
@@ -624,35 +684,44 @@ def main(argv):
         f"eval_views={len(eval_hr_payload['images'])} "
         f"gaussians={input_factor_entry['gs_params']['means'].shape[0]} "
         f"resolution={source_size}->{target_size} stages={train_cfg['ar_num_stages']} "
-        f"steps_per_stage={train_cfg['ar_steps_per_stage']}"
+        f"rollouts={train_cfg['ar_num_rollouts']}"
     )
     os.makedirs(os.path.join(FLAGS.output_dir, "train"), exist_ok=True)
     os.makedirs(os.path.join(FLAGS.output_dir, "checkpoints"), exist_ok=True)
 
     optimizer.zero_grad(set_to_none=True)
+    current_gs = None
+    train_hr_payload = None
     pbar = tqdm(range(resume_from_step, total_steps))
     for step in pbar:
-        stage_index = min(
-            step // train_cfg["ar_steps_per_stage"], train_cfg["ar_num_stages"] - 1
-        )
+        rollout_index, stage_index = training_position(step, train_cfg["ar_num_stages"])
         stage_info = schedule[stage_index]
         t_value = stage_info["t"]
         output_h, output_w = stage_info["size"]
 
-        train_hr_payload = _build_split_payload(
-            dataset, scene["idx"], scene["scene_name"], target_factor_entry, split="train"
-        )
+        if stage_index == 0:
+            current_gs = detach_gs(batch_gs[0])
+            train_hr_payload = _build_split_payload(
+                dataset, scene["idx"], scene["scene_name"], target_factor_entry, split="train"
+            )
+        elif current_gs is None:
+            # A resumed mid-rollout run has no cached handoff state. Rebuild the
+            # prefix with the loaded model, then continue with a fresh view sample.
+            current_gs = rollout_detached_prefix(
+                model,
+                batch_gs[0],
+                stage_index=stage_index,
+                num_stages=train_cfg["ar_num_stages"],
+                enable_amp=train_cfg["enable_amp"],
+            )
+            train_hr_payload = _build_split_payload(
+                dataset, scene["idx"], scene["scene_name"], target_factor_entry, split="train"
+            )
+
         train_payload = _resize_payload(train_hr_payload, stage_info["size"])
         batch_cameras = gpu_utils.move_to_device(train_payload["cameras"], device)
         batch_images = gpu_utils.move_to_device(train_payload["images"], device)
 
-        current_gs = rollout_detached_prefix(
-            model,
-            batch_gs[0],
-            stage_index=stage_index,
-            num_stages=train_cfg["ar_num_stages"],
-            enable_amp=train_cfg["enable_amp"],
-        )
         t = torch.tensor([t_value], device=device, dtype=torch.float32)
         with torch.cuda.amp.autocast(enabled=train_cfg["enable_amp"]):
             predicted_delta = model(batch_normalized_gs=[current_gs], timestep=t)[0]
@@ -664,39 +733,61 @@ def main(argv):
             lpips_loss = lpips_raw * train_cfg["lpips_loss_weight"]
             total_loss = image_l1 + lpips_loss
 
+        optimizer_step_applied = True
         if train_cfg["enable_amp"]:
+            scale_before_update = scaler.get_scale()
             scaler.scale(total_loss).backward()
             if train_cfg["grad_clip_norm"] > 0:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg["grad_clip_norm"])
             scaler.step(optimizer)
             scaler.update()
+            optimizer_step_applied = scaler.get_scale() >= scale_before_update
         else:
             total_loss.backward()
             if train_cfg["grad_clip_norm"] > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg["grad_clip_norm"])
             optimizer.step()
         optimizer.zero_grad(set_to_none=True)
-        scheduler.step()
+        if optimizer_step_applied:
+            scheduler.step()
+        completed_step = step + 1
+
+        if stage_index + 1 < train_cfg["ar_num_stages"]:
+            current_gs = recompute_detached_stage(
+                model,
+                current_gs,
+                stage_index=stage_index,
+                num_stages=train_cfg["ar_num_stages"],
+                enable_amp=train_cfg["enable_amp"],
+            )
+        else:
+            current_gs = None
+            train_hr_payload = None
 
         pbar.set_postfix(
             {
+                "rollout": f"{rollout_index + 1}/{train_cfg['ar_num_rollouts']}",
                 "stage": f"{stage_index + 1}/{train_cfg['ar_num_stages']}",
                 "t": f"{t_value:.2f}",
                 "res": f"{output_w}x{output_h}",
                 "loss": f"{total_loss.item():.4f}",
                 "psnr": f"{train_psnr.item():.2f}",
+                "skipped": str(not optimizer_step_applied),
                 "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
             }
         )
 
-        if train_cfg["empty_cache_fre"] > 0 and (step + 1) % train_cfg["empty_cache_fre"] == 0:
+        if train_cfg["empty_cache_fre"] > 0 and completed_step % train_cfg["empty_cache_fre"] == 0:
             torch.cuda.empty_cache()
-        if step % train_cfg["log_interval"] == 0:
+        if completed_step % train_cfg["log_interval"] == 0:
             logger.info(
-                "step=%s stage=%s/%s t=%.4f resolution=%sx%s total=%.6f l1=%.6f "
-                "lpips=%.6f psnr=%.4f lr=%.8f",
-                step,
+                "step=%s rollout=%s/%s stage=%s/%s t=%.4f resolution=%sx%s "
+                "total=%.6f l1=%.6f "
+                "lpips=%.6f psnr=%.4f optimizer_step_applied=%s lr=%.8f",
+                completed_step,
+                rollout_index + 1,
+                train_cfg["ar_num_rollouts"],
                 stage_index + 1,
                 train_cfg["ar_num_stages"],
                 t_value,
@@ -706,12 +797,13 @@ def main(argv):
                 image_l1.item(),
                 lpips_loss.item(),
                 train_psnr.item(),
+                optimizer_step_applied,
                 optimizer.param_groups[0]["lr"],
             )
-        if step % train_cfg["log_image_interval"] == 0:
+        if completed_step % train_cfg["log_image_interval"] == 0:
             pred_uint8 = [(image * 255).detach().cpu().numpy().astype(np.uint8) for image in pred_imgs]
             cv2.imwrite(
-                os.path.join(FLAGS.output_dir, "train", f"{step:08d}_pred.png"),
+                os.path.join(FLAGS.output_dir, "train", f"{completed_step:08d}_pred.png"),
                 cv2.cvtColor(make_grid(pred_uint8), cv2.COLOR_RGB2BGR),
             )
             gt_uint8 = [
@@ -719,28 +811,22 @@ def main(argv):
                 for image in batch_images
             ]
             cv2.imwrite(
-                os.path.join(FLAGS.output_dir, "train", f"{step:08d}_gt.png"),
+                os.path.join(FLAGS.output_dir, "train", f"{completed_step:08d}_gt.png"),
                 cv2.cvtColor(make_grid(gt_uint8), cv2.COLOR_RGB2BGR),
             )
-        if step % train_cfg["eval_interval"] == 0:
-            eval_payload = _resize_payload(eval_hr_payload, stage_info["size"])
-            eval_chunk_size = (
-                dataset.image_per_scene
-                if dataset.image_per_scene is not None
-                else len(eval_payload["images"])
-            )
+        if completed_step % train_cfg["eval_interval"] == 0:
             metrics, metrics_input = evaluate_single_scene(
                 model=model,
                 input_gs=batch_gs[0],
-                num_rollout_steps=stage_index + 1,
+                num_rollout_steps=train_cfg["ar_num_stages"],
                 num_stages=train_cfg["ar_num_stages"],
-                scene_idx=eval_payload["scene_idx"],
-                scene_name=eval_payload["scene_name"],
-                eval_images=eval_payload["images"],
-                eval_cameras=eval_payload["cameras"],
-                image_names=eval_payload["images_name"],
-                output_dir=os.path.join(FLAGS.output_dir, "eval", f"{step:08d}"),
-                eval_chunk_size=eval_chunk_size,
+                scene_idx=full_eval_payload["scene_idx"],
+                scene_name=full_eval_payload["scene_name"],
+                eval_images=full_eval_payload["images"],
+                eval_cameras=full_eval_payload["cameras"],
+                image_names=full_eval_payload["images_name"],
+                output_dir=os.path.join(FLAGS.output_dir, "eval", f"{completed_step:08d}"),
+                eval_chunk_size=full_eval_chunk_size,
                 gt_gs=target_factor_entry["gs_params"],
                 compare_with_input=FLAGS.compare_with_input,
                 save_viewer=FLAGS.save_viewer,
@@ -749,36 +835,29 @@ def main(argv):
             )
             _log_eval_metrics(
                 logger,
-                f"Eval step {step} stage {stage_index + 1} t={t_value:.4f} "
-                f"resolution={output_w}x{output_h}",
+                f"Eval step {completed_step} rollout {rollout_index + 1} full_hr",
                 metrics,
                 metrics_input,
             )
-        if (step + 1) % train_cfg["save_interval"] == 0:
+        if completed_step % train_cfg["save_interval"] == 0:
             torch.save(
                 model.state_dict(),
-                os.path.join(FLAGS.output_dir, "checkpoints", f"model_{step:08d}.pth"),
+                os.path.join(FLAGS.output_dir, "checkpoints", f"model_{completed_step:08d}.pth"),
             )
 
     torch.save(model.state_dict(), os.path.join(FLAGS.output_dir, "checkpoints", "model_last.pth"))
-    final_eval_payload = _resize_payload(eval_hr_payload, target_size)
-    final_chunk_size = (
-        dataset.image_per_scene
-        if dataset.image_per_scene is not None
-        else len(final_eval_payload["images"])
-    )
     metrics, metrics_input = evaluate_single_scene(
         model=model,
         input_gs=batch_gs[0],
         num_rollout_steps=train_cfg["ar_num_stages"],
         num_stages=train_cfg["ar_num_stages"],
-        scene_idx=final_eval_payload["scene_idx"],
-        scene_name=final_eval_payload["scene_name"],
-        eval_images=final_eval_payload["images"],
-        eval_cameras=final_eval_payload["cameras"],
-        image_names=final_eval_payload["images_name"],
+        scene_idx=full_eval_payload["scene_idx"],
+        scene_name=full_eval_payload["scene_name"],
+        eval_images=full_eval_payload["images"],
+        eval_cameras=full_eval_payload["cameras"],
+        image_names=full_eval_payload["images_name"],
         output_dir=os.path.join(FLAGS.output_dir, FLAGS.eval_subdir),
-        eval_chunk_size=final_chunk_size,
+        eval_chunk_size=full_eval_chunk_size,
         gt_gs=target_factor_entry["gs_params"],
         compare_with_input=FLAGS.compare_with_input,
         save_viewer=FLAGS.save_viewer,

@@ -28,6 +28,12 @@ def test_default_resolution_schedule():
     ]
 
 
+def test_training_schedule_interleaves_stages_across_rollouts():
+    positions = [AR.training_position(step, 10) for step in range(20)]
+    assert positions[:10] == [(0, stage) for stage in range(10)]
+    assert positions[10:] == [(1, stage) for stage in range(10)]
+
+
 def test_resize_scales_images_and_camera_intrinsics():
     images = [torch.ones(256, 256, 3)]
     cameras = {
@@ -89,3 +95,25 @@ def test_prefix_rollout_is_detached_and_active_pass_gets_gradient():
     assert model.weight.grad is not None
     assert input_means.grad is None
 
+
+def test_post_update_recompute_is_detached_and_restores_train_mode():
+    class MockDeltaModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor(2.0))
+            self.training_modes = []
+
+        def forward(self, batch_normalized_gs, timestep, **kwargs):
+            del kwargs
+            self.training_modes.append(self.training)
+            gs = batch_normalized_gs[0]
+            return [{"means": torch.ones_like(gs["means"]) * self.weight * timestep}]
+
+    model = MockDeltaModel()
+    model.train()
+    current_gs = {"means": torch.zeros(1, 3), "opacities": torch.ones(1, 1)}
+    next_gs = AR.recompute_detached_stage(model, current_gs, 0, 10)
+    assert torch.allclose(next_gs["means"], torch.full((1, 3), 0.2))
+    assert not next_gs["means"].requires_grad
+    assert model.training_modes == [False]
+    assert model.training
