@@ -1,6 +1,8 @@
+import copy
 import json
 import os
 import random
+from functools import wraps
 
 import cv2
 import gin
@@ -59,9 +61,13 @@ def training(
     resume_from_step=0,
     enable_amp=False,
     empty_cache_fre=-1,
-    ar_num_stages=10,
-    ar_num_rollouts=None,
-    ar_steps_per_stage=None,
+    ar_num_stages=2,
+    ar_num_rollouts=2,
+    ar_steps_per_stage=500,
+    ema_enabled=True,
+    ema_decay=0.999,
+    ema_warmup_steps=0,
+    ema_resume_ckpt=None,
     # Accepted for compatibility with configs/overfit/sr-flow.gin. The AR
     # curriculum does not use teacher GS paths or velocity supervision.
     flow_loss_weight=1.0,
@@ -84,23 +90,29 @@ def training(
     )
     if ar_num_stages <= 0:
         raise ValueError("training.ar_num_stages must be positive")
-    used_legacy_rollout_alias = ar_num_rollouts is None and ar_steps_per_stage is not None
-    if ar_num_rollouts is None:
-        ar_num_rollouts = 100 if ar_steps_per_stage is None else ar_steps_per_stage
-    elif ar_steps_per_stage is not None:
-        raise ValueError(
-            "Configure training.ar_num_rollouts or the deprecated "
-            "training.ar_steps_per_stage, not both"
-        )
     if ar_num_rollouts <= 0:
         raise ValueError("training.ar_num_rollouts must be positive")
+    if ar_steps_per_stage <= 0:
+        raise ValueError("training.ar_steps_per_stage must be positive")
+    if not 0.0 <= ema_decay < 1.0:
+        raise ValueError("training.ema_decay must be in [0, 1)")
+    if ema_warmup_steps < 0:
+        raise ValueError("training.ema_warmup_steps must be non-negative")
+    if not ema_enabled and ema_resume_ckpt is not None:
+        raise ValueError("training.ema_resume_ckpt requires training.ema_enabled=True")
     return {
         "output_dir": output_dir,
         "legacy_total_steps": total_steps,
-        "total_steps": int(ar_num_stages) * int(ar_num_rollouts),
+        "total_steps": (
+            int(ar_num_rollouts) * int(ar_num_stages) * int(ar_steps_per_stage)
+        ),
         "ar_num_stages": int(ar_num_stages),
         "ar_num_rollouts": int(ar_num_rollouts),
-        "used_legacy_rollout_alias": used_legacy_rollout_alias,
+        "ar_steps_per_stage": int(ar_steps_per_stage),
+        "ema_enabled": bool(ema_enabled),
+        "ema_decay": float(ema_decay),
+        "ema_warmup_steps": int(ema_warmup_steps),
+        "ema_resume_ckpt": ema_resume_ckpt,
         "eval_interval": eval_interval,
         "log_interval": log_interval,
         "save_interval": save_interval,
@@ -111,6 +123,76 @@ def training(
         "resume_from_step": resume_from_step,
         "enable_amp": enable_amp,
         "empty_cache_fre": empty_cache_fre,
+    }
+
+
+def effective_ema_decay(decay, warmup_steps, num_updates):
+    if not 0.0 <= decay < 1.0:
+        raise ValueError("decay must be in [0, 1)")
+    if warmup_steps < 0:
+        raise ValueError("warmup_steps must be non-negative")
+    if num_updates < 0:
+        raise ValueError("num_updates must be non-negative")
+    if warmup_steps == 0:
+        return float(decay)
+    return float(decay) * min(1.0, float(num_updates) / float(warmup_steps))
+
+
+class ModelEMA:
+    def __init__(self, model, decay=0.999, warmup_steps=0, num_updates=0):
+        self.decay = float(decay)
+        self.warmup_steps = int(warmup_steps)
+        self.num_updates = int(num_updates)
+        effective_ema_decay(self.decay, self.warmup_steps, self.num_updates)
+        self.module = copy.deepcopy(model)
+        self.module.requires_grad_(False)
+        self.module.eval()
+
+    @property
+    def current_decay(self):
+        return effective_ema_decay(self.decay, self.warmup_steps, self.num_updates)
+
+    @torch.no_grad()
+    def update(self, model, update_applied=True):
+        if not update_applied:
+            return False
+        self.num_updates += 1
+        decay = self.current_decay
+
+        source_parameters = dict(model.named_parameters())
+        for name, ema_parameter in self.module.named_parameters():
+            source_parameter = source_parameters[name].detach()
+            ema_parameter.lerp_(source_parameter, 1.0 - decay)
+
+        source_buffers = dict(model.named_buffers())
+        for name, ema_buffer in self.module.named_buffers():
+            source_buffer = source_buffers[name].detach()
+            if torch.is_floating_point(ema_buffer) or torch.is_complex(ema_buffer):
+                ema_buffer.lerp_(source_buffer, 1.0 - decay)
+            else:
+                ema_buffer.copy_(source_buffer)
+
+        self.module.eval()
+        return True
+
+
+def preserve_model_mode(function):
+    @wraps(function)
+    def wrapped(model, *args, **kwargs):
+        was_training = model.training
+        try:
+            return function(model, *args, **kwargs)
+        finally:
+            model.train(was_training)
+
+    return wrapped
+
+
+def checkpoint_paths(checkpoint_dir, completed_step=None):
+    suffix = "last" if completed_step is None else f"{completed_step:08d}"
+    return {
+        "online": os.path.join(checkpoint_dir, f"model_{suffix}.pth"),
+        "ema": os.path.join(checkpoint_dir, f"model_ema_{suffix}.pth"),
     }
 
 
@@ -177,12 +259,19 @@ def build_resolution_schedule(source_size, target_size, num_stages):
     ]
 
 
-def training_position(global_step, num_stages):
+def training_position(global_step, num_stages, steps_per_stage):
     if global_step < 0:
         raise ValueError("global_step must be non-negative")
     if num_stages <= 0:
         raise ValueError("num_stages must be positive")
-    return global_step // num_stages, global_step % num_stages
+    if steps_per_stage <= 0:
+        raise ValueError("steps_per_stage must be positive")
+    updates_per_rollout = num_stages * steps_per_stage
+    rollout_index = global_step // updates_per_rollout
+    step_in_rollout = global_step % updates_per_rollout
+    stage_index = step_in_rollout // steps_per_stage
+    local_step_index = step_in_rollout % steps_per_stage
+    return rollout_index, stage_index, local_step_index
 
 
 def resize_images_and_cameras(images, cameras, output_size):
@@ -278,25 +367,6 @@ def rollout_detached_prefix(model, input_gs, stage_index, num_stages, enable_amp
     finally:
         model.train(was_training)
     return detach_gs(current_gs)
-
-
-def recompute_detached_stage(model, current_gs, stage_index, num_stages, enable_amp=False):
-    del enable_amp
-    was_training = model.training
-    model.eval()
-    try:
-        # See rollout_detached_prefix: eval-mode spconv must remain FP32.
-        with torch.no_grad():
-            t = torch.tensor(
-                [stage_timestep(stage_index, num_stages)],
-                device=current_gs["means"].device,
-                dtype=torch.float32,
-            )
-            delta = model(batch_normalized_gs=[current_gs], timestep=t)[0]
-            next_gs = apply_gs_delta(current_gs, delta)
-    finally:
-        model.train(was_training)
-    return detach_gs(next_gs)
 
 
 def _build_dataset():
@@ -400,6 +470,7 @@ def _render_losses(gs, images, cameras, lpips_loss_func=None):
     )
 
 
+@preserve_model_mode
 def evaluate_single_scene(
     model,
     input_gs,
@@ -576,7 +647,6 @@ def evaluate_single_scene(
         metric_computer_input.write_to_file(os.path.join(output_dir, "metrics_input.json"))
     else:
         metrics_input = {}
-    model.train()
     return metrics, metrics_input
 
 
@@ -599,11 +669,6 @@ def main(argv):
     with open(os.path.join(FLAGS.output_dir, "config.gin"), "w") as file:
         file.writelines(gin.operative_config_str())
     logger = ProcessSafeLogger(os.path.join(FLAGS.output_dir, "overfit.log")).get_logger()
-    if train_cfg["used_legacy_rollout_alias"]:
-        logger.warning(
-            "training.ar_steps_per_stage is deprecated; its value is being used as "
-            "training.ar_num_rollouts"
-        )
     device = torch.device("cuda")
 
     dataset = _build_dataset()
@@ -627,9 +692,19 @@ def main(argv):
                 "target_size": list(target_size),
                 "num_stages": train_cfg["ar_num_stages"],
                 "num_rollouts": train_cfg["ar_num_rollouts"],
-                "updates_per_rollout": train_cfg["ar_num_stages"],
+                "steps_per_stage": train_cfg["ar_steps_per_stage"],
+                "updates_per_rollout": (
+                    train_cfg["ar_num_stages"] * train_cfg["ar_steps_per_stage"]
+                ),
                 "total_steps": train_cfg["total_steps"],
                 "legacy_total_steps": train_cfg["legacy_total_steps"],
+                "ema": {
+                    "enabled": train_cfg["ema_enabled"],
+                    "decay": train_cfg["ema_decay"],
+                    "warmup_steps": train_cfg["ema_warmup_steps"],
+                    "resume_ckpt": train_cfg["ema_resume_ckpt"],
+                    "inference_model": "ema" if train_cfg["ema_enabled"] else "online",
+                },
                 "stages": [
                     {**entry, "size": list(entry["size"])} for entry in schedule
                 ],
@@ -640,10 +715,12 @@ def main(argv):
 
     if int(train_cfg["legacy_total_steps"]) != train_cfg["total_steps"]:
         logger.info(
-            "Ignoring legacy training.total_steps=%s; AR schedule uses %s rollouts x %s stages = %s",
+            "Ignoring legacy training.total_steps=%s; AR schedule uses "
+            "%s rollouts x %s stages x %s steps = %s",
             train_cfg["legacy_total_steps"],
             train_cfg["ar_num_rollouts"],
             train_cfg["ar_num_stages"],
+            train_cfg["ar_steps_per_stage"],
             train_cfg["total_steps"],
         )
 
@@ -674,6 +751,28 @@ def main(argv):
     resume_from_step = int(train_cfg["resume_from_step"])
     if resume_from_step < 0 or resume_from_step >= total_steps:
         raise ValueError(f"resume_from_step must be in [0, {total_steps}), got {resume_from_step}")
+
+    model_ema = None
+    if train_cfg["ema_enabled"]:
+        model_ema = ModelEMA(
+            model,
+            decay=train_cfg["ema_decay"],
+            warmup_steps=train_cfg["ema_warmup_steps"],
+            num_updates=resume_from_step,
+        )
+        if train_cfg["ema_resume_ckpt"] is not None:
+            model_ema.module.load_state_dict(
+                torch.load(train_cfg["ema_resume_ckpt"], map_location="cpu")
+            )
+            model_ema.module.eval()
+            logger.info("Loaded EMA checkpoint from %s", train_cfg["ema_resume_ckpt"])
+    inference_model = model_ema.module if model_ema is not None else model
+    logger.info(
+        "EMA enabled=%s decay=%.6f warmup_steps=%s updates=%s inference_model=%s",
+        train_cfg["ema_enabled"], train_cfg["ema_decay"], train_cfg["ema_warmup_steps"],
+        resume_from_step, "ema" if model_ema is not None else "online",
+    )
+
     scaler = torch.cuda.amp.GradScaler(enabled=train_cfg["enable_amp"])
     lpips_loss_func = (
         loss_utils.lpips_loss_fn() if train_cfg["lpips_loss_weight"] > 0 else None
@@ -684,44 +783,42 @@ def main(argv):
         f"eval_views={len(eval_hr_payload['images'])} "
         f"gaussians={input_factor_entry['gs_params']['means'].shape[0]} "
         f"resolution={source_size}->{target_size} stages={train_cfg['ar_num_stages']} "
-        f"rollouts={train_cfg['ar_num_rollouts']}"
+        f"rollouts={train_cfg['ar_num_rollouts']} "
+        f"steps_per_stage={train_cfg['ar_steps_per_stage']} "
+        f"inference_model={'ema' if model_ema is not None else 'online'}"
     )
     os.makedirs(os.path.join(FLAGS.output_dir, "train"), exist_ok=True)
-    os.makedirs(os.path.join(FLAGS.output_dir, "checkpoints"), exist_ok=True)
+    checkpoint_dir = os.path.join(FLAGS.output_dir, "checkpoints")
+    os.makedirs(checkpoint_dir, exist_ok=True)
 
     optimizer.zero_grad(set_to_none=True)
-    current_gs = None
-    train_hr_payload = None
     pbar = tqdm(range(resume_from_step, total_steps))
     for step in pbar:
-        rollout_index, stage_index = training_position(step, train_cfg["ar_num_stages"])
+        rollout_index, stage_index, local_step_index = training_position(
+            step,
+            train_cfg["ar_num_stages"],
+            train_cfg["ar_steps_per_stage"],
+        )
         stage_info = schedule[stage_index]
         t_value = stage_info["t"]
         output_h, output_w = stage_info["size"]
 
-        if stage_index == 0:
-            current_gs = detach_gs(batch_gs[0])
-            train_hr_payload = _build_split_payload(
-                dataset, scene["idx"], scene["scene_name"], target_factor_entry, split="train"
-            )
-        elif current_gs is None:
-            # A resumed mid-rollout run has no cached handoff state. Rebuild the
-            # prefix with the loaded model, then continue with a fresh view sample.
-            current_gs = rollout_detached_prefix(
-                model,
-                batch_gs[0],
-                stage_index=stage_index,
-                num_stages=train_cfg["ar_num_stages"],
-                enable_amp=train_cfg["enable_amp"],
-            )
-            train_hr_payload = _build_split_payload(
-                dataset, scene["idx"], scene["scene_name"], target_factor_entry, split="train"
-            )
-
+        train_hr_payload = _build_split_payload(
+            dataset, scene["idx"], scene["scene_name"], target_factor_entry, split="train"
+        )
         train_payload = _resize_payload(train_hr_payload, stage_info["size"])
         batch_cameras = gpu_utils.move_to_device(train_payload["cameras"], device)
         batch_images = gpu_utils.move_to_device(train_payload["images"], device)
 
+        # Refresh the detached AR prefix with stable inference weights before
+        # every optimizer update. This also reconstructs state for resumed runs.
+        current_gs = rollout_detached_prefix(
+            inference_model,
+            batch_gs[0],
+            stage_index=stage_index,
+            num_stages=train_cfg["ar_num_stages"],
+            enable_amp=train_cfg["enable_amp"],
+        )
         t = torch.tensor([t_value], device=device, dtype=torch.float32)
         with torch.cuda.amp.autocast(enabled=train_cfg["enable_amp"]):
             predicted_delta = model(batch_normalized_gs=[current_gs], timestep=t)[0]
@@ -751,30 +848,24 @@ def main(argv):
         optimizer.zero_grad(set_to_none=True)
         if optimizer_step_applied:
             scheduler.step()
+        if model_ema is not None:
+            model_ema.update(model, update_applied=optimizer_step_applied)
         completed_step = step + 1
-
-        if stage_index + 1 < train_cfg["ar_num_stages"]:
-            current_gs = recompute_detached_stage(
-                model,
-                current_gs,
-                stage_index=stage_index,
-                num_stages=train_cfg["ar_num_stages"],
-                enable_amp=train_cfg["enable_amp"],
-            )
-        else:
-            current_gs = None
-            train_hr_payload = None
 
         pbar.set_postfix(
             {
                 "rollout": f"{rollout_index + 1}/{train_cfg['ar_num_rollouts']}",
                 "stage": f"{stage_index + 1}/{train_cfg['ar_num_stages']}",
+                "update": f"{local_step_index + 1}/{train_cfg['ar_steps_per_stage']}",
                 "t": f"{t_value:.2f}",
                 "res": f"{output_w}x{output_h}",
                 "loss": f"{total_loss.item():.4f}",
                 "psnr": f"{train_psnr.item():.2f}",
                 "skipped": str(not optimizer_step_applied),
                 "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
+                "ema": (
+                    f"{model_ema.current_decay:.6f}" if model_ema is not None else "off"
+                ),
             }
         )
 
@@ -782,14 +873,16 @@ def main(argv):
             torch.cuda.empty_cache()
         if completed_step % train_cfg["log_interval"] == 0:
             logger.info(
-                "step=%s rollout=%s/%s stage=%s/%s t=%.4f resolution=%sx%s "
-                "total=%.6f l1=%.6f "
+                "step=%s rollout=%s/%s stage=%s/%s local_update=%s/%s "
+                "t=%.4f resolution=%sx%s total=%.6f l1=%.6f "
                 "lpips=%.6f psnr=%.4f optimizer_step_applied=%s lr=%.8f",
                 completed_step,
                 rollout_index + 1,
                 train_cfg["ar_num_rollouts"],
                 stage_index + 1,
                 train_cfg["ar_num_stages"],
+                local_step_index + 1,
+                train_cfg["ar_steps_per_stage"],
                 t_value,
                 output_w,
                 output_h,
@@ -816,7 +909,7 @@ def main(argv):
             )
         if completed_step % train_cfg["eval_interval"] == 0:
             metrics, metrics_input = evaluate_single_scene(
-                model=model,
+                model=inference_model,
                 input_gs=batch_gs[0],
                 num_rollout_steps=train_cfg["ar_num_stages"],
                 num_stages=train_cfg["ar_num_stages"],
@@ -835,19 +928,23 @@ def main(argv):
             )
             _log_eval_metrics(
                 logger,
-                f"Eval step {completed_step} rollout {rollout_index + 1} full_hr",
+                f"Eval step {completed_step} rollout {rollout_index + 1} "
+                f"full_hr inference={'ema' if model_ema is not None else 'online'}",
                 metrics,
                 metrics_input,
             )
         if completed_step % train_cfg["save_interval"] == 0:
-            torch.save(
-                model.state_dict(),
-                os.path.join(FLAGS.output_dir, "checkpoints", f"model_{completed_step:08d}.pth"),
-            )
+            paths = checkpoint_paths(checkpoint_dir, completed_step)
+            torch.save(model.state_dict(), paths["online"])
+            if model_ema is not None:
+                torch.save(model_ema.module.state_dict(), paths["ema"])
 
-    torch.save(model.state_dict(), os.path.join(FLAGS.output_dir, "checkpoints", "model_last.pth"))
+    final_paths = checkpoint_paths(checkpoint_dir)
+    torch.save(model.state_dict(), final_paths["online"])
+    if model_ema is not None:
+        torch.save(model_ema.module.state_dict(), final_paths["ema"])
     metrics, metrics_input = evaluate_single_scene(
-        model=model,
+        model=inference_model,
         input_gs=batch_gs[0],
         num_rollout_steps=train_cfg["ar_num_stages"],
         num_stages=train_cfg["ar_num_stages"],
@@ -864,7 +961,12 @@ def main(argv):
         save_residuals=FLAGS.save_residuals,
         output_gt=True,
     )
-    _log_eval_metrics(logger, "Final eval", metrics, metrics_input)
+    _log_eval_metrics(
+        logger,
+        f"Final eval inference={'ema' if model_ema is not None else 'online'}",
+        metrics,
+        metrics_input,
+    )
 
 
 if __name__ == "__main__":

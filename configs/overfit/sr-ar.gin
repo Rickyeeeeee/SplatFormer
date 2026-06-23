@@ -1,12 +1,17 @@
 set_seed.seed = 42
 
 # training.total_steps is retained for compatibility. overfit-sr-ar.py derives
-# the actual budget from ar_num_stages * ar_num_rollouts.
-total_steps = 1000
+# the actual budget from ar_num_rollouts * ar_num_stages * ar_steps_per_stage.
+total_steps = 2000
 training.total_steps = %total_steps
 training.pretrain_steps = 0
-training.ar_num_stages = 10
-training.ar_num_rollouts = 100
+training.ar_num_stages = 2
+training.ar_num_rollouts = 2
+training.ar_steps_per_stage = 500
+training.ema_enabled = True
+training.ema_decay = 0.999
+training.ema_warmup_steps = 0
+training.ema_resume_ckpt = None
 training.eval_interval = 200
 training.save_interval = 200
 training.log_interval = 20
