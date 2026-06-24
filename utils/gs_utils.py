@@ -1,6 +1,5 @@
 import torch
 import gin 
-import gsplat 
 import math
 import numpy as np
 import os, cv2
@@ -9,6 +8,7 @@ from plyfile import PlyData, PlyElement
 import json
 from argparse import Namespace
 import torch_scatter
+from gsplat.rendering import rasterization
 BLOCK_WIDTH = 16 
 
 C0 = 0.28209479177387814
@@ -17,38 +17,42 @@ def SH2RGB(sh):
 def RGB2SH(rgb):
     return (rgb - 0.5) / C0
 
-def rasterize_gaussians_to_multiimgs(gs_params, cameras):
-    camera_to_worlds = cameras['camera_to_worlds']
-    rgbs, alphas = [], []
-    for camera_to_world in camera_to_worlds:
-        rgb, alpha = rasterize_gaussians_to_singleimg(gs_params, camera_to_world, **cameras)
-        rgbs.append(rgb)
-        alphas.append(alpha)
-    return rgbs, alphas
+def _to_python_scalar(value):
+    return value.item() if torch.is_tensor(value) else value
 
-def rasterize_gaussians_to_singleimg(gs_params, camera_to_world, cx, cy, fx, fy, width, height, background_color, **kwargs):
-    #Turn half to float
-    gs_params = {k:v.float() if v.dtype==torch.half else v for k,v in gs_params.items()}
-    R = camera_to_world[:3, :3]
-    T = camera_to_world[:3, 3:4]
-    # flip the z and y axes to align with gsplat conventions (opengl/blender to opencv/colmap)
-    R_edit = torch.diag(torch.tensor([1, -1, -1], device='cuda', dtype=R.dtype))
-    R = R @ R_edit
-    # analytic matrix inverse to get world2camera matrix
-    R_inv = R.T
-    T_inv = -R_inv @ T
-    viewmat = torch.eye(4, device=R.device, dtype=R.dtype)
-    viewmat[:3, :3] = R_inv
-    viewmat[:3, 3:4] = T_inv
 
+def _camera_to_viewmats(camera_to_worlds, device, dtype):
+    """Convert OpenGL/Blender camera-to-world matrices to gsplat world-to-camera matrices."""
+    if camera_to_worlds.ndim == 2:
+        camera_to_worlds = camera_to_worlds.unsqueeze(0)
+    camera_to_worlds = camera_to_worlds.to(device=device, dtype=dtype)
+
+    rotations = camera_to_worlds[:, :3, :3]
+    translations = camera_to_worlds[:, :3, 3:4]
+    axis_flip = torch.diag(
+        torch.tensor([1, -1, -1], device=device, dtype=dtype)
+    )
+    rotations = rotations @ axis_flip
+
+    rotations_inv = rotations.transpose(-1, -2)
+    translations_inv = -rotations_inv @ translations
+    viewmats = torch.eye(4, device=device, dtype=dtype).expand(
+        camera_to_worlds.shape[0], -1, -1
+    ).clone()
+    viewmats[:, :3, :3] = rotations_inv
+    viewmats[:, :3, 3:4] = translations_inv
+    return viewmats
+
+
+def _prepare_render_inputs(gs_params):
+    # gsplat's CUDA kernels require float32 rather than float16 inputs.
+    gs_params = {
+        key: value.float() if value.dtype == torch.half else value
+        for key, value in gs_params.items()
+    }
     means = gs_params['means']
     scales = torch.exp(gs_params['scales'])
-    quats = gs_params['quats']/torch.norm(gs_params['quats'], dim=-1, keepdim=True)
-    mask = (quats.norm(dim=-1) - 1)<1e-6
-    inv_mask = ~mask
-    if inv_mask.sum() > 0:
-        print(f"Warning: {mask.sum()} quaternions are not normalized\n, This quaternions are ")
-        quats[inv_mask] = torch.tensor([0, 0, 0, 1.], device=quats.device)
+    quats = gs_params['quats']
 
     if 'opacities' in gs_params:
         opacities = torch.sigmoid(gs_params['opacities'])
@@ -56,62 +60,129 @@ def rasterize_gaussians_to_singleimg(gs_params, camera_to_world, cx, cy, fx, fy,
         opacities = gs_params['opacities_sigmoid']
     else:
         raise ValueError("No opacities found in gs_params")
-    if 'features_rest' in gs_params:
-        colors = torch.cat([gs_params['features_dc'].unsqueeze(1), gs_params['features_rest']], dim=1)
-    else:
-        colors = gs_params['features_dc'].unsqueeze(1)
-    n = int(math.sqrt(colors.shape[1])-1)
-    if n==0:
-        rgbs = torch.sigmoid(colors[:,0,:])
-    else:
-        viewdirs_ = means.detach() - camera_to_world.detach()[:3, 3]  # (N, 3)
-        viewdirs_norm = viewdirs_.norm(dim=-1, keepdim=True)
-        viewdirs = viewdirs_ / viewdirs_norm
-        ## In some extremely rare case, the gs mean can be the same as the camera position
-        # In this case, we set viewdirs randomly
-        if torch.isnan(viewdirs).any():
-            mask_ = (viewdirs_norm==0).squeeze() #N,
-            newviewdir = torch.randn_like(viewdirs_[mask_]) #N,3
-            newviewdir_norm = newviewdir.norm(dim=-1, keepdim=True)
-            viewdirs[mask_] = newviewdir/newviewdir_norm
-            
-        rgbs = gsplat.spherical_harmonics(n, viewdirs, colors)
-        rgbs = torch.clamp(rgbs + 0.5, min=0.0)  # type: ignore
-    H, W = int(height.item()), int(width.item())
-   
-    xys, depths, radii, conics, comp, num_tiles_hit, cov3d = gsplat.project_gaussians(  # type: ignore
-        means,
-        scales,
-        1,
-        quats,
-        viewmat.squeeze()[:3, :].float(),
-        fx.item(),
-        fy.item(),
-        cx.item(),
-        cy.item(),
-        H,
-        W,
-        BLOCK_WIDTH,
-    ) 
-    rgb, alpha = gsplat.rasterize_gaussians(  
-        xys,
-        depths,
-        radii,
-        conics,
-        num_tiles_hit,  
-        rgbs,
-        opacities,
-        H,
-        W,
-        BLOCK_WIDTH,
-        background = background_color,
-        return_alpha=True,
-    )  
+    opacities = opacities.reshape(-1)
+    if opacities.shape[0] != means.shape[0]:
+        raise ValueError(
+            f"Expected one opacity per Gaussian, got {opacities.shape[0]} "
+            f"opacities for {means.shape[0]} Gaussians"
+        )
 
-    rgb = torch.clamp(rgb, max=1.0)  
-    alpha = alpha.unsqueeze(-1)
+    features_rest = gs_params.get('features_rest')
+    if features_rest is not None and features_rest.shape[1] > 0:
+        colors = torch.cat(
+            [gs_params['features_dc'].unsqueeze(1), features_rest], dim=1
+        )
+        sh_degree = int(math.sqrt(colors.shape[1]) - 1)
+    else:
+        colors = torch.sigmoid(gs_params['features_dc'])
+        sh_degree = None
 
-    return rgb, alpha
+    return means, quats, scales, opacities, colors, sh_degree
+
+
+def _rasterize_gaussians(
+    gs_params,
+    camera_to_worlds,
+    cx,
+    cy,
+    fx,
+    fy,
+    width,
+    height,
+    background_color,
+):
+    means, quats, scales, opacities, colors, sh_degree = _prepare_render_inputs(
+        gs_params
+    )
+    viewmats = _camera_to_viewmats(
+        camera_to_worlds, device=means.device, dtype=means.dtype
+    )
+    camera_count = viewmats.shape[0]
+
+    K = torch.tensor(
+        [
+            [_to_python_scalar(fx), 0.0, _to_python_scalar(cx)],
+            [0.0, _to_python_scalar(fy), _to_python_scalar(cy)],
+            [0.0, 0.0, 1.0],
+        ],
+        device=means.device,
+        dtype=means.dtype,
+    )
+    Ks = K.unsqueeze(0).expand(camera_count, -1, -1).contiguous()
+    H, W = int(_to_python_scalar(height)), int(_to_python_scalar(width))
+
+    render_colors, render_alphas, _ = rasterization(
+        means=means,
+        quats=quats,
+        scales=scales,
+        opacities=opacities,
+        colors=colors,
+        viewmats=viewmats,
+        Ks=Ks,
+        width=W,
+        height=H,
+        sh_degree=sh_degree,
+        packed=True,
+        tile_size=BLOCK_WIDTH,
+        render_mode="RGB",
+        rasterize_mode="classic",
+    )
+
+    # gsplat 1.5.3 does not handle per-camera backgrounds correctly in packed
+    # mode, so composite the shared background from the returned alpha instead.
+    background = torch.as_tensor(
+        background_color, device=means.device, dtype=render_colors.dtype
+    ).reshape(-1)
+    if background.shape[0] != render_colors.shape[-1]:
+        raise ValueError(
+            f"Expected a {render_colors.shape[-1]}-channel background, "
+            f"got shape {tuple(background.shape)}"
+        )
+    render_colors = render_colors + (1.0 - render_alphas) * background.view(
+        1, 1, 1, -1
+    )
+    render_colors = torch.clamp(render_colors, max=1.0)
+    return render_colors, render_alphas
+
+
+def rasterize_gaussians_to_multiimgs(gs_params, cameras, batched=False):
+    """Render several cameras, optionally using gsplat's native camera batching."""
+    camera_to_worlds = cameras['camera_to_worlds']
+    if batched:
+        rgbs, alphas = _rasterize_gaussians(
+            gs_params,
+            camera_to_worlds,
+            cx=cameras['cx'],
+            cy=cameras['cy'],
+            fx=cameras['fx'],
+            fy=cameras['fy'],
+            width=cameras['width'],
+            height=cameras['height'],
+            background_color=cameras['background_color'],
+        )
+        return list(rgbs.unbind(0)), list(alphas.unbind(0))
+
+    rgbs, alphas = [], []
+    for camera_to_world in camera_to_worlds:
+        rgb, alpha = rasterize_gaussians_to_singleimg(gs_params, camera_to_world, **cameras)
+        rgbs.append(rgb)
+        alphas.append(alpha)
+    return rgbs, alphas
+
+
+def rasterize_gaussians_to_singleimg(gs_params, camera_to_world, cx, cy, fx, fy, width, height, background_color, **kwargs):
+    rgbs, alphas = _rasterize_gaussians(
+        gs_params,
+        camera_to_world,
+        cx=cx,
+        cy=cy,
+        fx=fx,
+        fy=fy,
+        width=width,
+        height=height,
+        background_color=background_color,
+    )
+    return rgbs[0], alphas[0]
 
 def focal2fov(focal, pixels):
     return 2*math.atan(pixels/(2*focal))

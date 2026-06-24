@@ -22,7 +22,7 @@ eval_interval=${3:-200}
 log_image_interval=${4:-200}
 
 out_name=${scene_name}
-output_dir=/project/ricky/outputs/objaverse_splatformer_overfit_sr512/${out_name}
+output_dir=/project/ricky/outputs/objaverse_splatformer_overfit_sr_512_gsplat/${out_name}
 
 CUDA_VISIBLE_DEVICES=$GPU_ID python overfit-sr.py \
     --output_dir=${output_dir} \

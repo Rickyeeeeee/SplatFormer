@@ -24,8 +24,11 @@ pip install flash-attn --no-build-isolation
 pip install -r requirements.txt
 
 # Install gsplat
-pip install git+https://github.com/nerfstudio-project/gsplat.git@v0.1.11
+pip install gsplat==1.5.3
 ```
+
+The vendored `DataGenerator/nerfstudio` code still uses gsplat's legacy two-step
+rendering API. Install and run it in a separate environment with `gsplat==0.1.11`.
 
 ## Out-of-distribution (OOD) Novel View Synthesis Test Sets
 Our OOD-NVS test sets can be downloaded [here](https://drive.google.com/file/d/1-mUCl-yxe1aE0rrQDHKlXk1J2n8d1-60/view?usp=sharing). There are three object-centric OOD NVS test sets rendered from ShapeNet-core, Objaverse-v1, and GSO, and one real-world iPhone image set captured by us. All scene directories are in colmap-like structure. 
