@@ -9,7 +9,7 @@ total_steps=${1:-2000}
 save_interval=${2:-200}
 eval_interval=${3:-200}
 log_image_interval=${4:-200}
-alignment=${5:-emd}
+alignment=${5:-nearest}
 attribute_init=${6:-3dgs}
 input_factor=${7:-4}
 target_factor=${8:-2}
@@ -19,7 +19,7 @@ flow_noise_std=${11:-0.0}
 conda_env=${CONDA_ENV:-3dgs-sr}
 gt_features_dc=${GT_FEATURES_DC:-true}
 gt_features_rest=${GT_FEATURES_REST:-true}
-gt_opacities=${GT_OPACITIES:-true}
+gt_opacities=${GT_OPACITIES:-false}
 gt_scales=${GT_SCALES:-true}
 gt_quats=${GT_QUATS:-true}
 
