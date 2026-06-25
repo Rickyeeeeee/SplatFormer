@@ -1,5 +1,4 @@
 import torch, gin 
-from models.feature_predictor import FeaturePredictor
 @gin.configurable
 def build_3DGSoptimizer(gs_params, lr_dict, optimizer_type, optimizer_params):
     params_lr = []
@@ -23,8 +22,8 @@ def build_optimizer(model,
                     optimizer_type: gin.REQUIRED,
                     optimizer_params):  
     params_lr = []
-    if type(model) == FeaturePredictor:
-        if model.backbone_type != 'empty':
+    if hasattr(model, 'backbone') and hasattr(model, 'features_outputhead'):
+        if getattr(model, 'backbone_type', None) != 'empty':
             params_lr.append({'params': model.backbone.parameters(), 'lr': lr_dict['backbone']})
         for feature in model.features_outputhead.keys():
             lr = lr_dict.get(feature, lr_dict['base'])

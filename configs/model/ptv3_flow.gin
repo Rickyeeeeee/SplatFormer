@@ -1,0 +1,19 @@
+FeaturePredictor.input_features = ['means', 'scales', 'opacities', 'quats', 'features_dc', 'features_rest']
+GSFlowPredictor.sh_degree = 1
+GSFlowPredictor.output_head_nlayer = 4
+GSFlowPredictor.output_head_type = 'mlp-relu'
+GSFlowPredictor.grid_resolution = 384
+GSFlowPredictor.resume_ckpt = None
+GSFlowPredictor.input_features = ['means', 'scales', 'opacities', 'quats', 'features_dc', 'features_rest']
+GSFlowPredictor.output_features = ['means', 'scales', 'opacities', 'quats', 'features_dc', 'features_rest']
+GSFlowPredictor.output_head_width = 128
+GSFlowPredictor.zeroinit = True
+GSFlowPredictor.input_feat_to_mlp = True
+
+PointTransformerV3FlowModel.enable_flash = True
+PointTransformerV3FlowModel.output_dim = 96
+PointTransformerV3FlowModel.enc_dim = 64
+PointTransformerV3FlowModel.turn_off_bn = False
+PointTransformerV3FlowModel.stride = (1, 2, 2, 2)
+PointTransformerV3FlowModel.embedding_type = 'MLP'
+PointTransformerV3FlowModel.T_dim = 3
