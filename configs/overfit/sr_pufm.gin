@@ -14,6 +14,9 @@ training.empty_cache_fre = -1
 flow_matching.flow_steps = 5
 flow_matching.flow_space = 'render'
 flow_matching.flow_noise_std = 0.0
+flow_matching.flow_loss_weight = 1.0
+flow_matching.render_loss_weight = 1.0
+flow_matching.flow_loss_grad_keys = ['means']
 flow_matching.loss_weights = {
     'means': 1.0,
     'features_dc': 1.0,

@@ -100,14 +100,22 @@ def flow_matching(
     flow_space="render",
     flow_noise_std=0.0,
     loss_weights=None,
+    flow_loss_weight=1.0,
+    render_loss_weight=1.0,
+    flow_loss_grad_keys=None,
 ):
     if loss_weights is None:
         loss_weights = {key: 1.0 for key in FLOW_KEYS}
+    if flow_loss_grad_keys is None:
+        flow_loss_grad_keys = ["means"]
     return {
         "flow_steps": flow_steps,
         "flow_space": flow_space,
         "flow_noise_std": flow_noise_std,
         "loss_weights": loss_weights,
+        "flow_loss_weight": flow_loss_weight,
+        "render_loss_weight": render_loss_weight,
+        "flow_loss_grad_keys": list(flow_loss_grad_keys),
     }
 
 
@@ -195,19 +203,41 @@ def add_flow_noise(flow_gs, std):
     return {key: value + torch.randn_like(value) * std for key, value in flow_gs.items()}
 
 
-def flow_loss(pred_vel, target_vel, loss_weights):
+def flow_loss(pred_vel, target_vel, loss_weights, grad_keys):
     losses = {}
     total = None
+    grad_keys = set(grad_keys)
     for key in FLOW_KEYS:
         if key not in pred_vel or key not in target_vel:
             continue
         loss = (pred_vel[key] - target_vel[key]).pow(2).mean()
         losses[key] = loss
-        weighted = float(loss_weights.get(key, 1.0)) * loss
+        weighted_loss = loss if key in grad_keys else loss.detach()
+        weighted = float(loss_weights.get(key, 1.0)) * weighted_loss
         total = weighted if total is None else total + weighted
     if total is None:
         raise ValueError("No overlapping flow keys between prediction and target")
     return total, losses
+
+
+def extrapolate_target_flow_gs(query_flow_gs, pred_vel, t):
+    remaining = (1.0 - t).view(1, 1)
+    target_hat = {}
+    for key, value in query_flow_gs.items():
+        if key in pred_vel:
+            target_hat[key] = value + remaining * pred_vel[key]
+        else:
+            target_hat[key] = value.clone()
+    return target_hat
+
+
+def render_l1_loss(gs_raw, cameras, images):
+    pred_imgs, _ = gs_utils.rasterize_gaussians_to_multiimgs(gs_raw, cameras)
+    loss = 0.0
+    for pred_img, gt_img in zip(pred_imgs, images):
+        gt_rgb = gt_img[..., :3]
+        loss = loss + (pred_img - gt_rgb).abs().mean()
+    return loss / max(1, len(pred_imgs)), pred_imgs
 
 
 def sample_flow_model(model, source_flow_gs, scene_idx, flow_steps, flow_space):
@@ -562,14 +592,18 @@ def main(argv):
         f"alignment={FLAGS.alignment} attribute_init={FLAGS.attribute_init} "
         f"gt_attributes={','.join(gt_attribute_keys) if gt_attribute_keys else 'none'} "
         f"flow_space={flow_cfg['flow_space']} flow_steps={flow_cfg['flow_steps']} "
-        f"flow_noise_std={flow_cfg['flow_noise_std']}"
+        f"flow_noise_std={flow_cfg['flow_noise_std']} "
+        f"flow_loss_weight={flow_cfg['flow_loss_weight']} "
+        f"render_loss_weight={flow_cfg['render_loss_weight']} "
+        f"flow_loss_grad_keys={','.join(flow_cfg['flow_loss_grad_keys'])}"
     )
 
     os.makedirs(os.path.join(FLAGS.output_dir, "train"), exist_ok=True)
     os.makedirs(os.path.join(FLAGS.output_dir, "checkpoints"), exist_ok=True)
 
-    init_batch_images = gpu_utils.move_to_device([train_payload["images"]], device)
-    gt_imgs_uint8 = [(img[..., :3] * 255).detach().cpu().numpy().astype(np.uint8) for img in init_batch_images[0]]
+    train_images_device = gpu_utils.move_to_device(train_payload["images"], device)
+    train_cameras_device = gpu_utils.move_to_device(train_payload["cameras"], device)
+    gt_imgs_uint8 = [(img[..., :3] * 255).detach().cpu().numpy().astype(np.uint8) for img in train_images_device]
     if len(gt_imgs_uint8) > 0:
         gt_grid = cv2.cvtColor(make_grid(gt_imgs_uint8), cv2.COLOR_RGB2BGR)
         cv2.imwrite(os.path.join(FLAGS.output_dir, "train", "00000000_gt.png"), gt_grid)
@@ -586,7 +620,16 @@ def main(argv):
 
         with torch.cuda.amp.autocast(enabled=enable_amp):
             pred_vel = model(batch_flow_gs=[query_flow_gs], batch_scene_idx=batch_scene_idx, t=t)[0]
-            total_loss, attr_losses = flow_loss(pred_vel, target_vel, flow_cfg["loss_weights"])
+            flow_total_loss, attr_losses = flow_loss(
+                pred_vel, target_vel, flow_cfg["loss_weights"], flow_cfg["flow_loss_grad_keys"]
+            )
+            target_hat_flow_gs = extrapolate_target_flow_gs(query_flow_gs, pred_vel, t)
+            target_hat_raw_gs = flow_to_raw_gs(target_hat_flow_gs, flow_cfg["flow_space"])
+            render_loss, pred_imgs_for_log = render_l1_loss(target_hat_raw_gs, train_cameras_device, train_images_device)
+            total_loss = (
+                float(flow_cfg["flow_loss_weight"]) * flow_total_loss
+                + float(flow_cfg["render_loss_weight"]) * render_loss
+            )
 
         if enable_amp:
             scaler.scale(total_loss).backward()
@@ -604,7 +647,13 @@ def main(argv):
         optimizer.zero_grad(set_to_none=True)
         scheduler.step()
 
-        postfix = {"loss": f"{total_loss.item():.4f}", "t": f"{t.item():.3f}", "lr": f"{optimizer.param_groups[0]['lr']:.2e}"}
+        postfix = {
+            "loss": f"{total_loss.item():.4f}",
+            "flow": f"{flow_total_loss.item():.4f}",
+            "render": f"{render_loss.item():.4f}",
+            "t": f"{t.item():.3f}",
+            "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
+        }
         for key in ["means", "features_dc", "features_rest", "opacities", "scales", "quats"]:
             if key in attr_losses:
                 postfix[key] = f"{attr_losses[key].item():.3e}"
@@ -616,7 +665,11 @@ def main(argv):
         if step % log_interval == 0:
             attr_str = " ".join([f"{key}={value.item():.6f}" for key, value in attr_losses.items()])
             logger.info(
-                f"step={step} total={total_loss.item():.6f} t={t.item():.6f} "
+                f"step={step} total={total_loss.item():.6f} "
+                f"flow={flow_total_loss.item():.6f} render={render_loss.item():.6f} "
+                f"flow_w={float(flow_cfg['flow_loss_weight']):.6f} "
+                f"render_w={float(flow_cfg['render_loss_weight']):.6f} "
+                f"fm_grad={','.join(flow_cfg['flow_loss_grad_keys'])} t={t.item():.6f} "
                 f"lr={optimizer.param_groups[0]['lr']:.8f} {attr_str}"
             )
 
@@ -625,8 +678,7 @@ def main(argv):
                 train_out_gs = sample_flow_model(
                     model, source_flow_gs, scene["idx"], int(flow_cfg["flow_steps"]), flow_cfg["flow_space"]
                 )
-                train_cameras = gpu_utils.move_to_device(train_payload["cameras"], device)
-                pred_imgs, _ = gs_utils.rasterize_gaussians_to_multiimgs(train_out_gs, train_cameras)
+                pred_imgs, _ = gs_utils.rasterize_gaussians_to_multiimgs(train_out_gs, train_cameras_device)
                 pred_imgs_uint8 = [(im * 255).detach().cpu().numpy().astype(np.uint8) for im in pred_imgs[:9]]
                 if len(pred_imgs_uint8) > 0:
                     pred_grid = cv2.cvtColor(make_grid(pred_imgs_uint8), cv2.COLOR_RGB2BGR)

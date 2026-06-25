@@ -14,8 +14,10 @@ attribute_init=${6:-3dgs}
 input_factor=${7:-4}
 target_factor=${8:-2}
 flow_space=${9:-bounded}
-flow_steps=${10:-10}
+flow_steps=${10:-5}
 flow_noise_std=${11:-0.0}
+flow_loss_weight=${12:-0.0}
+render_loss_weight=${13:-1.0}
 conda_env=${CONDA_ENV:-3dgs-sr}
 gt_features_dc=${GT_FEATURES_DC:-true}
 gt_features_rest=${GT_FEATURES_REST:-true}
@@ -41,7 +43,7 @@ to_bit() {
 
 gt_attr_bits="$(to_bit ${gt_features_dc})$(to_bit ${gt_features_rest})$(to_bit ${gt_opacities})$(to_bit ${gt_scales})$(to_bit ${gt_quats})"
 
-out_name=${scene_name}_${alignment}_${attribute_init}_gt${gt_attr_bits}_if${input_factor}_tf${target_factor}_${flow_space}_fs${flow_steps}_n${flow_noise_std}
+out_name=${scene_name}_${alignment}_${attribute_init}_gt${gt_attr_bits}_if${input_factor}_tf${target_factor}_${flow_space}_fs${flow_steps}_n${flow_noise_std}_fw${flow_loss_weight}_rw${render_loss_weight}
 output_dir=/project/ricky/outputs/objaverse_splatformer_overfit_sr_pufm_512_gsplat/${out_name}
 
 CUDA_VISIBLE_DEVICES=$GPU_ID python overfit-sr-pufm.py \
@@ -54,6 +56,8 @@ CUDA_VISIBLE_DEVICES=$GPU_ID python overfit-sr-pufm.py \
     --flow_space=${flow_space} \
     --flow_steps=${flow_steps} \
     --flow_noise_std=${flow_noise_std} \
+    --gin_param="flow_matching.flow_loss_weight=${flow_loss_weight}" \
+    --gin_param="flow_matching.render_loss_weight=${render_loss_weight}" \
     --gt_features_dc=${gt_features_dc} \
     --gt_features_rest=${gt_features_rest} \
     --gt_opacities=${gt_opacities} \
