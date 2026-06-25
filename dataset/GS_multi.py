@@ -358,6 +358,7 @@ class SplatFactoMultiLevelDataset(torch.utils.data.IterableDataset):
                 "meta": meta,
                 "imgs_path": imgs_path,
                 "imgs_name": [os.path.basename(path) for path in imgs_path],
+                "scaler": scaler,
             }
             self._validate_pose_image_count(factor, factor_entry)
             factor_data[factor] = factor_entry
