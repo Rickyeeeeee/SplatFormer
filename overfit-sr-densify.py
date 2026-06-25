@@ -27,8 +27,19 @@ flags.DEFINE_boolean("save_residuals", True, "Save residual tensors and stats")
 flags.DEFINE_integer("input_factor", 4, "Low-resolution GS factor used as densification source")
 flags.DEFINE_integer("target_factor", 2, "High-resolution GS/image factor used as overfit target")
 flags.DEFINE_enum("alignment", "emd", ["emd", "nearest"], "Interpolated-to-target alignment method")
+flags.DEFINE_enum(
+    "attribute_init",
+    "aligned",
+    ["aligned", "3dgs"],
+    "How to initialize non-position GS attributes after high-res positions are fixed",
+)
 flags.DEFINE_float("emd_eps", 0.01, "Auction EMD epsilon")
 flags.DEFINE_integer("emd_iters", 100, "Auction EMD iterations")
+flags.DEFINE_boolean("gt_features_dc", False, "Initialize features_dc from GT high-res GS")
+flags.DEFINE_boolean("gt_features_rest", False, "Initialize features_rest from GT high-res GS")
+flags.DEFINE_boolean("gt_opacities", False, "Initialize opacities from GT high-res GS")
+flags.DEFINE_boolean("gt_scales", False, "Initialize scales from GT high-res GS")
+flags.DEFINE_boolean("gt_quats", False, "Initialize quats from GT high-res GS")
 flags.DEFINE_multi_string("gin_file", None, "List of paths to the config files.")
 flags.DEFINE_multi_string("gin_param", "", "Newline separated list of Gin parameter bindings.")
 
@@ -141,13 +152,7 @@ def _build_split_payload(dataset, scene_idx, scene_name, factor_entry, split):
         background = torch.tensor(dataset.background_color, dtype=torch.float32) / 255.0
 
     total_num = len(meta["camera_to_worlds"])
-    if split == "train":
-        if dataset.image_per_scene is None:
-            sample_num = total_num
-        else:
-            sample_num = min(dataset.image_per_scene, total_num)
-        cam_ids = np.random.permutation(total_num)[:sample_num]
-    elif split == "test":
+    if split in ["train", "test"]:
         cam_ids = np.arange(total_num)
     else:
         raise ValueError(f"Unsupported split: {split}")
@@ -332,6 +337,45 @@ def _align_emd_target_to_source(source_means, target_means, eps, iters):
     return best_source.to(source_means.device)
 
 
+def _nearest_neighbor_dist2(means):
+    count = means.shape[0]
+    if count <= 1:
+        return torch.full((count,), 1e-7, device=means.device, dtype=means.dtype)
+    nn_idx = _chunked_knn_indices(means, means, 2)
+    nearest = means[nn_idx[:, 1]]
+    dist2 = ((means - nearest) ** 2).sum(dim=-1)
+    return torch.clamp_min(dist2, 1e-7)
+
+
+def _apply_3dgs_attribute_init(densified_gs):
+    means = densified_gs["means"]
+    count = means.shape[0]
+    device = means.device
+    dtype = means.dtype
+
+    if "scales" in densified_gs:
+        dist2 = _nearest_neighbor_dist2(means)
+        densified_gs["scales"] = torch.log(torch.sqrt(dist2))[..., None].repeat(1, 3)
+
+    if "quats" in densified_gs:
+        quats = torch.zeros((count, 4), device=device, dtype=dtype)
+        quats[:, 0] = 1
+        densified_gs["quats"] = quats
+
+    if "opacities" in densified_gs:
+        opacity = 0.1 * torch.ones((count, 1), device=device, dtype=dtype)
+        densified_gs["opacities"] = torch.logit(opacity)
+
+    return densified_gs
+
+
+def _apply_gt_attribute_overrides(densified_gs, target_gs, gt_attribute_keys):
+    for key in gt_attribute_keys:
+        if key in target_gs and key in densified_gs:
+            densified_gs[key] = target_gs[key].clone()
+    return densified_gs
+
+
 def _save_densify_stage_plys(output_dir, low_res_gs, interpolated_gs, gt_high_res_gs, input_high_res_gs):
     stage_dir = os.path.join(output_dir, "densify_init")
     gs_utils.export_ply_forviewer(low_res_gs, os.path.join(stage_dir, "00_low_res_gs.ply"))
@@ -344,10 +388,12 @@ def build_densified_input_gs(
     input_factor_entry,
     target_factor_entry,
     alignment,
+    attribute_init,
     emd_eps,
     emd_iters,
     device,
     output_dir=None,
+    gt_attribute_keys=None,
 ):
     input_gs = gpu_utils.move_to_device(input_factor_entry["gs_params"], device)
     target_gs = gpu_utils.move_to_device(target_factor_entry["gs_params"], device)
@@ -377,6 +423,15 @@ def build_densified_input_gs(
             densified_gs[key] = interpolated_gs[key][source_idx].clone()
         else:
             densified_gs[key] = value.clone()
+
+    if attribute_init == "3dgs":
+        densified_gs = _apply_3dgs_attribute_init(densified_gs)
+    elif attribute_init != "aligned":
+        raise ValueError(f"Unsupported attribute initialization: {attribute_init}")
+
+    if gt_attribute_keys is None:
+        gt_attribute_keys = []
+    densified_gs = _apply_gt_attribute_overrides(densified_gs, target_gs, gt_attribute_keys)
 
     if output_dir is not None:
         _save_densify_stage_plys(
@@ -606,14 +661,27 @@ def main(argv):
             dataset, scene["idx"], scene["scene_name"], target_factor_entry, split="train"
         )
 
+    gt_attribute_keys = []
+    for flag_name, key in [
+        ("gt_features_dc", "features_dc"),
+        ("gt_features_rest", "features_rest"),
+        ("gt_opacities", "opacities"),
+        ("gt_scales", "scales"),
+        ("gt_quats", "quats"),
+    ]:
+        if getattr(FLAGS, flag_name):
+            gt_attribute_keys.append(key)
+
     densified_input_gs = build_densified_input_gs(
         input_factor_entry=input_factor_entry,
         target_factor_entry=target_factor_entry,
         alignment=FLAGS.alignment,
+        attribute_init=FLAGS.attribute_init,
         emd_eps=FLAGS.emd_eps,
         emd_iters=FLAGS.emd_iters,
         device=device,
         output_dir=FLAGS.output_dir,
+        gt_attribute_keys=gt_attribute_keys,
     )
     batch_gs = gpu_utils.move_to_device([densified_input_gs], device)
     batch_scene_idx = [scene["idx"]]
@@ -648,6 +716,8 @@ def main(argv):
     scaler = torch.cuda.amp.GradScaler(enabled=enable_amp)
     lpips_loss_func = loss_utils.lpips_loss_fn() if lpips_loss_weight > 0 else None
 
+    print("test")
+
     print(
         f"Overfit scene={scene['scene_name']} idx={scene['idx']} "
         f"train_views={len(train_payload['images'])} eval_views={len(eval_payload['images'])} "
@@ -655,7 +725,8 @@ def main(argv):
         f"densified_gaussians={batch_gs[0]['means'].shape[0]} "
         f"target_gaussians={target_factor_entry['gs_params']['means'].shape[0]} "
         f"input_factor={FLAGS.input_factor} target_factor={FLAGS.target_factor} "
-        f"alignment={FLAGS.alignment}"
+        f"alignment={FLAGS.alignment} attribute_init={FLAGS.attribute_init} "
+        f"gt_attributes={','.join(gt_attribute_keys) if gt_attribute_keys else 'none'}"
     )
 
     os.makedirs(os.path.join(FLAGS.output_dir, "train"), exist_ok=True)

@@ -1,15 +1,6 @@
 #!/bin/bash
 
-GPU_ID=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits \
-    | awk '$1 == 0 {print NR-1}' \
-    | head -n1)
-
-if [ -z "$GPU_ID" ]; then
-    echo "[ERROR] No available GPU found. Exiting."
-    exit 1
-fi
 GPU_ID=${GPU_ID:-5}
-GPU_ID=5
 echo "Using GPU: $GPU_ID"
 
 # for scene_name in $(ls /project/ricky/splatformer-data/test-set-512/colmap)
@@ -22,19 +13,40 @@ save_interval=${2:-200}
 eval_interval=${3:-200}
 log_image_interval=${4:-200}
 alignment=${5:-emd}
-input_factor=${6:-4}
-target_factor=${7:-2}
+attribute_init=${6:-3dgs}
+input_factor=${7:-4}
+target_factor=${8:-2}
 conda_env=${CONDA_ENV:-3dgs-sr}
+gt_features_dc=${GT_FEATURES_DC:-true}
+gt_features_rest=${GT_FEATURES_REST:-true}
+gt_opacities=${GT_OPACITIES:-true}
+gt_scales=${GT_SCALES:-false}
+gt_quats=${GT_QUATS:-false}
 
-out_name=${scene_name}_${alignment}_if${input_factor}_tf${target_factor}
+to_bit() {
+    case "$1" in
+        true|True|TRUE|1|yes|Yes|YES) echo 1 ;;
+        *) echo 0 ;;
+    esac
+}
+
+gt_attr_bits="$(to_bit ${gt_features_dc})$(to_bit ${gt_features_rest})$(to_bit ${gt_opacities})$(to_bit ${gt_scales})$(to_bit ${gt_quats})"
+
+out_name=${scene_name}_${alignment}_${attribute_init}_gt${gt_attr_bits}_if${input_factor}_tf${target_factor}
 output_dir=/project/ricky/outputs/objaverse_splatformer_overfit_sr_densify_512_gsplat/${out_name}
 
-CUDA_VISIBLE_DEVICES=$GPU_ID conda run -n ${conda_env} python overfit-sr-densify.py \
+CUDA_VISIBLE_DEVICES=$GPU_ID python overfit-sr-densify.py \
     --output_dir=${output_dir} \
     --scene_name=${scene_name} \
     --alignment=${alignment} \
+    --attribute_init=${attribute_init} \
     --input_factor=${input_factor} \
     --target_factor=${target_factor} \
+    --gt_features_dc=${gt_features_dc} \
+    --gt_features_rest=${gt_features_rest} \
+    --gt_opacities=${gt_opacities} \
+    --gt_scales=${gt_scales} \
+    --gt_quats=${gt_quats} \
     --gin_file=configs/model/ptv3.gin \
     --gin_file=configs/overfit/sr.gin \
     --gin_param="training.total_steps=${total_steps}" \
