@@ -18,21 +18,14 @@ flow_steps=${10:-5}
 flow_noise_std=${11:-0.005}
 flow_loss_weight=${12:-0.0}
 render_loss_weight=${13:-1.0}
-conda_env=${CONDA_ENV:-3dgs-sr}
+flow_t_eps=${FLOW_T_EPS:-1e-4}
 gt_features_dc=${GT_FEATURES_DC:-false}
 gt_features_rest=${GT_FEATURES_REST:-false}
 gt_opacities=${GT_OPACITIES:-false}
 gt_scales=${GT_SCALES:-false}
 gt_quats=${GT_QUATS:-false}
 
-if [ -n "$CONDA_PREFIX" ]; then
-    current_env=$(basename "$CONDA_PREFIX")
-else
-    current_env=""
-fi
-if [ "$current_env" != "$conda_env" ]; then
-    echo "Warning: expected conda env '$conda_env', current env is '${current_env:-none}'"
-fi
+
 
 to_bit() {
     case "$1" in
@@ -43,8 +36,8 @@ to_bit() {
 
 gt_attr_bits="$(to_bit ${gt_features_dc})$(to_bit ${gt_features_rest})$(to_bit ${gt_opacities})$(to_bit ${gt_scales})$(to_bit ${gt_quats})"
 
-out_name=${scene_name}_${alignment}_${attribute_init}_gt${gt_attr_bits}_if${input_factor}_tf${target_factor}_${flow_space}_fs${flow_steps}_n${flow_noise_std}_fw${flow_loss_weight}_rw${render_loss_weight}
-output_dir=/project/ricky/outputs/objaverse_splatformer_overfit_sr_pufm_512_gsplat/${out_name}
+out_name=${scene_name}_${alignment}_${attribute_init}_if${input_factor}_tf${target_factor}_${flow_space}_n${flow_noise_std}_fw${flow_loss_weight}_rw${render_loss_weight}
+output_dir=${OUTPUT_DIR:-/project/ricky/outputs/objaverse_splatformer_overfit_sr_si_512/${out_name}}
 
 CUDA_VISIBLE_DEVICES=$GPU_ID python overfit-sr-pufm.py \
     --output_dir=${output_dir} \
@@ -56,6 +49,7 @@ CUDA_VISIBLE_DEVICES=$GPU_ID python overfit-sr-pufm.py \
     --flow_space=${flow_space} \
     --flow_steps=${flow_steps} \
     --flow_noise_std=${flow_noise_std} \
+    --gin_param="flow_matching.flow_t_eps=${flow_t_eps}" \
     --gin_param="flow_matching.flow_loss_weight=${flow_loss_weight}" \
     --gin_param="flow_matching.render_loss_weight=${render_loss_weight}" \
     --gt_features_dc=${gt_features_dc} \

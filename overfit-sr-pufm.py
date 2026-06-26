@@ -44,7 +44,7 @@ flags.DEFINE_boolean("gt_scales", False, "Initialize scales from GT high-res GS"
 flags.DEFINE_boolean("gt_quats", False, "Initialize quats from GT high-res GS")
 flags.DEFINE_integer("flow_steps", None, "Euler sampling steps; overrides gin flow_matching.flow_steps")
 flags.DEFINE_string("flow_space", None, "Flow space: render, bounded, or raw_scale_opacity")
-flags.DEFINE_float("flow_noise_std", None, "Stddev of Gaussian noise added to x0 in flow-space")
+flags.DEFINE_float("flow_noise_std", None, "Stochastic-interpolant noise scale multiplying sqrt(2t(1-t))")
 flags.DEFINE_multi_string("gin_file", None, "List of paths to the config files.")
 flags.DEFINE_multi_string("gin_param", "", "Newline separated list of Gin parameter bindings.")
 
@@ -99,6 +99,7 @@ def flow_matching(
     flow_steps=5,
     flow_space="render",
     flow_noise_std=0.0,
+    flow_t_eps=1e-4,
     loss_weights=None,
     flow_loss_weight=1.0,
     render_loss_weight=1.0,
@@ -112,6 +113,7 @@ def flow_matching(
         "flow_steps": flow_steps,
         "flow_space": flow_space,
         "flow_noise_std": flow_noise_std,
+        "flow_t_eps": flow_t_eps,
         "loss_weights": loss_weights,
         "flow_loss_weight": flow_loss_weight,
         "render_loss_weight": render_loss_weight,
@@ -193,14 +195,42 @@ def flow_to_raw_gs(flow, flow_space):
     return raw
 
 
-def flow_state_like(lhs, rhs, alpha):
-    return {key: alpha * rhs[key] + (1.0 - alpha) * lhs[key] for key in lhs.keys() if key in rhs}
+def sample_stochastic_interpolant(source_flow_gs, target_flow_gs, t, noise_scale):
+    alpha = t.view(1, 1)
+    gamma_base = torch.sqrt(torch.clamp(2.0 * t * (1.0 - t), min=EPS))
+    gamma = (float(noise_scale) * gamma_base).view(1, 1)
+    gamma_dot = (float(noise_scale) * (1.0 - 2.0 * t) / gamma_base).view(1, 1)
+
+    query_flow_gs = {}
+    target_vel = {}
+    flow_noise = {}
+    for key, source_value in source_flow_gs.items():
+        if key not in target_flow_gs:
+            continue
+        target_value = target_flow_gs[key]
+        if float(noise_scale) > 0.0:
+            z = torch.randn_like(source_value)
+        else:
+            z = torch.zeros_like(source_value)
+        flow_noise[key] = z
+        query_flow_gs[key] = (1.0 - alpha) * source_value + alpha * target_value + gamma * z
+        target_vel[key] = target_value - source_value + gamma_dot * z
+
+    return query_flow_gs, target_vel, flow_noise, gamma, gamma_dot
 
 
-def add_flow_noise(flow_gs, std):
-    if std <= 0:
-        return _clone_gs(flow_gs)
-    return {key: value + torch.randn_like(value) * std for key, value in flow_gs.items()}
+def subtract_stochastic_velocity(pred_vel, flow_noise, gamma_dot):
+    return {
+        key: value - gamma_dot * flow_noise[key] if key in flow_noise else value
+        for key, value in pred_vel.items()
+    }
+
+
+def apply_flow_velocity(source_flow_gs, pred_vel):
+    return {
+        key: source_value + pred_vel[key] if key in pred_vel else source_value.clone()
+        for key, source_value in source_flow_gs.items()
+    }
 
 
 def flow_loss(pred_vel, target_vel, loss_weights, grad_keys):
@@ -218,17 +248,6 @@ def flow_loss(pred_vel, target_vel, loss_weights, grad_keys):
     if total is None:
         raise ValueError("No overlapping flow keys between prediction and target")
     return total, losses
-
-
-def extrapolate_target_flow_gs(query_flow_gs, pred_vel, t):
-    remaining = (1.0 - t).view(1, 1)
-    target_hat = {}
-    for key, value in query_flow_gs.items():
-        if key in pred_vel:
-            target_hat[key] = value + remaining * pred_vel[key]
-        else:
-            target_hat[key] = value.clone()
-    return target_hat
 
 
 def render_l1_loss(gs_raw, cameras, images):
@@ -501,6 +520,8 @@ def _resolve_flow_cfg():
         cfg["flow_noise_std"] = FLAGS.flow_noise_std
     if cfg["flow_space"] not in FLOW_SPACES:
         raise ValueError(f"Unsupported flow_space={cfg['flow_space']}; expected one of {sorted(FLOW_SPACES)}")
+    if not (0.0 < float(cfg["flow_t_eps"]) < 0.5):
+        raise ValueError(f"flow_t_eps must be in (0, 0.5), got {cfg['flow_t_eps']}")
     return cfg
 
 
@@ -593,6 +614,7 @@ def main(argv):
         f"gt_attributes={','.join(gt_attribute_keys) if gt_attribute_keys else 'none'} "
         f"flow_space={flow_cfg['flow_space']} flow_steps={flow_cfg['flow_steps']} "
         f"flow_noise_std={flow_cfg['flow_noise_std']} "
+        f"flow_t_eps={flow_cfg['flow_t_eps']} "
         f"flow_loss_weight={flow_cfg['flow_loss_weight']} "
         f"render_loss_weight={flow_cfg['render_loss_weight']} "
         f"flow_loss_grad_keys={','.join(flow_cfg['flow_loss_grad_keys'])}"
@@ -610,20 +632,21 @@ def main(argv):
 
     optimizer.zero_grad(set_to_none=True)
     pbar = tqdm(range(resume_from_step, total_steps))
+    flow_t_eps = float(flow_cfg["flow_t_eps"])
+    flow_noise_std = float(flow_cfg["flow_noise_std"])
     for step in pbar:
-        t = torch.rand(1, device=device)
-        t = 1.0 - torch.cos(t * torch.pi / 2.0)
-        alpha = t.view(1, 1)
-        noisy_source_flow = add_flow_noise(source_flow_gs, float(flow_cfg["flow_noise_std"]))
-        query_flow_gs = flow_state_like(noisy_source_flow, target_flow_gs, alpha)
-        target_vel = {key: target_flow_gs[key] - noisy_source_flow[key] for key in query_flow_gs.keys()}
+        t = torch.empty(1, device=device).uniform_(flow_t_eps, 1.0 - flow_t_eps)
+        query_flow_gs, target_vel, flow_noise, gamma, gamma_dot = sample_stochastic_interpolant(
+            source_flow_gs, target_flow_gs, t, flow_noise_std
+        )
 
         with torch.cuda.amp.autocast(enabled=enable_amp):
             pred_vel = model(batch_flow_gs=[query_flow_gs], batch_scene_idx=batch_scene_idx, t=t)[0]
             flow_total_loss, attr_losses = flow_loss(
                 pred_vel, target_vel, flow_cfg["loss_weights"], flow_cfg["flow_loss_grad_keys"]
             )
-            target_hat_flow_gs = extrapolate_target_flow_gs(query_flow_gs, pred_vel, t)
+            pred_clean_vel = subtract_stochastic_velocity(pred_vel, flow_noise, gamma_dot)
+            target_hat_flow_gs = apply_flow_velocity(source_flow_gs, pred_clean_vel)
             target_hat_raw_gs = flow_to_raw_gs(target_hat_flow_gs, flow_cfg["flow_space"])
             render_loss, pred_imgs_for_log = render_l1_loss(target_hat_raw_gs, train_cameras_device, train_images_device)
             total_loss = (
@@ -654,6 +677,9 @@ def main(argv):
             "t": f"{t.item():.3f}",
             "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
         }
+        if flow_noise_std > 0.0:
+            postfix["gamma"] = f"{gamma.item():.3e}"
+            postfix["gdot"] = f"{gamma_dot.item():.3e}"
         for key in ["means", "features_dc", "features_rest", "opacities", "scales", "quats"]:
             if key in attr_losses:
                 postfix[key] = f"{attr_losses[key].item():.3e}"
@@ -670,6 +696,7 @@ def main(argv):
                 f"flow_w={float(flow_cfg['flow_loss_weight']):.6f} "
                 f"render_w={float(flow_cfg['render_loss_weight']):.6f} "
                 f"fm_grad={','.join(flow_cfg['flow_loss_grad_keys'])} t={t.item():.6f} "
+                f"t_eps={flow_t_eps:.6f} gamma={gamma.item():.8f} gamma_dot={gamma_dot.item():.8f} "
                 f"lr={optimizer.param_groups[0]['lr']:.8f} {attr_str}"
             )
 

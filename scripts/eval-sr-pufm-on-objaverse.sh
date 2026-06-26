@@ -15,12 +15,13 @@ flow_noise_std=${7:-0.0}
 flow_loss_weight=${8:-0.0}
 render_loss_weight=${9:-1.0}
 eval_flow_steps=${EVAL_FLOW_STEPS:-1-10}
+flow_t_eps=${FLOW_T_EPS:-1e-4}
 conda_env=${CONDA_ENV:-3dgs-sr}
-gt_features_dc=${GT_FEATURES_DC:-true}
-gt_features_rest=${GT_FEATURES_REST:-true}
+gt_features_dc=${GT_FEATURES_DC:-false}
+gt_features_rest=${GT_FEATURES_REST:-false}
 gt_opacities=${GT_OPACITIES:-false}
-gt_scales=${GT_SCALES:-true}
-gt_quats=${GT_QUATS:-true}
+gt_scales=${GT_SCALES:-false}
+gt_quats=${GT_QUATS:-false}
 
 if [ -n "$CONDA_PREFIX" ]; then
     current_env=$(basename "$CONDA_PREFIX")
@@ -40,7 +41,7 @@ to_bit() {
 
 gt_attr_bits="$(to_bit ${gt_features_dc})$(to_bit ${gt_features_rest})$(to_bit ${gt_opacities})$(to_bit ${gt_scales})$(to_bit ${gt_quats})"
 
-out_name=${scene_name}_${alignment}_${attribute_init}_gt${gt_attr_bits}_if${input_factor}_tf${target_factor}_${flow_space}_fs${flow_steps}_n${flow_noise_std}_fw${flow_loss_weight}_rw${render_loss_weight}
+out_name=${scene_name}_${alignment}_${attribute_init}_gt${gt_attr_bits}_if${input_factor}_tf${target_factor}_${flow_space}_fs${flow_steps}_n${flow_noise_std}_te${flow_t_eps}_fw${flow_loss_weight}_rw${render_loss_weight}
 output_dir=${OUTPUT_DIR:-/project/ricky/outputs/objaverse_splatformer_overfit_sr_pufm_512_gsplat/${out_name}}
 checkpoint=${CHECKPOINT:-${output_dir}/checkpoints/model_last.pth}
 eval_output_dir=${EVAL_OUTPUT_DIR:-${output_dir}/eval_flow_steps_${eval_flow_steps}}
@@ -58,6 +59,7 @@ CUDA_VISIBLE_DEVICES=$GPU_ID python eval-sr-pufm.py \
     --flow_steps=${flow_steps} \
     --flow_noise_std=${flow_noise_std} \
     --eval_flow_steps=${eval_flow_steps} \
+    --gin_param="flow_matching.flow_t_eps=${flow_t_eps}" \
     --gin_param="flow_matching.flow_loss_weight=${flow_loss_weight}" \
     --gin_param="flow_matching.render_loss_weight=${render_loss_weight}" \
     --gt_features_dc=${gt_features_dc} \
