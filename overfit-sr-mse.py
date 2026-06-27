@@ -35,11 +35,6 @@ flags.DEFINE_enum(
 )
 flags.DEFINE_float("emd_eps", 0.01, "Auction EMD epsilon")
 flags.DEFINE_integer("emd_iters", 100, "Auction EMD iterations")
-flags.DEFINE_boolean("gt_features_dc", False, "Initialize features_dc from GT high-res GS")
-flags.DEFINE_boolean("gt_features_rest", False, "Initialize features_rest from GT high-res GS")
-flags.DEFINE_boolean("gt_opacities", False, "Initialize opacities from GT high-res GS")
-flags.DEFINE_boolean("gt_scales", False, "Initialize scales from GT high-res GS")
-flags.DEFINE_boolean("gt_quats", False, "Initialize quats from GT high-res GS")
 flags.DEFINE_string(
     "loss_features",
     "",
@@ -103,6 +98,21 @@ def training(
         "enable_amp": enable_amp,
         "empty_cache_fre": empty_cache_fre,
     }
+
+
+@gin.configurable
+def feature_mse_loss(loss_weights=None):
+    default_weights = {key: 1.0 for key in SUPPORTED_GS_KEYS}
+    if loss_weights is None:
+        loss_weights = {}
+    unknown_keys = sorted(set(loss_weights) - set(SUPPORTED_GS_KEYS))
+    if unknown_keys:
+        raise ValueError(
+            f"Unsupported feature_mse_loss.loss_weights keys: {unknown_keys}. "
+            f"Supported keys are: {SUPPORTED_GS_KEYS}"
+        )
+    default_weights.update({key: float(value) for key, value in loss_weights.items()})
+    return {"loss_weights": default_weights}
 
 
 def make_grid(imgs, nrow=3, ncols=3):
@@ -192,9 +202,19 @@ def _post_activate_feature(key, value):
     return value
 
 
-def _feature_mse_loss(out_gs, target_gs, loss_features, post_activate_loss=False):
+def _feature_mse_loss(
+    out_gs,
+    target_gs,
+    loss_features,
+    post_activate_loss=False,
+    loss_weights=None,
+):
     losses = {}
+    weighted_losses = {}
     total_loss = None
+    if loss_weights is None:
+        loss_weights = {key: 1.0 for key in loss_features}
+
     for key in loss_features:
         if key not in out_gs:
             raise ValueError(f"Selected loss feature '{key}' missing from model output")
@@ -209,8 +229,10 @@ def _feature_mse_loss(out_gs, target_gs, loss_features, post_activate_loss=False
             pred = _post_activate_feature(key, pred)
             target = _post_activate_feature(key, target)
         loss = F.mse_loss(pred, target)
+        weighted_loss = float(loss_weights.get(key, 1.0)) * loss
         losses[key] = loss
-        total_loss = loss if total_loss is None else total_loss + loss
+        weighted_losses[key] = weighted_loss
+        total_loss = weighted_loss if total_loss is None else total_loss + weighted_loss
 
     if total_loss is None:
         raise ValueError("No MSE losses were computed")
@@ -219,7 +241,7 @@ def _feature_mse_loss(out_gs, target_gs, loss_features, post_activate_loss=False
             "Selected loss features do not receive gradients. "
             "Make sure FeaturePredictor.output_features includes at least one selected loss feature."
         )
-    return total_loss, losses
+    return total_loss, losses, weighted_losses
 
 def _build_dataset():
     with gin.config_scope("train_dataset"):
@@ -467,13 +489,6 @@ def _apply_3dgs_attribute_init(densified_gs):
     return densified_gs
 
 
-def _apply_gt_attribute_overrides(densified_gs, target_gs, gt_attribute_keys):
-    for key in gt_attribute_keys:
-        if key in target_gs and key in densified_gs:
-            densified_gs[key] = target_gs[key].clone()
-    return densified_gs
-
-
 def _densify_stage_gs(low_res_gs, interpolated_gs, gt_high_res_gs, input_high_res_gs):
     return {
         "00_low_res_gs.ply": low_res_gs,
@@ -546,8 +561,6 @@ def build_densified_input_gs(
     emd_eps,
     emd_iters,
     device,
-    output_dir=None,
-    gt_attribute_keys=None,
     return_stages=False,
 ):
     input_gs = gpu_utils.move_to_device(input_factor_entry["gs_params"], device)
@@ -581,19 +594,6 @@ def build_densified_input_gs(
         densified_gs = _apply_3dgs_attribute_init(densified_gs)
     elif attribute_init != "aligned":
         raise ValueError(f"Unsupported attribute initialization: {attribute_init}")
-
-    if gt_attribute_keys is None:
-        gt_attribute_keys = []
-    densified_gs = _apply_gt_attribute_overrides(densified_gs, target_gs, gt_attribute_keys)
-
-    if output_dir is not None:
-        _save_densify_stage_plys(
-            output_dir=output_dir,
-            low_res_gs=input_in_target_frame,
-            interpolated_gs=interpolated_gs,
-            gt_high_res_gs=target_gs,
-            input_high_res_gs=densified_gs,
-        )
 
     if return_stages:
         return densified_gs, _densify_stage_gs(
@@ -802,6 +802,7 @@ def main(argv):
 
     gin.parse_config_files_and_bindings(FLAGS.gin_file, FLAGS.gin_param)
     train_cfg = training(output_dir=FLAGS.output_dir)
+    mse_loss_cfg = feature_mse_loss()
     set_seed()
 
     with open(os.path.join(FLAGS.output_dir, "config.gin"), "w") as f:
@@ -837,18 +838,6 @@ def main(argv):
     loss_features = _parse_loss_features(FLAGS.loss_features, model, target_gs)
     fixed_attribute_keys = _fixed_attribute_keys(loss_features, target_gs)
 
-    gt_attribute_keys = []
-    for flag_name, key in [
-        ("gt_features_dc", "features_dc"),
-        ("gt_features_rest", "features_rest"),
-        ("gt_opacities", "opacities"),
-        ("gt_scales", "scales"),
-        ("gt_quats", "quats"),
-    ]:
-        if getattr(FLAGS, flag_name):
-            gt_attribute_keys.append(key)
-    init_gt_attribute_keys = _unique_preserve_order(gt_attribute_keys + fixed_attribute_keys)
-
     densified_input_gs, densify_stage_gs = build_densified_input_gs(
         input_factor_entry=input_factor_entry,
         target_factor_entry=target_factor_entry,
@@ -857,11 +846,17 @@ def main(argv):
         emd_eps=FLAGS.emd_eps,
         emd_iters=FLAGS.emd_iters,
         device=device,
-        output_dir=FLAGS.output_dir,
-        gt_attribute_keys=init_gt_attribute_keys,
         return_stages=True,
     )
     densified_input_gs = _copy_gt_attributes(densified_input_gs, target_gs, fixed_attribute_keys)
+    densify_stage_gs["03_input_high_res_gs.ply"] = densified_input_gs
+    _save_densify_stage_plys(
+        output_dir=FLAGS.output_dir,
+        low_res_gs=densify_stage_gs["00_low_res_gs.ply"],
+        interpolated_gs=densify_stage_gs["01_interpolated_high_res_gs.ply"],
+        gt_high_res_gs=densify_stage_gs["02_gt_high_res_gs.ply"],
+        input_high_res_gs=densify_stage_gs["03_input_high_res_gs.ply"],
+    )
     batch_gs = gpu_utils.move_to_device([densified_input_gs], device)
     batch_scene_idx = [scene["idx"]]
 
@@ -912,8 +907,8 @@ def main(argv):
         f"alignment={FLAGS.alignment} attribute_init={FLAGS.attribute_init} "
         f"loss_features={','.join(loss_features)} "
         f"post_activate_loss={FLAGS.post_activate_loss} "
+        f"loss_weights={mse_loss_cfg['loss_weights']} "
         f"fixed_gt_attributes={','.join(fixed_attribute_keys) if fixed_attribute_keys else 'none'} "
-        f"gt_init_attributes={','.join(gt_attribute_keys) if gt_attribute_keys else 'none'}"
     )
 
     os.makedirs(os.path.join(FLAGS.output_dir, "train"), exist_ok=True)
@@ -930,11 +925,12 @@ def main(argv):
         with torch.cuda.amp.autocast(enabled=enable_amp):
             out_batch_gs = model(batch_normalized_gs=batch_gs, batch_scene_idx=batch_scene_idx)
             out_gs = _copy_gt_attributes(out_batch_gs[0], target_gs, fixed_attribute_keys)
-            total_loss, feature_losses = _feature_mse_loss(
+            total_loss, feature_losses, weighted_feature_losses = _feature_mse_loss(
                 out_gs,
                 target_gs,
                 loss_features,
                 post_activate_loss=FLAGS.post_activate_loss,
+                loss_weights=mse_loss_cfg["loss_weights"],
             )
 
         if enable_amp:
@@ -954,6 +950,7 @@ def main(argv):
         scheduler.step()
 
         feature_loss_values = {key: loss.item() for key, loss in feature_losses.items()}
+        weighted_loss_values = {key: loss.item() for key, loss in weighted_feature_losses.items()}
         postfix = {"loss": f"{total_loss.item():.3e}", "lr": f"{optimizer.param_groups[0]['lr']:.2e}"}
         postfix.update({key: f"{value:.3e}" for key, value in feature_loss_values.items()})
         pbar.set_postfix(postfix)
@@ -963,7 +960,8 @@ def main(argv):
 
         if step % log_interval == 0:
             feature_loss_str = " ".join(
-                f"{key}_mse={value:.6f}" for key, value in feature_loss_values.items()
+                f"{key}_mse={value:.6f} {key}_weighted={weighted_loss_values[key]:.6f}"
+                for key, value in feature_loss_values.items()
             )
             logger.info(
                 f"step={step} total={total_loss.item():.6f} "

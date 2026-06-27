@@ -19,11 +19,6 @@ target_factor=${8:-2}
 loss_features=${9:-${LOSS_FEATURES:-means}}
 post_activate_loss=${10:-${POST_ACTIVATE_LOSS:-false}}
 conda_env=${CONDA_ENV:-3dgs-sr}
-gt_features_dc=${GT_FEATURES_DC:-true}
-gt_features_rest=${GT_FEATURES_REST:-true}
-gt_opacities=${GT_OPACITIES:-true}
-gt_scales=${GT_SCALES:-false}
-gt_quats=${GT_QUATS:-false}
 
 to_bit() {
     case "$1" in
@@ -36,11 +31,10 @@ sanitize_name() {
     echo "$1" | tr ',' '-'
 }
 
-gt_attr_bits="$(to_bit ${gt_features_dc})$(to_bit ${gt_features_rest})$(to_bit ${gt_opacities})$(to_bit ${gt_scales})$(to_bit ${gt_quats})"
 loss_name="$(sanitize_name "${loss_features}")"
 post_activate_bit="$(to_bit ${post_activate_loss})"
 
-out_name=${scene_name}_${alignment}_${attribute_init}_gt${gt_attr_bits}_if${input_factor}_tf${target_factor}_mse_${loss_name}_pa${post_activate_bit}
+out_name=${scene_name}_${alignment}_${attribute_init}_if${input_factor}_tf${target_factor}_mse_${loss_name}_pa${post_activate_bit}
 output_dir=/project/ricky/experiments/objaverse_splatformer_overfit_sr_mse_512/${out_name}
 
 CUDA_VISIBLE_DEVICES=$GPU_ID python overfit-sr-mse.py \
@@ -52,13 +46,8 @@ CUDA_VISIBLE_DEVICES=$GPU_ID python overfit-sr-mse.py \
     --target_factor=${target_factor} \
     --loss_features=${loss_features} \
     --post_activate_loss=${post_activate_loss} \
-    --gt_features_dc=${gt_features_dc} \
-    --gt_features_rest=${gt_features_rest} \
-    --gt_opacities=${gt_opacities} \
-    --gt_scales=${gt_scales} \
-    --gt_quats=${gt_quats} \
     --gin_file=configs/model/ptv3.gin \
-    --gin_file=configs/overfit/sr.gin \
+    --gin_file=configs/overfit/sr_mse.gin \
     --gin_param="training.total_steps=${total_steps}" \
     --gin_param="training.save_interval=${save_interval}" \
     --gin_param="training.eval_interval=${eval_interval}" \
