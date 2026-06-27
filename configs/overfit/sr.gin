@@ -49,7 +49,7 @@ train2D/build_scheduler.schedule = 'constant'
 SplatFactoMultiLevelDataset.remove_outlier_ndevs = -1
 SplatFactoMultiLevelDataset.image_per_scene = None
 SplatFactoMultiLevelDataset.sample_ratio_test = None
-SplatFactoMultiLevelDataset.max_gs_num = 100000
+SplatFactoMultiLevelDataset.max_gs_num = 1000000
 SplatFactoMultiLevelDataset.load_pose_src = 'nerfstudio'
 
 train_dataset/SplatFactoMultiLevelDataset.train_or_test = 'test'
