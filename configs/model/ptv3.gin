@@ -13,13 +13,14 @@ FeaturePredictor.zeroinit = True
  
 
 FeaturePredictor.res_feature_activation = {
-    "means":  @Tanh(),
+    "means":  @Identity(),
     "features_dc": @Identity(),
     "features_rest": @Identity(),
     "scales": @Identity(),
     "opacities": @Identity(),
     "quats": @Identity()
 }
+    # "means":  @Tanh(),
 
 FeaturePredictor.input_embed_to_mlp = False
 FeaturePredictor.input_feat_to_mlp = True

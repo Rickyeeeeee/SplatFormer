@@ -21,8 +21,15 @@ feature_mse_loss.loss_weights = {
     "features_rest": 1.0,
     "opacities": 1.0,
     "scales": 1.0,
-    "quats": 1.0,
+    "quats": 10.0,
 }
+#     "means": 10000.0,
+#     "features_dc": 1.0,
+#     "features_rest": 1.0,
+#     "opacities": 1.0,
+#     "scales": 1.0,
+#     "quats": 10.0,
+feature_mse_loss.quat_direct_mse = False
 
 pretrain/build_optimizer.lr_dict = {
     "base": 1e-3,
@@ -70,4 +77,4 @@ train_dataset/SplatFactoMultiLevelDataset.sample_ratio_test = 0.7
 train_dataset/SplatFactoMultiLevelDataset.cache_steps = 1
 train_dataset/SplatFactoMultiLevelDataset.cache_num_scenes = 1
 train_dataset/SplatFactoMultiLevelDataset.split_across_gpus = True
-train_dataset/SplatFactoMultiLevelDataset.factors = [2, 4]
+train_dataset/SplatFactoMultiLevelDataset.factors = [1, 2, 4]

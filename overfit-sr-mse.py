@@ -44,7 +44,7 @@ flags.DEFINE_string(
 flags.DEFINE_boolean(
     "post_activate_loss",
     False,
-    "Compute MSE after render-space Gaussian activations for scales/opacities/quats.",
+    "Use feature-specific loss transforms: log-space scales, sigmoid opacities, and geodesic quats.",
 )
 flags.DEFINE_multi_string("gin_file", None, "List of paths to the config files.")
 flags.DEFINE_multi_string("gin_param", "", "Newline separated list of Gin parameter bindings.")
@@ -54,6 +54,7 @@ FLAGS = flags.FLAGS
 INPUT_FACTOR = 4
 TARGET_FACTOR = 2
 SUPPORTED_GS_KEYS = ["means", "features_dc", "features_rest", "opacities", "scales", "quats"]
+MEANS_LOSS_REDUCTION = "sum"  # Set to "sum" to match PUFM-style summed point loss.
 
 
 @gin.configurable
@@ -101,7 +102,7 @@ def training(
 
 
 @gin.configurable
-def feature_mse_loss(loss_weights=None):
+def feature_mse_loss(loss_weights=None, quat_direct_mse=False):
     default_weights = {key: 1.0 for key in SUPPORTED_GS_KEYS}
     if loss_weights is None:
         loss_weights = {}
@@ -112,7 +113,7 @@ def feature_mse_loss(loss_weights=None):
             f"Supported keys are: {SUPPORTED_GS_KEYS}"
         )
     default_weights.update({key: float(value) for key, value in loss_weights.items()})
-    return {"loss_weights": default_weights}
+    return {"loss_weights": default_weights, "quat_direct_mse": quat_direct_mse}
 
 
 def make_grid(imgs, nrow=3, ncols=3):
@@ -192,14 +193,34 @@ def _copy_gt_attributes(gs, target_gs, attribute_keys):
     return gs
 
 
-def _post_activate_feature(key, value):
-    if key == "scales":
-        return torch.exp(value)
+def _feature_loss_value(key, pred, target, post_activate_loss=False, quat_direct_mse=False):
+    if key == "means":
+        squared_error = (pred - target).square()
+        if MEANS_LOSS_REDUCTION == "mean":
+            return squared_error.mean()
+        if MEANS_LOSS_REDUCTION == "sum":
+            return squared_error.sum()
+        raise ValueError(
+            f"Unsupported MEANS_LOSS_REDUCTION={MEANS_LOSS_REDUCTION}; expected 'mean' or 'sum'"
+        )
+
+    if not post_activate_loss:
+        return F.mse_loss(pred, target)
+
     if key == "opacities":
-        return torch.sigmoid(value)
+        return F.mse_loss(torch.sigmoid(pred), torch.sigmoid(target))
+
     if key == "quats":
-        return F.normalize(value, dim=-1)
-    return value
+        if quat_direct_mse:
+            return F.mse_loss(pred, target)
+        pred_quat = F.normalize(pred, dim=-1)
+        target_quat = F.normalize(target, dim=-1)
+        cosine_sq = (pred_quat * target_quat).sum(dim=-1).square().clamp(max=1.0)
+        return (1.0 - cosine_sq).mean()
+
+    # Means, SH/color features, and scales use their stored parameterization.
+    # Scales are stored as log-scales, so this is log-space MSE rather than exp-space MSE.
+    return F.mse_loss(pred, target)
 
 
 def _feature_mse_loss(
@@ -208,6 +229,7 @@ def _feature_mse_loss(
     loss_features,
     post_activate_loss=False,
     loss_weights=None,
+    quat_direct_mse=False,
 ):
     losses = {}
     weighted_losses = {}
@@ -225,10 +247,13 @@ def _feature_mse_loss(
             )
         pred = out_gs[key]
         target = target_gs[key].to(device=pred.device, dtype=pred.dtype)
-        if post_activate_loss:
-            pred = _post_activate_feature(key, pred)
-            target = _post_activate_feature(key, target)
-        loss = F.mse_loss(pred, target)
+        loss = _feature_loss_value(
+            key,
+            pred,
+            target,
+            post_activate_loss=post_activate_loss,
+            quat_direct_mse=quat_direct_mse,
+        )
         weighted_loss = float(loss_weights.get(key, 1.0)) * loss
         losses[key] = loss
         weighted_losses[key] = weighted_loss
@@ -907,6 +932,7 @@ def main(argv):
         f"alignment={FLAGS.alignment} attribute_init={FLAGS.attribute_init} "
         f"loss_features={','.join(loss_features)} "
         f"post_activate_loss={FLAGS.post_activate_loss} "
+        f"quat_direct_mse={mse_loss_cfg['quat_direct_mse']} "
         f"loss_weights={mse_loss_cfg['loss_weights']} "
         f"fixed_gt_attributes={','.join(fixed_attribute_keys) if fixed_attribute_keys else 'none'} "
     )
@@ -931,6 +957,7 @@ def main(argv):
                 loss_features,
                 post_activate_loss=FLAGS.post_activate_loss,
                 loss_weights=mse_loss_cfg["loss_weights"],
+                quat_direct_mse=mse_loss_cfg["quat_direct_mse"],
             )
 
         if enable_amp:
@@ -960,7 +987,7 @@ def main(argv):
 
         if step % log_interval == 0:
             feature_loss_str = " ".join(
-                f"{key}_mse={value:.6f} {key}_weighted={weighted_loss_values[key]:.6f}"
+                f"{key}_loss={value:.6f} {key}_weighted={weighted_loss_values[key]:.6f}"
                 for key, value in feature_loss_values.items()
             )
             logger.info(
