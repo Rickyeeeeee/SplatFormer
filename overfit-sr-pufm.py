@@ -226,9 +226,21 @@ def subtract_stochastic_velocity(pred_vel, flow_noise, gamma_dot):
     }
 
 
-def apply_flow_velocity(source_flow_gs, pred_vel):
+def _apply_model_flow_update(model, feature, value, update, step_scale=1.0):
+    if model is not None and hasattr(model, "apply_feature_update"):
+        return model.apply_feature_update(feature, value, update, step_scale)
+    if torch.is_tensor(step_scale):
+        step_scale = step_scale.to(device=update.device, dtype=update.dtype)
+    else:
+        step_scale = float(step_scale)
+    return value + step_scale * update
+
+
+def apply_flow_velocity(source_flow_gs, pred_vel, model=None):
     return {
-        key: source_value + pred_vel[key] if key in pred_vel else source_value.clone()
+        key: _apply_model_flow_update(model, key, source_value, pred_vel[key])
+        if key in pred_vel
+        else source_value.clone()
         for key, source_value in source_flow_gs.items()
     }
 
@@ -271,7 +283,9 @@ def sample_flow_model(model, source_flow_gs, scene_idx, flow_steps, flow_space):
             pred_vel = model(batch_flow_gs=[state], batch_scene_idx=[scene_idx], t=t_value)[0]
             for key in state.keys():
                 if key in pred_vel:
-                    state[key] = state[key] + pred_vel[key] / float(flow_steps)
+                    state[key] = _apply_model_flow_update(
+                        model, key, state[key], pred_vel[key], 1.0 / float(flow_steps)
+                    )
     return flow_to_raw_gs(state, flow_space)
 
 
@@ -646,7 +660,7 @@ def main(argv):
                 pred_vel, target_vel, flow_cfg["loss_weights"], flow_cfg["flow_loss_grad_keys"]
             )
             pred_clean_vel = subtract_stochastic_velocity(pred_vel, flow_noise, gamma_dot)
-            target_hat_flow_gs = apply_flow_velocity(source_flow_gs, pred_clean_vel)
+            target_hat_flow_gs = apply_flow_velocity(source_flow_gs, pred_clean_vel, model=model)
             target_hat_raw_gs = flow_to_raw_gs(target_hat_flow_gs, flow_cfg["flow_space"])
             render_loss, pred_imgs_for_log = render_l1_loss(target_hat_raw_gs, train_cameras_device, train_images_device)
             total_loss = (
@@ -680,9 +694,6 @@ def main(argv):
         if flow_noise_std > 0.0:
             postfix["gamma"] = f"{gamma.item():.3e}"
             postfix["gdot"] = f"{gamma_dot.item():.3e}"
-        for key in ["means", "features_dc", "features_rest", "opacities", "scales", "quats"]:
-            if key in attr_losses:
-                postfix[key] = f"{attr_losses[key].item():.3e}"
         pbar.set_postfix(postfix)
 
         if empty_cache_fre > 0 and (step + 1) % empty_cache_fre == 0:

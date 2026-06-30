@@ -11,21 +11,23 @@ from absl import app, flags
 from tqdm import tqdm
 
 from dataset.GS_multi import SplatFactoMultiLevelDataset
-from models.feature_predictor import FeaturePredictor
+from models.feature_flow_predictor import GSFlowPredictor
+from models.feature_predictor import FeaturePredictor  # Registers legacy gin keys used by GS_multi.
 from utils import gpu_utils, gs_utils
 from utils.log_utils import ProcessSafeLogger
 from utils.metrics import MetricComputer
 from utils.optimizers import build_optimizer, build_scheduler
+from utils.sr_densify_utils import build_densified_input_gs
 
 
-flags.DEFINE_string("output_dir", "output_overfit", "Output directory")
+flags.DEFINE_string("output_dir", "output_overfit_gsfm", "Output directory")
 flags.DEFINE_string("eval_subdir", "eval_final", "Eval subdirectory")
 flags.DEFINE_string("scene_name", "", "Scene name to overfit")
 flags.DEFINE_boolean("compare_with_input", False, "Compare with input 3DGS")
 flags.DEFINE_boolean("save_viewer", True, "Save viewer point clouds")
 flags.DEFINE_boolean("save_residuals", True, "Save residual tensors and stats")
 flags.DEFINE_integer("input_factor", 4, "Low-resolution GS factor used as densification source")
-flags.DEFINE_integer("target_factor", 2, "High-resolution GS/image factor used as overfit target")
+flags.DEFINE_integer("target_factor", 2, "High-resolution GS/image factor used as flow target")
 flags.DEFINE_enum("alignment", "emd", ["emd", "nearest"], "Interpolated-to-target alignment method")
 flags.DEFINE_enum(
     "attribute_init",
@@ -35,26 +37,28 @@ flags.DEFINE_enum(
 )
 flags.DEFINE_float("emd_eps", 0.01, "Auction EMD epsilon")
 flags.DEFINE_integer("emd_iters", 100, "Auction EMD iterations")
-flags.DEFINE_string(
-    "loss_features",
-    "",
-    "Comma-separated Gaussian attributes to include in point-wise MSE loss. "
-    "Defaults to FeaturePredictor.output_features.",
-)
+flags.DEFINE_integer("flow_steps", None, "Euler sampling steps; overrides gin flow_matching.flow_steps")
+flags.DEFINE_string("flow_space", None, "Flow space. GSFM only supports raw, matching overfit-sr-mse.py.")
+flags.DEFINE_float("flow_noise_std", None, "Stochastic-interpolant noise scale multiplying sqrt(2t(1-t))")
 flags.DEFINE_boolean(
     "post_activate_loss",
     False,
-    "Use feature-specific loss transforms: log-space scales, sigmoid opacities, and geodesic quats.",
+    "Use MSE-style feature loss transforms: sigmoid opacities and normalized quaternion loss.",
+)
+flags.DEFINE_string(
+    "loss_features",
+    "",
+    "Comma-separated Gaussian attributes to include in point-wise flow loss. "
+    "Defaults to GSFlowPredictor.output_features.",
 )
 flags.DEFINE_multi_string("gin_file", None, "List of paths to the config files.")
 flags.DEFINE_multi_string("gin_param", "", "Newline separated list of Gin parameter bindings.")
 
 FLAGS = flags.FLAGS
-
-INPUT_FACTOR = 4
-TARGET_FACTOR = 2
-SUPPORTED_GS_KEYS = ["means", "features_dc", "features_rest", "opacities", "scales", "quats"]
-MEANS_LOSS_REDUCTION = "sum"  # Set to "sum" to match PUFM-style summed point loss.
+FLOW_SPACES = {"raw"}
+FLOW_KEYS = ["means", "features_dc", "features_rest", "opacities", "scales", "quats"]
+MEANS_LOSS_REDUCTION = "sum"  # Set to "mean" for per-coordinate averaging.
+EPS = 1e-6
 
 
 @gin.configurable
@@ -71,15 +75,13 @@ def set_seed(seed):
 @gin.configurable
 def training(
     output_dir=None,
-    total_steps = gin.REQUIRED,
-    pretrain_steps = gin.REQUIRED,
-    eval_interval = gin.REQUIRED,
-    log_interval = gin.REQUIRED,
-    save_interval = gin.REQUIRED,
-    log_image_interval = gin.REQUIRED,
-    grad_clip_norm = gin.REQUIRED,
-    image_l1_loss_weight=1.0,
-    lpips_loss_weight=0.0,
+    total_steps=gin.REQUIRED,
+    pretrain_steps=gin.REQUIRED,
+    eval_interval=gin.REQUIRED,
+    log_interval=gin.REQUIRED,
+    save_interval=gin.REQUIRED,
+    log_image_interval=gin.REQUIRED,
+    grad_clip_norm=gin.REQUIRED,
     resume_from_step=0,
     enable_amp=False,
     empty_cache_fre=-1,
@@ -93,8 +95,6 @@ def training(
         "save_interval": save_interval,
         "log_image_interval": log_image_interval,
         "grad_clip_norm": grad_clip_norm,
-        "image_l1_loss_weight": image_l1_loss_weight,
-        "lpips_loss_weight": lpips_loss_weight,
         "resume_from_step": resume_from_step,
         "enable_amp": enable_amp,
         "empty_cache_fre": empty_cache_fre,
@@ -102,15 +102,30 @@ def training(
 
 
 @gin.configurable
+def flow_matching(
+    flow_steps=5,
+    flow_space="raw",
+    flow_noise_std=0.0,
+    flow_t_eps=1e-4,
+):
+    return {
+        "flow_steps": flow_steps,
+        "flow_space": flow_space,
+        "flow_noise_std": flow_noise_std,
+        "flow_t_eps": flow_t_eps,
+    }
+
+
+@gin.configurable
 def feature_mse_loss(loss_weights=None, quat_direct_mse=False):
-    default_weights = {key: 1.0 for key in SUPPORTED_GS_KEYS}
+    default_weights = {key: 1.0 for key in FLOW_KEYS}
     if loss_weights is None:
         loss_weights = {}
-    unknown_keys = sorted(set(loss_weights) - set(SUPPORTED_GS_KEYS))
+    unknown_keys = sorted(set(loss_weights) - set(FLOW_KEYS))
     if unknown_keys:
         raise ValueError(
             f"Unsupported feature_mse_loss.loss_weights keys: {unknown_keys}. "
-            f"Supported keys are: {SUPPORTED_GS_KEYS}"
+            f"Supported keys are: {FLOW_KEYS}"
         )
     default_weights.update({key: float(value) for key, value in loss_weights.items()})
     return {"loss_weights": default_weights, "quat_direct_mse": quat_direct_mse}
@@ -164,15 +179,11 @@ def _parse_loss_features(raw_loss_features, model, target_gs):
 
     loss_features = _unique_preserve_order(loss_features)
     if len(loss_features) == 0:
-        raise ValueError("No Gaussian attributes selected for MSE loss")
+        raise ValueError("No Gaussian attributes selected for flow loss")
 
-    supported = set(SUPPORTED_GS_KEYS)
-    unsupported = [feature for feature in loss_features if feature not in supported]
+    unsupported = [feature for feature in loss_features if feature not in FLOW_KEYS]
     if unsupported:
-        raise ValueError(
-            f"Unsupported loss feature(s): {unsupported}. "
-            f"Supported features are: {SUPPORTED_GS_KEYS}"
-        )
+        raise ValueError(f"Unsupported loss feature(s): {unsupported}. Supported features are: {FLOW_KEYS}")
 
     missing = [feature for feature in loss_features if feature not in target_gs]
     if missing:
@@ -183,7 +194,7 @@ def _parse_loss_features(raw_loss_features, model, target_gs):
 
 def _fixed_attribute_keys(loss_features, target_gs):
     loss_set = set(loss_features)
-    return [key for key in SUPPORTED_GS_KEYS if key in target_gs and key not in loss_set]
+    return [key for key in FLOW_KEYS if key in target_gs and key not in loss_set]
 
 
 def _copy_gt_attributes(gs, target_gs, attribute_keys):
@@ -191,6 +202,98 @@ def _copy_gt_attributes(gs, target_gs, attribute_keys):
         if key in gs and key in target_gs:
             gs[key] = target_gs[key].to(device=gs[key].device, dtype=gs[key].dtype).clone()
     return gs
+
+
+def _apply_fixed_flow_attributes(flow_gs, fixed_flow_gs, attribute_keys):
+    if fixed_flow_gs is None:
+        return flow_gs
+    for key in attribute_keys:
+        if key in flow_gs and key in fixed_flow_gs:
+            flow_gs[key] = fixed_flow_gs[key].to(device=flow_gs[key].device, dtype=flow_gs[key].dtype).clone()
+    return flow_gs
+
+
+def _clone_gs(gs):
+    return {key: value.clone() for key, value in gs.items()}
+
+
+def _require_raw_flow_space(flow_space):
+    if flow_space != "raw":
+        raise ValueError(
+            f"GSFM only supports flow_space='raw' to match overfit-sr-mse.py residual prediction; "
+            f"got {flow_space!r}"
+        )
+
+
+def raw_to_flow_gs(gs, flow_space):
+    _require_raw_flow_space(flow_space)
+    return {key: value.clone() for key, value in gs.items()}
+
+
+def flow_to_raw_gs(flow, flow_space):
+    _require_raw_flow_space(flow_space)
+    return {key: value.clone() for key, value in flow.items()}
+
+
+def sample_stochastic_interpolant(source_flow_gs, target_flow_gs, t, noise_scale):
+    alpha = t.view(1, 1)
+    gamma_base = torch.sqrt(torch.clamp(2.0 * t * (1.0 - t), min=EPS))
+    gamma = (float(noise_scale) * gamma_base).view(1, 1)
+    gamma_dot = (float(noise_scale) * (1.0 - 2.0 * t) / gamma_base).view(1, 1)
+
+    query_flow_gs = {}
+    flow_noise = {}
+    for key, source_value in source_flow_gs.items():
+        if key not in target_flow_gs:
+            continue
+        target_value = target_flow_gs[key]
+        if float(noise_scale) > 0.0:
+            z = torch.randn_like(source_value)
+        else:
+            z = torch.zeros_like(source_value)
+        flow_noise[key] = z
+        query_flow_gs[key] = (1.0 - alpha) * source_value + alpha * target_value + gamma * z
+
+    return query_flow_gs, flow_noise, gamma, gamma_dot
+
+
+def subtract_stochastic_velocity(pred_vel, flow_noise, gamma_dot):
+    return {
+        key: value - gamma_dot * flow_noise[key] if key in flow_noise else value
+        for key, value in pred_vel.items()
+    }
+
+
+def _apply_model_flow_update(model, feature, value, update, step_scale=1.0):
+    if model is not None and hasattr(model, "apply_feature_update"):
+        return model.apply_feature_update(feature, value, update, step_scale)
+    if torch.is_tensor(step_scale):
+        step_scale = step_scale.to(device=update.device, dtype=update.dtype)
+    else:
+        step_scale = float(step_scale)
+    return value + step_scale * update
+
+
+def apply_flow_velocity(source_flow_gs, pred_vel, model=None):
+    return {
+        key: _apply_model_flow_update(model, key, source_value, pred_vel[key])
+        if key in pred_vel
+        else source_value.clone()
+        for key, source_value in source_flow_gs.items()
+    }
+
+
+def predict_x1_from_velocity(model, query_flow_gs, pred_vel, flow_noise, gamma, gamma_dot, t):
+    one_minus_t = (1.0 - t).view(1, 1)
+    x1_pred = {}
+    for key, query_value in query_flow_gs.items():
+        clean_xt = query_value - gamma * flow_noise.get(key, torch.zeros_like(query_value))
+        if key in pred_vel:
+            clean_vel = pred_vel[key] - gamma_dot * flow_noise.get(key, torch.zeros_like(pred_vel[key]))
+            x1_pred[key] = _apply_model_flow_update(model, key, clean_xt, clean_vel, one_minus_t)
+        else:
+            x1_pred[key] = clean_xt.clone()
+    return x1_pred
 
 
 def _feature_loss_value(key, pred, target, post_activate_loss=False, quat_direct_mse=False):
@@ -218,8 +321,6 @@ def _feature_loss_value(key, pred, target, post_activate_loss=False, quat_direct
         cosine_sq = (pred_quat * target_quat).sum(dim=-1).square().clamp(max=1.0)
         return (1.0 - cosine_sq).mean()
 
-    # Means, SH/color features, and scales use their stored parameterization.
-    # Scales are stored as log-scales, so this is log-space MSE rather than exp-space MSE.
     return F.mse_loss(pred, target)
 
 
@@ -233,13 +334,15 @@ def _feature_mse_loss(
 ):
     losses = {}
     weighted_losses = {}
-    total_loss = None
+    total = None
     if loss_weights is None:
         loss_weights = {key: 1.0 for key in loss_features}
 
     for key in loss_features:
         if key not in out_gs:
-            raise ValueError(f"Selected loss feature '{key}' missing from model output")
+            raise ValueError(f"Selected loss feature '{key}' missing from predicted x1")
+        if key not in target_gs:
+            raise ValueError(f"Selected loss feature '{key}' missing from target GS")
         if out_gs[key].shape != target_gs[key].shape:
             raise ValueError(
                 f"Shape mismatch for loss feature '{key}': "
@@ -254,19 +357,42 @@ def _feature_mse_loss(
             post_activate_loss=post_activate_loss,
             quat_direct_mse=quat_direct_mse,
         )
-        weighted_loss = float(loss_weights.get(key, 1.0)) * loss
+        weighted = float(loss_weights.get(key, 1.0)) * loss
         losses[key] = loss
-        weighted_losses[key] = weighted_loss
-        total_loss = weighted_loss if total_loss is None else total_loss + weighted_loss
+        weighted_losses[key] = weighted
+        total = weighted if total is None else total + weighted
 
-    if total_loss is None:
-        raise ValueError("No MSE losses were computed")
-    if not total_loss.requires_grad:
+    if total is None:
+        raise ValueError("No x1_pred MSE losses were computed")
+    if not total.requires_grad:
         raise ValueError(
             "Selected loss features do not receive gradients. "
-            "Make sure FeaturePredictor.output_features includes at least one selected loss feature."
+            "Make sure GSFlowPredictor.output_features includes at least one selected loss feature."
         )
-    return total_loss, losses, weighted_losses
+    return total, losses, weighted_losses
+
+
+def sample_flow_model(model, source_flow_gs, scene_idx, flow_steps, flow_space, fixed_flow_gs=None, fixed_attribute_keys=None):
+    if flow_steps <= 0:
+        raise ValueError("flow_steps must be positive")
+    model.eval()
+    if fixed_attribute_keys is None:
+        fixed_attribute_keys = []
+    state = _clone_gs(source_flow_gs)
+    state = _apply_fixed_flow_attributes(state, fixed_flow_gs, fixed_attribute_keys)
+    device = state["means"].device
+    with torch.no_grad():
+        for step in range(flow_steps):
+            t_value = torch.full((1,), float(step) / float(flow_steps), device=device)
+            pred_vel = model(batch_flow_gs=[state], batch_scene_idx=[scene_idx], t=t_value)[0]
+            for key in state.keys():
+                if key in pred_vel:
+                    state[key] = _apply_model_flow_update(
+                        model, key, state[key], pred_vel[key], 1.0 / float(flow_steps)
+                    )
+            state = _apply_fixed_flow_attributes(state, fixed_flow_gs, fixed_attribute_keys)
+    return flow_to_raw_gs(state, flow_space)
+
 
 def _build_dataset():
     with gin.config_scope("train_dataset"):
@@ -327,334 +453,32 @@ def _build_split_payload(dataset, scene_idx, scene_name, factor_entry, split):
     }
 
 
-
-def _as_scaler_tensor(scaler, name, device, dtype):
-    value = getattr(scaler, name)
-    if not torch.is_tensor(value):
-        value = torch.as_tensor(value)
-    return value.to(device=device, dtype=dtype)
-
-
-def _as_scale_tensor(scaler, device, dtype):
-    return _as_scaler_tensor(scaler, "scale_", device, dtype)
-
-
-def _scaler_transform(scaler, value):
-    device = value.device
-    dtype = value.dtype
-    scale = _as_scaler_tensor(scaler, "scale_", device, dtype)
-    trans = _as_scaler_tensor(scaler, "trans_", device, dtype)
-    return value * scale + trans
-
-
-def _scaler_inverse_transform(scaler, value):
-    device = value.device
-    dtype = value.dtype
-    scale = _as_scaler_tensor(scaler, "scale_", device, dtype)
-    trans = _as_scaler_tensor(scaler, "trans_", device, dtype)
-    return (value - trans) / scale
-
-
-def _convert_gs_to_target_frame(input_gs, input_scaler, target_scaler):
-    target_gs = {}
-    device = input_gs["means"].device
-    dtype = input_gs["means"].dtype
-
-    raw_means = _scaler_inverse_transform(input_scaler, input_gs["means"])
-    target_gs["means"] = _scaler_transform(target_scaler, raw_means)
-
-    input_scale = _as_scale_tensor(input_scaler, device, dtype)
-    target_scale = _as_scale_tensor(target_scaler, device, dtype)
-    for key, value in input_gs.items():
-        if key == "means":
-            continue
-        if key == "scales":
-            target_gs[key] = value - torch.log(input_scale) + torch.log(target_scale)
-        else:
-            target_gs[key] = value.clone()
-    return target_gs
-
-
-def _chunked_knn_indices(points, centers, k, chunk_size=512):
-    if points.shape[0] == 0 or centers.shape[0] == 0:
-        raise ValueError("Cannot query kNN on empty point sets")
-    k = min(int(k), points.shape[0])
-    idx_chunks = []
-    for start in range(0, centers.shape[0], chunk_size):
-        end = min(start + chunk_size, centers.shape[0])
-        dist = torch.cdist(centers[start:end].float(), points.float())
-        idx_chunks.append(torch.topk(dist, k=k, dim=1, largest=False).indices)
-    return torch.cat(idx_chunks, dim=0)
-
-
-def _chunked_nearest_indices(source_means, target_means, chunk_size=512):
-    return _chunked_knn_indices(source_means, target_means, 1, chunk_size=chunk_size).squeeze(1)
-
-
-def _midpoint_interpolate_gs(input_gs, target_count):
-    source_count = input_gs["means"].shape[0]
-    if source_count <= 0:
-        raise ValueError("Cannot densify an empty input GS")
-    k = min(source_count, max(2, int(np.ceil(2.0 * target_count / source_count))))
-    nn_idx = _chunked_knn_indices(input_gs["means"], input_gs["means"], k)
-    src_idx = torch.arange(source_count, device=input_gs["means"].device).repeat_interleave(k)
-    nbr_idx = nn_idx.reshape(-1)
-
-    interpolated = {}
-    for key, value in input_gs.items():
-        src_value = value[src_idx]
-        nbr_value = value[nbr_idx]
-        if key == "quats":
-            sign = torch.sign((src_value * nbr_value).sum(dim=-1, keepdim=True))
-            sign = torch.where(sign == 0, torch.ones_like(sign), sign)
-            nbr_value = nbr_value * sign
-            interpolated[key] = F.normalize((src_value + nbr_value) * 0.5, dim=-1)
-        else:
-            interpolated[key] = (src_value + nbr_value) * 0.5
-
-    candidate_count = interpolated["means"].shape[0]
-    if candidate_count < target_count:
-        raise ValueError(
-            f"Midpoint interpolation produced {candidate_count} candidates, "
-            f"but target requires {target_count}. source_count={source_count}, k={k}"
-        )
-    if candidate_count > target_count:
-        keep_idx = torch.randperm(candidate_count, device=interpolated["means"].device)[:target_count]
-        interpolated = {key: value[keep_idx] for key, value in interpolated.items()}
-    return interpolated
-
-
-def _align_nearest_target_to_source(source_means, target_means):
-    return _chunked_nearest_indices(source_means, target_means)
-
-
-def _align_emd_target_to_source(source_means, target_means, eps, iters):
-    try:
-        from emd_assignment import emd_module
-    except Exception as exc:
-        raise ImportError(
-            "Could not import local EMD package. Run "
-            "`cd /home/ricky/SplatFormer/emd_assignment && python setup.py install`, "
-            "or rerun with `--alignment=nearest`."
-        ) from exc
-
-    if source_means.shape[0] != target_means.shape[0]:
-        raise ValueError(
-            f"EMD alignment requires equal counts, got {source_means.shape[0]} and {target_means.shape[0]}"
-        )
-
-    count = source_means.shape[0]
-    padded_count = int(np.ceil(count / 128.0) * 128)
-    source_pad = source_means
-    target_pad = target_means
-    if padded_count != count:
-        pad = padded_count - count
-        source_pad = torch.cat([source_means, source_means[-1:].expand(pad, -1)], dim=0)
-        target_pad = torch.cat([target_means, target_means[-1:].expand(pad, -1)], dim=0)
-
-    aligner = emd_module.emdModule()
-    with torch.no_grad():
-        _, assignment = aligner(
-            source_pad.unsqueeze(0).contiguous(),
-            target_pad.unsqueeze(0).contiguous(),
-            float(eps),
-            int(iters),
-        )
-    assignment = assignment[0, :count].detach().long()
-    assigned_target = assignment.cpu()
-    source_cpu = torch.arange(count, dtype=torch.long)
-    dist_cpu = ((source_means - target_pad[assignment.clamp(min=0)].to(source_means.device)) ** 2).sum(dim=1).detach().cpu()
-
-    best_source = torch.full((count,), -1, dtype=torch.long)
-    best_dist = torch.full((count,), float("inf"))
-    valid = (assigned_target >= 0) & (assigned_target < count)
-    for src_i, tgt_i, dist_i in zip(source_cpu[valid].tolist(), assigned_target[valid].tolist(), dist_cpu[valid].tolist()):
-        if dist_i < best_dist[tgt_i].item():
-            best_dist[tgt_i] = dist_i
-            best_source[tgt_i] = src_i
-
-    missing = best_source < 0
-    if missing.any():
-        missing_idx = missing.nonzero(as_tuple=False).squeeze(1).to(target_means.device)
-        nearest = _align_nearest_target_to_source(source_means, target_means[missing_idx]).detach().cpu()
-        best_source[missing] = nearest
-
-    return best_source.to(source_means.device)
-
-
-def _nearest_neighbor_dist2(means):
-    count = means.shape[0]
-    if count <= 1:
-        return torch.full((count,), 1e-7, device=means.device, dtype=means.dtype)
-    nn_idx = _chunked_knn_indices(means, means, 2)
-    nearest = means[nn_idx[:, 1]]
-    dist2 = ((means - nearest) ** 2).sum(dim=-1)
-    return torch.clamp_min(dist2, 1e-7)
-
-
-def _apply_3dgs_attribute_init(densified_gs):
-    means = densified_gs["means"]
-    count = means.shape[0]
-    device = means.device
-    dtype = means.dtype
-
-    if "scales" in densified_gs:
-        dist2 = _nearest_neighbor_dist2(means)
-        densified_gs["scales"] = torch.log(torch.sqrt(dist2))[..., None].repeat(1, 3)
-
-    if "quats" in densified_gs:
-        quats = torch.zeros((count, 4), device=device, dtype=dtype)
-        quats[:, 0] = 1
-        densified_gs["quats"] = quats
-
-    if "opacities" in densified_gs:
-        opacity = 0.1 * torch.ones((count, 1), device=device, dtype=dtype)
-        densified_gs["opacities"] = torch.logit(opacity)
-
-    return densified_gs
-
-
-def _densify_stage_gs(low_res_gs, interpolated_gs, gt_high_res_gs, input_high_res_gs):
-    return {
-        "00_low_res_gs.ply": low_res_gs,
-        "01_interpolated_high_res_gs.ply": interpolated_gs,
-        "02_gt_high_res_gs.ply": gt_high_res_gs,
-        "03_input_high_res_gs.ply": input_high_res_gs,
-    }
-
-
-def _save_densify_stage_plys(output_dir, low_res_gs, interpolated_gs, gt_high_res_gs, input_high_res_gs):
-    stage_dir = os.path.join(output_dir, "densify_init")
-    for ply_name, gs in _densify_stage_gs(
-        low_res_gs, interpolated_gs, gt_high_res_gs, input_high_res_gs
-    ).items():
-        gs_utils.export_ply_forviewer(gs, os.path.join(stage_dir, ply_name))
-
-
-def _render_gs_average_metrics(gs, images, cameras, chunk_size, device):
-    metric_computer = MetricComputer()
-    num_views = len(images)
-    if num_views == 0:
-        raise ValueError("Cannot compute render metrics with zero views")
-    if chunk_size is None or chunk_size <= 0:
-        chunk_size = num_views
-    chunk_size = min(chunk_size, num_views)
-
-    with torch.no_grad():
-        for start in range(0, num_views, chunk_size):
-            end = min(start + chunk_size, num_views)
-            chunk_images = gpu_utils.move_to_device(images[start:end], device)
-            chunk_cameras = {
-                key: (value[start:end] if key == "camera_to_worlds" else value)
-                for key, value in cameras.items()
-            }
-            chunk_cameras = gpu_utils.move_to_device(chunk_cameras, device)
-
-            pred_imgs, _ = gs_utils.rasterize_gaussians_to_multiimgs(gs, chunk_cameras)
-            pred_imgs = torch.stack(pred_imgs, dim=0)
-            gt_imgs = torch.stack(chunk_images, dim=0)
-
-            if gt_imgs.shape[-1] == 4:
-                masks = gt_imgs[..., 3].unsqueeze(-1)
-                pred_imgs = (pred_imgs * masks * 255).to(torch.uint8)
-                gt_imgs = (gt_imgs[..., :3] * 255).to(torch.uint8)
-            else:
-                pred_imgs = (pred_imgs * 255).to(torch.uint8)
-                gt_imgs = (gt_imgs * 255).to(torch.uint8)
-
-            metric_computer.update(pred_imgs, gt_imgs, name=f"{start:06d}_{end:06d}")
-
-    return metric_computer.finalize()
-
-
-def _write_densify_stage_render_metrics(output_dir, stage_gs, images, cameras, chunk_size, device):
-    stage_dir = os.path.join(output_dir, "densify_init")
-    os.makedirs(stage_dir, exist_ok=True)
-    metrics_by_ply = {}
-    for ply_name, gs in stage_gs.items():
-        metrics_by_ply[ply_name] = _render_gs_average_metrics(gs, images, cameras, chunk_size, device)
-    with open(os.path.join(stage_dir, "render_metrics.json"), "w") as f:
-        json.dump(metrics_by_ply, f, indent=2)
-    return metrics_by_ply
-
-
-def build_densified_input_gs(
-    input_factor_entry,
-    target_factor_entry,
-    alignment,
-    attribute_init,
-    emd_eps,
-    emd_iters,
-    device,
-    return_stages=False,
-):
-    input_gs = gpu_utils.move_to_device(input_factor_entry["gs_params"], device)
-    target_gs = gpu_utils.move_to_device(target_factor_entry["gs_params"], device)
-    target_count = target_gs["means"].shape[0]
-
-    input_in_target_frame = _convert_gs_to_target_frame(
-        input_gs,
-        input_factor_entry["scaler"],
-        target_factor_entry["scaler"],
-    )
-    interpolated_gs = _midpoint_interpolate_gs(input_in_target_frame, target_count)
-
-    if alignment == "emd":
-        source_idx = _align_emd_target_to_source(
-            interpolated_gs["means"], target_gs["means"], emd_eps, emd_iters
-        )
-    elif alignment == "nearest":
-        source_idx = _align_nearest_target_to_source(interpolated_gs["means"], target_gs["means"])
-    else:
-        raise ValueError(f"Unsupported alignment method: {alignment}")
-
-    densified_gs = {}
-    for key, value in target_gs.items():
-        if key in interpolated_gs:
-            densified_gs[key] = interpolated_gs[key][source_idx].clone()
-        else:
-            densified_gs[key] = value.clone()
-
-    if attribute_init == "3dgs":
-        densified_gs = _apply_3dgs_attribute_init(densified_gs)
-    elif attribute_init != "aligned":
-        raise ValueError(f"Unsupported attribute initialization: {attribute_init}")
-
-    if return_stages:
-        return densified_gs, _densify_stage_gs(
-            low_res_gs=input_in_target_frame,
-            interpolated_gs=interpolated_gs,
-            gt_high_res_gs=target_gs,
-            input_high_res_gs=densified_gs,
-        )
-    return densified_gs
-
-
 def evaluate_single_scene(
     model,
     input_gs,
+    source_flow_gs,
     scene_idx,
     scene_name,
     eval_images,
     eval_cameras,
     image_names,
     output_dir,
+    flow_steps,
+    flow_space,
+    fixed_raw_gs=None,
+    fixed_flow_gs=None,
+    fixed_attribute_keys=None,
     eval_chunk_size=None,
     gt_gs=None,
     compare_with_input=False,
     save_viewer=True,
     save_residuals=True,
     output_gt=True,
-    fixed_gt_gs=None,
-    fixed_attribute_keys=None,
 ):
-    model.eval()
-    metric_computer = MetricComputer()
-    metric_computer_input = MetricComputer() if compare_with_input else None
-    predicted_keys = list(getattr(model, "output_features", []))
     if fixed_attribute_keys is None:
         fixed_attribute_keys = []
-
+    metric_computer = MetricComputer()
+    metric_computer_input = MetricComputer() if compare_with_input else None
     device = next(model.parameters()).device
     num_views = len(eval_images)
     if num_views == 0:
@@ -679,10 +503,17 @@ def evaluate_single_scene(
         os.makedirs(compare_dir, exist_ok=True)
 
     with torch.no_grad():
-        out_gs = model(batch_normalized_gs=[input_gs], batch_scene_idx=[scene_idx])[0]
-        if fixed_gt_gs is not None:
-            out_gs = _copy_gt_attributes(out_gs, fixed_gt_gs, fixed_attribute_keys)
-
+        out_gs = sample_flow_model(
+            model,
+            source_flow_gs,
+            scene_idx,
+            flow_steps,
+            flow_space,
+            fixed_flow_gs=fixed_flow_gs,
+            fixed_attribute_keys=fixed_attribute_keys,
+        )
+        if fixed_raw_gs is not None:
+            out_gs = _copy_gt_attributes(out_gs, fixed_raw_gs, fixed_attribute_keys)
         pred_preview = []
         gt_preview = []
 
@@ -754,26 +585,13 @@ def evaluate_single_scene(
             viewerdir = os.path.join(output_dir, f"viewer/{scene_name}")
             os.makedirs(viewerdir, exist_ok=True)
             gs_utils.prepare_viewer(eval_cameras, viewerdir, model.sh_degree)
-            gs_utils.export_ply_forviewer(
-                gs_params=input_gs,
-                filename=os.path.join(viewerdir, "point_cloud/input.ply"),
-            )
-            gs_utils.export_ply_forviewer(
-                gs_params=out_gs,
-                filename=os.path.join(viewerdir, "point_cloud/output.ply"),
-            )
+            gs_utils.export_ply_forviewer(input_gs, os.path.join(viewerdir, "point_cloud/input.ply"))
+            gs_utils.export_ply_forviewer(out_gs, os.path.join(viewerdir, "point_cloud/output.ply"))
             if gt_gs is not None:
-                gs_utils.export_ply_forviewer(
-                    gs_params=gt_gs,
-                    filename=os.path.join(viewerdir, "point_cloud/gt.ply"),
-                )
+                gs_utils.export_ply_forviewer(gt_gs, os.path.join(viewerdir, "point_cloud/gt.ply"))
 
         if save_residuals:
-            residual_type = "out_minus_input"
-            residual_keys = [key for key in predicted_keys if key in out_gs and key in input_gs]
-            if len(residual_keys) == 0:
-                residual_keys = sorted([key for key in out_gs.keys() if key in input_gs])
-
+            residual_keys = sorted([key for key in out_gs.keys() if key in input_gs])
             residuals = {}
             residual_stats = {}
             for key in residual_keys:
@@ -788,11 +606,14 @@ def evaluate_single_scene(
             pt_payload = {
                 "scene_idx": int(scene_idx),
                 "scene_name": scene_name,
-                "residual_type": residual_type,
+                "residual_type": "sampled_out_minus_input",
+                "flow_steps": int(flow_steps),
+                "flow_space": flow_space,
                 "residual_keys": residual_keys,
                 "residuals": _to_cpu(residuals),
                 "input_gs": _to_cpu(input_gs),
                 "output_gs": _to_cpu(out_gs),
+                "target_gs": _to_cpu(gt_gs) if gt_gs is not None else None,
                 "cameras": _to_cpu(eval_cameras),
             }
             torch.save(pt_payload, os.path.join(residual_dir, f"{scene_stem}.pt"))
@@ -801,7 +622,9 @@ def evaluate_single_scene(
                 "scene_idx": int(scene_idx),
                 "scene_name": scene_name,
                 "num_gaussians": int(input_gs["means"].shape[0]),
-                "residual_type": residual_type,
+                "residual_type": "sampled_out_minus_input",
+                "flow_steps": int(flow_steps),
+                "flow_space": flow_space,
                 "residual_keys": residual_keys,
                 "residual_stats": residual_stats,
             }
@@ -821,12 +644,28 @@ def evaluate_single_scene(
     return metrics, metrics_input
 
 
+def _resolve_flow_cfg():
+    cfg = flow_matching()
+    if FLAGS.flow_steps is not None:
+        cfg["flow_steps"] = FLAGS.flow_steps
+    if FLAGS.flow_space is not None:
+        cfg["flow_space"] = FLAGS.flow_space
+    if FLAGS.flow_noise_std is not None:
+        cfg["flow_noise_std"] = FLAGS.flow_noise_std
+    if cfg["flow_space"] not in FLOW_SPACES:
+        raise ValueError(f"Unsupported flow_space={cfg['flow_space']}; expected one of {sorted(FLOW_SPACES)}")
+    if not (0.0 < float(cfg["flow_t_eps"]) < 0.5):
+        raise ValueError(f"flow_t_eps must be in (0, 0.5), got {cfg['flow_t_eps']}")
+    return cfg
+
+
 def main(argv):
     del argv
     os.makedirs(FLAGS.output_dir, exist_ok=True)
 
     gin.parse_config_files_and_bindings(FLAGS.gin_file, FLAGS.gin_param)
     train_cfg = training(output_dir=FLAGS.output_dir)
+    flow_cfg = _resolve_flow_cfg()
     mse_loss_cfg = feature_mse_loss()
     set_seed()
 
@@ -836,34 +675,25 @@ def main(argv):
     logger = ProcessSafeLogger(os.path.join(FLAGS.output_dir, "overfit.log")).get_logger()
     device = torch.device("cuda")
 
-    dataset: SplatFactoMultiLevelDataset = _build_dataset()
+    dataset = _build_dataset()
     scene_idx = _find_scene_index(dataset, FLAGS.scene_name)
     scene = dataset.load_scene(scene_idx)
     input_factor_entry = scene["factor_data"][FLAGS.input_factor]
     target_factor_entry = scene["factor_data"][FLAGS.target_factor]
 
-    train_payload = _build_split_payload(
-        dataset, scene["idx"], scene["scene_name"], target_factor_entry, split="train"
-    )
-    eval_payload = _build_split_payload(
-        dataset, scene["idx"], scene["scene_name"], target_factor_entry, split="test"
-    )
-    if len(eval_payload["images"]) == 0:
-        eval_payload = _build_split_payload(
-            dataset, scene["idx"], scene["scene_name"], target_factor_entry, split="train"
-        )
+    train_payload = _build_split_payload(dataset, scene["idx"], scene["scene_name"], target_factor_entry, split="train")
+    eval_payload = _build_split_payload(dataset, scene["idx"], scene["scene_name"], target_factor_entry, split="test")
 
-    target_gs = gpu_utils.move_to_device(target_factor_entry["gs_params"], device)
-
-    model = FeaturePredictor().to(device)
+    model = GSFlowPredictor().to(device)
     if model.resume_ckpt is not None:
         model.load_state_dict(torch.load(model.resume_ckpt, map_location="cpu"))
     model.train()
 
-    loss_features = _parse_loss_features(FLAGS.loss_features, model, target_gs)
-    fixed_attribute_keys = _fixed_attribute_keys(loss_features, target_gs)
+    target_gs_raw = gpu_utils.move_to_device(target_factor_entry["gs_params"], device)
+    loss_features = _parse_loss_features(FLAGS.loss_features, model, target_gs_raw)
+    fixed_attribute_keys = _fixed_attribute_keys(loss_features, target_gs_raw)
 
-    densified_input_gs, densify_stage_gs = build_densified_input_gs(
+    input_gs_raw = build_densified_input_gs(
         input_factor_entry=input_factor_entry,
         target_factor_entry=target_factor_entry,
         alignment=FLAGS.alignment,
@@ -871,18 +701,13 @@ def main(argv):
         emd_eps=FLAGS.emd_eps,
         emd_iters=FLAGS.emd_iters,
         device=device,
-        return_stages=True,
-    )
-    densified_input_gs = _copy_gt_attributes(densified_input_gs, target_gs, fixed_attribute_keys)
-    densify_stage_gs["03_input_high_res_gs.ply"] = densified_input_gs
-    _save_densify_stage_plys(
         output_dir=FLAGS.output_dir,
-        low_res_gs=densify_stage_gs["00_low_res_gs.ply"],
-        interpolated_gs=densify_stage_gs["01_interpolated_high_res_gs.ply"],
-        gt_high_res_gs=densify_stage_gs["02_gt_high_res_gs.ply"],
-        input_high_res_gs=densify_stage_gs["03_input_high_res_gs.ply"],
+        gt_attribute_keys=fixed_attribute_keys,
     )
-    batch_gs = gpu_utils.move_to_device([densified_input_gs], device)
+    input_gs_raw = _copy_gt_attributes(input_gs_raw, target_gs_raw, fixed_attribute_keys)
+    source_flow_gs = raw_to_flow_gs(input_gs_raw, flow_cfg["flow_space"])
+    target_flow_gs = raw_to_flow_gs(target_gs_raw, flow_cfg["flow_space"])
+    source_flow_gs = _apply_fixed_flow_attributes(source_flow_gs, target_flow_gs, fixed_attribute_keys)
     batch_scene_idx = [scene["idx"]]
 
     eval_images = eval_payload["images"]
@@ -890,18 +715,6 @@ def main(argv):
     eval_chunk_size = dataset.image_per_scene if dataset.image_per_scene is not None else len(eval_images)
     if eval_chunk_size <= 0:
         eval_chunk_size = len(eval_images)
-
-    densify_metrics = _write_densify_stage_render_metrics(
-        output_dir=FLAGS.output_dir,
-        stage_gs=densify_stage_gs,
-        images=eval_images,
-        cameras=eval_cameras,
-        chunk_size=eval_chunk_size,
-        device=device,
-    )
-    for ply_name, metrics in densify_metrics.items():
-        metric_str = " ".join([f"{k}: {v:.4f}" for k, v in metrics.items()])
-        logger.info(f"Densify init {ply_name}: {metric_str}")
 
     with gin.config_scope("train2D"):
         optimizer = build_optimizer(model)
@@ -916,44 +729,58 @@ def main(argv):
     resume_from_step = train_cfg["resume_from_step"]
     enable_amp = train_cfg["enable_amp"]
     empty_cache_fre = train_cfg["empty_cache_fre"]
-    # Keep render-loss training gin keys accepted for compatibility; this script optimizes GS MSE only.
-    _ = train_cfg["image_l1_loss_weight"]
-    _ = train_cfg["lpips_loss_weight"]
 
     scaler = torch.cuda.amp.GradScaler(enabled=enable_amp)
 
     print(
-        f"Overfit scene={scene['scene_name']} idx={scene['idx']} "
+        f"GSFM scene={scene['scene_name']} idx={scene['idx']} "
         f"train_views={len(train_payload['images'])} eval_views={len(eval_payload['images'])} "
         f"input_gaussians={input_factor_entry['gs_params']['means'].shape[0]} "
-        f"densified_gaussians={batch_gs[0]['means'].shape[0]} "
-        f"target_gaussians={target_factor_entry['gs_params']['means'].shape[0]} "
+        f"densified_gaussians={input_gs_raw['means'].shape[0]} "
+        f"target_gaussians={target_gs_raw['means'].shape[0]} "
         f"input_factor={FLAGS.input_factor} target_factor={FLAGS.target_factor} "
         f"alignment={FLAGS.alignment} attribute_init={FLAGS.attribute_init} "
         f"loss_features={','.join(loss_features)} "
+        f"fixed_gt_attributes={','.join(fixed_attribute_keys) if fixed_attribute_keys else 'none'} "
+        f"flow_space={flow_cfg['flow_space']} flow_steps={flow_cfg['flow_steps']} "
+        f"flow_noise_std={flow_cfg['flow_noise_std']} "
+        f"flow_t_eps={flow_cfg['flow_t_eps']} "
         f"post_activate_loss={FLAGS.post_activate_loss} "
         f"quat_direct_mse={mse_loss_cfg['quat_direct_mse']} "
-        f"loss_weights={mse_loss_cfg['loss_weights']} "
-        f"fixed_gt_attributes={','.join(fixed_attribute_keys) if fixed_attribute_keys else 'none'} "
+        f"loss_weights={mse_loss_cfg['loss_weights']}"
     )
 
     os.makedirs(os.path.join(FLAGS.output_dir, "train"), exist_ok=True)
     os.makedirs(os.path.join(FLAGS.output_dir, "checkpoints"), exist_ok=True)
 
-    init_batch_images = gpu_utils.move_to_device([train_payload["images"]], device)
-    gt_imgs_uint8 = [(img[..., :3] * 255).detach().cpu().numpy().astype(np.uint8) for img in init_batch_images[0]]
-    gt_grid = cv2.cvtColor(make_grid(gt_imgs_uint8), cv2.COLOR_RGB2BGR)
-    cv2.imwrite(os.path.join(FLAGS.output_dir, "train", "00000000_gt.png"), gt_grid)
+    train_images_device = gpu_utils.move_to_device(train_payload["images"], device)
+    train_cameras_device = gpu_utils.move_to_device(train_payload["cameras"], device)
+    gt_imgs_uint8 = [(img[..., :3] * 255).detach().cpu().numpy().astype(np.uint8) for img in train_images_device]
+    if len(gt_imgs_uint8) > 0:
+        gt_grid = cv2.cvtColor(make_grid(gt_imgs_uint8), cv2.COLOR_RGB2BGR)
+        cv2.imwrite(os.path.join(FLAGS.output_dir, "train", "00000000_gt.png"), gt_grid)
 
     optimizer.zero_grad(set_to_none=True)
     pbar = tqdm(range(resume_from_step, total_steps))
+    flow_t_eps = float(flow_cfg["flow_t_eps"])
+    flow_noise_std = float(flow_cfg["flow_noise_std"])
     for step in pbar:
+        t = torch.empty(1, device=device).uniform_(flow_t_eps, 1.0 - flow_t_eps)
+        query_flow_gs, flow_noise, gamma, gamma_dot = sample_stochastic_interpolant(
+            source_flow_gs, target_flow_gs, t, flow_noise_std
+        )
+        query_flow_gs = _apply_fixed_flow_attributes(query_flow_gs, target_flow_gs, fixed_attribute_keys)
+
         with torch.cuda.amp.autocast(enabled=enable_amp):
-            out_batch_gs = model(batch_normalized_gs=batch_gs, batch_scene_idx=batch_scene_idx)
-            out_gs = _copy_gt_attributes(out_batch_gs[0], target_gs, fixed_attribute_keys)
-            total_loss, feature_losses, weighted_feature_losses = _feature_mse_loss(
-                out_gs,
-                target_gs,
+            pred_vel = model(batch_flow_gs=[query_flow_gs], batch_scene_idx=batch_scene_idx, t=t)[0]
+            x1_pred_flow_gs = predict_x1_from_velocity(
+                model, query_flow_gs, pred_vel, flow_noise, gamma, gamma_dot, t
+            )
+            x1_pred_raw_gs = flow_to_raw_gs(x1_pred_flow_gs, flow_cfg["flow_space"])
+            x1_pred_raw_gs = _copy_gt_attributes(x1_pred_raw_gs, target_gs_raw, fixed_attribute_keys)
+            total_loss, attr_losses, weighted_attr_losses = _feature_mse_loss(
+                x1_pred_raw_gs,
+                target_gs_raw,
                 loss_features,
                 post_activate_loss=FLAGS.post_activate_loss,
                 loss_weights=mse_loss_cfg["loss_weights"],
@@ -976,53 +803,75 @@ def main(argv):
         optimizer.zero_grad(set_to_none=True)
         scheduler.step()
 
-        feature_loss_values = {key: loss.item() for key, loss in feature_losses.items()}
-        weighted_loss_values = {key: loss.item() for key, loss in weighted_feature_losses.items()}
-        postfix = {"loss": f"{total_loss.item():.3e}", "lr": f"{optimizer.param_groups[0]['lr']:.2e}"}
+        postfix = {
+            "loss": f"{total_loss.item():.4f}",
+            "t": f"{t.item():.3f}",
+            "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
+        }
+        if flow_noise_std > 0.0:
+            postfix["gamma"] = f"{gamma.item():.3e}"
+            postfix["gdot"] = f"{gamma_dot.item():.3e}"
         pbar.set_postfix(postfix)
 
         if empty_cache_fre > 0 and (step + 1) % empty_cache_fre == 0:
             torch.cuda.empty_cache()
 
         if step % log_interval == 0:
-            feature_loss_str = " ".join(
-                f"{key}_loss={value:.6f} {key}_weighted={weighted_loss_values[key]:.6f}"
-                for key, value in feature_loss_values.items()
+            attr_str = " ".join(
+                [
+                    f"{key}_mse={attr_losses[key].item():.6f} "
+                    f"{key}_weighted={weighted_attr_losses[key].item():.6f}"
+                    for key in attr_losses.keys()
+                ]
             )
             logger.info(
-                f"step={step} total={total_loss.item():.6f} "
-                f"{feature_loss_str} lr={optimizer.param_groups[0]['lr']:.8f}"
+                f"step={step} total={total_loss.item():.6f} loss_type=x1_pred_mse "
+                f"loss_features={','.join(loss_features)} t={t.item():.6f} "
+                f"t_eps={flow_t_eps:.6f} gamma={gamma.item():.8f} gamma_dot={gamma_dot.item():.8f} "
+                f"lr={optimizer.param_groups[0]['lr']:.8f} {attr_str}"
             )
 
         if step % log_image_interval == 0:
             with torch.no_grad():
-                log_out_gs = model(batch_normalized_gs=batch_gs, batch_scene_idx=batch_scene_idx)[0]
-                log_out_gs = _copy_gt_attributes(log_out_gs, target_gs, fixed_attribute_keys)
-                batch_cameras = gpu_utils.move_to_device(train_payload["cameras"], device)
-                pred_imgs, _ = gs_utils.rasterize_gaussians_to_multiimgs(log_out_gs, batch_cameras)
-            pred_imgs_uint8 = [(im * 255).detach().cpu().numpy().astype(np.uint8) for im in pred_imgs]
-            pred_grid = cv2.cvtColor(make_grid(pred_imgs_uint8), cv2.COLOR_RGB2BGR)
-            cv2.imwrite(os.path.join(FLAGS.output_dir, "train", f"{step:08d}_pred.png"), pred_grid)
+                train_out_gs = sample_flow_model(
+                    model,
+                    source_flow_gs,
+                    scene["idx"],
+                    int(flow_cfg["flow_steps"]),
+                    flow_cfg["flow_space"],
+                    fixed_flow_gs=target_flow_gs,
+                    fixed_attribute_keys=fixed_attribute_keys,
+                )
+                train_out_gs = _copy_gt_attributes(train_out_gs, target_gs_raw, fixed_attribute_keys)
+                pred_imgs, _ = gs_utils.rasterize_gaussians_to_multiimgs(train_out_gs, train_cameras_device)
+                pred_imgs_uint8 = [(im * 255).detach().cpu().numpy().astype(np.uint8) for im in pred_imgs[:9]]
+                if len(pred_imgs_uint8) > 0:
+                    pred_grid = cv2.cvtColor(make_grid(pred_imgs_uint8), cv2.COLOR_RGB2BGR)
+                    cv2.imwrite(os.path.join(FLAGS.output_dir, "train", f"{step:08d}_pred.png"), pred_grid)
 
         if step % eval_interval == 0:
             eval_dir = os.path.join(FLAGS.output_dir, "eval", f"{step:08d}")
             metrics, metrics_input = evaluate_single_scene(
                 model=model,
-                input_gs=batch_gs[0],
-                gt_gs=target_gs,
+                input_gs=input_gs_raw,
+                source_flow_gs=source_flow_gs,
+                gt_gs=target_gs_raw,
                 scene_idx=eval_payload["scene_idx"],
                 scene_name=eval_payload["scene_name"],
                 eval_images=eval_images,
                 eval_cameras=eval_cameras,
                 image_names=eval_payload["images_name"],
                 output_dir=eval_dir,
+                flow_steps=int(flow_cfg["flow_steps"]),
+                flow_space=flow_cfg["flow_space"],
+                fixed_raw_gs=target_gs_raw,
+                fixed_flow_gs=target_flow_gs,
+                fixed_attribute_keys=fixed_attribute_keys,
                 eval_chunk_size=eval_chunk_size,
                 compare_with_input=FLAGS.compare_with_input,
                 save_viewer=FLAGS.save_viewer,
                 save_residuals=FLAGS.save_residuals,
                 output_gt=(step == 0),
-                fixed_gt_gs=target_gs,
-                fixed_attribute_keys=fixed_attribute_keys,
             )
             metric_str = " ".join([f"{k}: {v:.4f}" for k, v in metrics.items()])
             logger.info(f"Eval step {step}: {metric_str}")
@@ -1038,21 +887,25 @@ def main(argv):
     final_eval_dir = os.path.join(FLAGS.output_dir, FLAGS.eval_subdir)
     metrics, metrics_input = evaluate_single_scene(
         model=model,
-        input_gs=batch_gs[0],
-        gt_gs=target_gs,
+        input_gs=input_gs_raw,
+        source_flow_gs=source_flow_gs,
+        gt_gs=target_gs_raw,
         scene_idx=eval_payload["scene_idx"],
         scene_name=eval_payload["scene_name"],
         eval_images=eval_images,
         eval_cameras=eval_cameras,
         image_names=eval_payload["images_name"],
         output_dir=final_eval_dir,
+        flow_steps=int(flow_cfg["flow_steps"]),
+        flow_space=flow_cfg["flow_space"],
+        fixed_raw_gs=target_gs_raw,
+        fixed_flow_gs=target_flow_gs,
+        fixed_attribute_keys=fixed_attribute_keys,
         eval_chunk_size=eval_chunk_size,
         compare_with_input=FLAGS.compare_with_input,
         save_viewer=FLAGS.save_viewer,
         save_residuals=FLAGS.save_residuals,
         output_gt=True,
-        fixed_gt_gs=target_gs,
-        fixed_attribute_keys=fixed_attribute_keys,
     )
 
     metric_str = " ".join([f"{k}: {v:.4f}" for k, v in metrics.items()])
@@ -1060,7 +913,6 @@ def main(argv):
     if FLAGS.compare_with_input:
         metric_str = " ".join([f"{k}: {v:.4f}" for k, v in metrics_input.items()])
         logger.info(f"Final eval input: {metric_str}")
-
 
 
 if __name__ == "__main__":

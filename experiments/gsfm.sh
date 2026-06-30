@@ -1,0 +1,1 @@
+bash scripts/overfit-sr-gsfm-on-objaverse.sh

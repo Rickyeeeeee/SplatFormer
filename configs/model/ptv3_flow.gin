@@ -8,6 +8,7 @@ GSFlowPredictor.input_features = ['means', 'scales', 'opacities', 'quats', 'feat
 GSFlowPredictor.output_features = ['means', 'scales', 'opacities', 'quats', 'features_dc', 'features_rest']
 GSFlowPredictor.output_head_width = 128
 GSFlowPredictor.zeroinit = True
+GSFlowPredictor.quat_residual_mode = "mul" #[add, mul]
 GSFlowPredictor.input_feat_to_mlp = True
 
 PointTransformerV3FlowModel.enable_flash = True

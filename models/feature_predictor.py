@@ -21,6 +21,27 @@ FEATURE2CHANNEL = {
     'quats': 4,
 }
 ALL_FEATURES = ['means','features_dc','features_rest','opacities','scales','quats']
+
+
+def _identity_quat_like(quats):
+    identity = torch.zeros_like(quats)
+    identity[..., 0] = 1.0
+    return identity
+
+
+def _quat_multiply(q1, q2):
+    w1, x1, y1, z1 = q1.unbind(dim=-1)
+    w2, x2, y2, z2 = q2.unbind(dim=-1)
+    return torch.stack(
+        [
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        ],
+        dim=-1,
+    )
+
 @gin.configurable
 class FeaturePredictor(nn.Module):
     def __init__(self, 
@@ -39,8 +60,13 @@ class FeaturePredictor(nn.Module):
                  resume_ckpt,
                  input_embed_to_mlp,
                  zeroinit,
+                 quat_residual_mode="add",
                  ):
         super(FeaturePredictor, self).__init__()
+        if quat_residual_mode not in ["add", "mul"]:
+            raise ValueError(
+                f"Unsupported quat_residual_mode={quat_residual_mode}; expected 'add' or 'mul'"
+            )
         self.sh_degree = sh_degree
         sh_dim = (sh_degree+1)**2-1
         FEATURE2CHANNEL['features_rest'] = sh_dim*3
@@ -58,6 +84,7 @@ class FeaturePredictor(nn.Module):
         self.output_features_type = output_features_type 
         self.res_feature_activation = res_feature_activation 
         self.input_embed_to_mlp = input_embed_to_mlp
+        self.quat_residual_mode = quat_residual_mode
 
         if backbone_type == 'SP':
             self.backbone = SparseConvModel(in_channels=in_channels)
@@ -193,7 +220,17 @@ class FeaturePredictor(nn.Module):
                     if self.output_features_type=='dc':
                         out_normalized_gs[feature] = output[feature][left:right]
                     elif self.output_features_type=='res':
-                        out_normalized_gs[feature] = in_gs[feature] + output[feature][left:right] #Residual
+                        feature_res = output[feature][left:right]
+                        if feature == 'quats' and self.quat_residual_mode == "mul":
+                            delta_quat = torch.nn.functional.normalize(
+                                _identity_quat_like(feature_res) + feature_res, dim=-1
+                            )
+                            input_quat = torch.nn.functional.normalize(in_gs[feature], dim=-1)
+                            out_normalized_gs[feature] = torch.nn.functional.normalize(
+                                _quat_multiply(delta_quat, input_quat), dim=-1
+                            )
+                        else:
+                            out_normalized_gs[feature] = in_gs[feature] + feature_res #Residual
                 out_batch_normalized_gs.append(out_normalized_gs)
                 left = right
 

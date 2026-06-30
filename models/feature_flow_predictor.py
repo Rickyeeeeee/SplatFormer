@@ -22,6 +22,26 @@ FEATURE2CHANNEL = {
 ALL_FEATURES = ["means", "features_dc", "features_rest", "opacities", "scales", "quats"]
 
 
+def _identity_quat_like(quats):
+    identity = torch.zeros_like(quats)
+    identity[..., 0] = 1.0
+    return identity
+
+
+def _quat_multiply(q1, q2):
+    w1, x1, y1, z1 = q1.unbind(dim=-1)
+    w2, x2, y2, z2 = q2.unbind(dim=-1)
+    return torch.stack(
+        [
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        ],
+        dim=-1,
+    )
+
+
 @gin.configurable
 class GSFlowPredictor(nn.Module):
     def __init__(
@@ -36,8 +56,13 @@ class GSFlowPredictor(nn.Module):
         grid_resolution,
         resume_ckpt,
         zeroinit,
+        quat_residual_mode="add",
     ):
         super().__init__()
+        if quat_residual_mode not in ["add", "mul"]:
+            raise ValueError(
+                f"Unsupported quat_residual_mode={quat_residual_mode}; expected 'add' or 'mul'"
+            )
         self.sh_degree = sh_degree
         sh_dim = (sh_degree + 1) ** 2 - 1
         self.feature2channel = dict(FEATURE2CHANNEL)
@@ -47,6 +72,7 @@ class GSFlowPredictor(nn.Module):
         self.input_feat_to_mlp = input_feat_to_mlp
         self.grid_resolution = grid_resolution
         self.resume_ckpt = resume_ckpt
+        self.quat_residual_mode = quat_residual_mode
         self.backbone_type = "PT_FLOW"
 
         in_channels = sum(self.feature2channel[feature] for feature in self.input_features)
@@ -95,6 +121,19 @@ class GSFlowPredictor(nn.Module):
         if t.numel() != batch_size:
             raise ValueError(f"Expected one t per scene or one scalar, got {t.numel()} for batch {batch_size}")
         return torch.stack([t, torch.sin(t), torch.cos(t)], dim=-1)
+
+    def apply_feature_update(self, feature, value, update, step_scale=1.0):
+        if torch.is_tensor(step_scale):
+            scale = step_scale.to(device=update.device, dtype=update.dtype)
+        else:
+            scale = float(step_scale)
+        if feature == "quats" and self.quat_residual_mode == "mul":
+            delta_quat = torch.nn.functional.normalize(
+                _identity_quat_like(update) + scale * update, dim=-1
+            )
+            input_quat = torch.nn.functional.normalize(value, dim=-1)
+            return torch.nn.functional.normalize(_quat_multiply(delta_quat, input_quat), dim=-1)
+        return value + scale * update
 
     def forward(self, batch_flow_gs: List[dict], batch_scene_idx: List[int], t=None, **kwargs):
         del batch_scene_idx, kwargs
