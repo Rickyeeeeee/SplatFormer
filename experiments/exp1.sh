@@ -18,5 +18,17 @@
 # GPU_ID=5 bash scripts/overfit-sr-mse-on-objaverse.sh 1000 200 200 200 emd 3dgs 4 1 scales,opacities true
 # GPU_ID=5 bash scripts/overfit-sr-mse-on-objaverse.sh 2000 200 200 200 emd 3dgs 4 2 quats,scales,opacities true
 # GPU_ID=5 bash scripts/overfit-sr-mse-on-objaverse.sh 2000 200 200 200 emd 3dgs 4 1 means,scales,opacities true
-GPU_ID=5 bash scripts/overfit-sr-mse-on-objaverse.sh 2000 200 200 200 emd 3dgs 4 2 means,quats,scales,opacities,features_dc
+# GPU_ID=2 bash scripts/overfit-sr-mse-on-objaverse.sh 2000 200 200 200 emd 3dgs 4 2 means,quats,scales,opacities,features_dc
 # GPU_ID=5 bash scripts/overfit-sr-mse-on-objaverse.sh 2000 200 200 200 nearest 3dgs 4 2 means,quats,scales,opacities,features_dc
+
+GPU_ID=2 bash scripts/overfit-sr-mse-on-objaverse.sh 2000 200 200 200 emd 3dgs 4 2 means,opacities,features_dc true false 1.01
+# GPU_ID=2 bash scripts/overfit-sr-mse-on-objaverse.sh 2000 200 200 200 emd 3dgs 4 2 means,quats,scales,opacities,features_dc true false 1.01
+# GPU_ID=2 bash scripts/overfit-sr-mse-on-objaverse.sh 2000 200 200 200 emd aligned 4 2 means,quats,scales,opacities,features_dc true false 1.001
+# GPU_ID=2 bash scripts/overfit-sr-mse-on-objaverse.sh 2000 200 200 200 emd 3dgs 4 2 means true false 1.01
+# GPU_ID=2 bash scripts/overfit-sr-mse-on-objaverse.sh 2000 200 200 200 emd 3dgs 4 2 means true false 1.005
+# GPU_ID=2 bash scripts/overfit-sr-mse-on-objaverse.sh 2000 200 200 200 nearest 3dgs 4 2 means true false 1.001
+# GPU_ID=2 bash scripts/overfit-sr-mse-on-objaverse.sh 2000 200 200 200 emd 3dgs 4 2 means true false 1.0001
+# GPU_ID=2 bash scripts/overfit-sr-mse-on-objaverse.sh 2000 200 200 200 emd 3dgs 4 2 means true false 1.00001
+# GPU_ID=2 bash scripts/overfit-sr-mse-on-objaverse.sh 2000 200 200 200 nearest 3dgs 4 2 means,quats,scales,opacities,features_dc true false 1.001
+
+# GPU_ID=2 bash scripts/overfit-sr-mse-on-objaverse.sh 2000 200 200 200 emd aligned 4 2 means,quats,scales,opacities,features_dc true false 1.001

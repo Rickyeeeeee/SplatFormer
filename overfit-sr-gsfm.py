@@ -57,6 +57,7 @@ flags.DEFINE_multi_string("gin_param", "", "Newline separated list of Gin parame
 FLAGS = flags.FLAGS
 FLOW_SPACES = {"raw"}
 FLOW_KEYS = ["means", "features_dc", "features_rest", "opacities", "scales", "quats"]
+EVAL_FLOW_STEPS = [1, 2, 5]
 MEANS_LOSS_REDUCTION = "sum"  # Set to "mean" for per-coordinate averaging.
 EPS = 1e-6
 
@@ -850,69 +851,73 @@ def main(argv):
                     cv2.imwrite(os.path.join(FLAGS.output_dir, "train", f"{step:08d}_pred.png"), pred_grid)
 
         if step % eval_interval == 0:
-            eval_dir = os.path.join(FLAGS.output_dir, "eval", f"{step:08d}")
-            metrics, metrics_input = evaluate_single_scene(
-                model=model,
-                input_gs=input_gs_raw,
-                source_flow_gs=source_flow_gs,
-                gt_gs=target_gs_raw,
-                scene_idx=eval_payload["scene_idx"],
-                scene_name=eval_payload["scene_name"],
-                eval_images=eval_images,
-                eval_cameras=eval_cameras,
-                image_names=eval_payload["images_name"],
-                output_dir=eval_dir,
-                flow_steps=int(flow_cfg["flow_steps"]),
-                flow_space=flow_cfg["flow_space"],
-                fixed_raw_gs=target_gs_raw,
-                fixed_flow_gs=target_flow_gs,
-                fixed_attribute_keys=fixed_attribute_keys,
-                eval_chunk_size=eval_chunk_size,
-                compare_with_input=FLAGS.compare_with_input,
-                save_viewer=FLAGS.save_viewer,
-                save_residuals=FLAGS.save_residuals,
-                output_gt=(step == 0),
-            )
-            metric_str = " ".join([f"{k}: {v:.4f}" for k, v in metrics.items()])
-            logger.info(f"Eval step {step}: {metric_str}")
-            if FLAGS.compare_with_input:
-                metric_str = " ".join([f"{k}: {v:.4f}" for k, v in metrics_input.items()])
-                logger.info(f"Eval input step {step}: {metric_str}")
+            eval_base_dir = os.path.join(FLAGS.output_dir, "eval", f"{step:08d}")
+            for eval_flow_steps in EVAL_FLOW_STEPS:
+                eval_dir = os.path.join(eval_base_dir, f"flow_steps_{eval_flow_steps:02d}")
+                metrics, metrics_input = evaluate_single_scene(
+                    model=model,
+                    input_gs=input_gs_raw,
+                    source_flow_gs=source_flow_gs,
+                    gt_gs=target_gs_raw,
+                    scene_idx=eval_payload["scene_idx"],
+                    scene_name=eval_payload["scene_name"],
+                    eval_images=eval_images,
+                    eval_cameras=eval_cameras,
+                    image_names=eval_payload["images_name"],
+                    output_dir=eval_dir,
+                    flow_steps=int(eval_flow_steps),
+                    flow_space=flow_cfg["flow_space"],
+                    fixed_raw_gs=target_gs_raw,
+                    fixed_flow_gs=target_flow_gs,
+                    fixed_attribute_keys=fixed_attribute_keys,
+                    eval_chunk_size=eval_chunk_size,
+                    compare_with_input=FLAGS.compare_with_input,
+                    save_viewer=FLAGS.save_viewer,
+                    save_residuals=FLAGS.save_residuals,
+                    output_gt=(step == 0 and eval_flow_steps == EVAL_FLOW_STEPS[0]),
+                )
+                metric_str = " ".join([f"{k}: {v:.4f}" for k, v in metrics.items()])
+                logger.info(f"Eval step {step} flow_steps={eval_flow_steps}: {metric_str}")
+                if FLAGS.compare_with_input:
+                    metric_str = " ".join([f"{k}: {v:.4f}" for k, v in metrics_input.items()])
+                    logger.info(f"Eval input step {step} flow_steps={eval_flow_steps}: {metric_str}")
 
         if (step + 1) % save_interval == 0:
             torch.save(model.state_dict(), os.path.join(FLAGS.output_dir, "checkpoints", f"model_{step:08d}.pth"))
 
     torch.save(model.state_dict(), os.path.join(FLAGS.output_dir, "checkpoints", "model_last.pth"))
 
-    final_eval_dir = os.path.join(FLAGS.output_dir, FLAGS.eval_subdir)
-    metrics, metrics_input = evaluate_single_scene(
-        model=model,
-        input_gs=input_gs_raw,
-        source_flow_gs=source_flow_gs,
-        gt_gs=target_gs_raw,
-        scene_idx=eval_payload["scene_idx"],
-        scene_name=eval_payload["scene_name"],
-        eval_images=eval_images,
-        eval_cameras=eval_cameras,
-        image_names=eval_payload["images_name"],
-        output_dir=final_eval_dir,
-        flow_steps=int(flow_cfg["flow_steps"]),
-        flow_space=flow_cfg["flow_space"],
-        fixed_raw_gs=target_gs_raw,
-        fixed_flow_gs=target_flow_gs,
-        fixed_attribute_keys=fixed_attribute_keys,
-        eval_chunk_size=eval_chunk_size,
-        compare_with_input=FLAGS.compare_with_input,
-        save_viewer=FLAGS.save_viewer,
-        save_residuals=FLAGS.save_residuals,
-        output_gt=True,
-    )
+    final_eval_base_dir = os.path.join(FLAGS.output_dir, FLAGS.eval_subdir)
+    for eval_flow_steps in EVAL_FLOW_STEPS:
+        final_eval_dir = os.path.join(final_eval_base_dir, f"flow_steps_{eval_flow_steps:02d}")
+        metrics, metrics_input = evaluate_single_scene(
+            model=model,
+            input_gs=input_gs_raw,
+            source_flow_gs=source_flow_gs,
+            gt_gs=target_gs_raw,
+            scene_idx=eval_payload["scene_idx"],
+            scene_name=eval_payload["scene_name"],
+            eval_images=eval_images,
+            eval_cameras=eval_cameras,
+            image_names=eval_payload["images_name"],
+            output_dir=final_eval_dir,
+            flow_steps=int(eval_flow_steps),
+            flow_space=flow_cfg["flow_space"],
+            fixed_raw_gs=target_gs_raw,
+            fixed_flow_gs=target_flow_gs,
+            fixed_attribute_keys=fixed_attribute_keys,
+            eval_chunk_size=eval_chunk_size,
+            compare_with_input=FLAGS.compare_with_input,
+            save_viewer=FLAGS.save_viewer,
+            save_residuals=FLAGS.save_residuals,
+            output_gt=(eval_flow_steps == EVAL_FLOW_STEPS[0]),
+        )
 
-    metric_str = " ".join([f"{k}: {v:.4f}" for k, v in metrics.items()])
-    logger.info(f"Final eval: {metric_str}")
-    if FLAGS.compare_with_input:
-        metric_str = " ".join([f"{k}: {v:.4f}" for k, v in metrics_input.items()])
-        logger.info(f"Final eval input: {metric_str}")
+        metric_str = " ".join([f"{k}: {v:.4f}" for k, v in metrics.items()])
+        logger.info(f"Final eval flow_steps={eval_flow_steps}: {metric_str}")
+        if FLAGS.compare_with_input:
+            metric_str = " ".join([f"{k}: {v:.4f}" for k, v in metrics_input.items()])
+            logger.info(f"Final eval input flow_steps={eval_flow_steps}: {metric_str}")
 
 
 if __name__ == "__main__":

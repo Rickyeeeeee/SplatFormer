@@ -1,6 +1,7 @@
 import json
 import os
 import random
+import sys
 
 import cv2
 import gin
@@ -46,6 +47,12 @@ flags.DEFINE_boolean(
     False,
     "Use feature-specific loss transforms: log-space scales, sigmoid opacities, and geodesic quats.",
 )
+flags.DEFINE_float(
+    "means_origin_scale",
+    1.0,
+    "Training-only origin scale for target Gaussian means when computing means MSE loss. "
+    "Predicted means are divided by this value before render/export.",
+)
 flags.DEFINE_multi_string("gin_file", None, "List of paths to the config files.")
 flags.DEFINE_multi_string("gin_param", "", "Newline separated list of Gin parameter bindings.")
 
@@ -54,7 +61,7 @@ FLAGS = flags.FLAGS
 INPUT_FACTOR = 4
 TARGET_FACTOR = 2
 SUPPORTED_GS_KEYS = ["means", "features_dc", "features_rest", "opacities", "scales", "quats"]
-MEANS_LOSS_REDUCTION = "sum"  # Set to "sum" to match PUFM-style summed point loss.
+MEANS_LOSS_REDUCTION = "mean"  # Set to "sum" to match PUFM-style summed point loss.
 
 
 @gin.configurable
@@ -193,9 +200,24 @@ def _copy_gt_attributes(gs, target_gs, attribute_keys):
     return gs
 
 
+def _scale_means_origin(gs, scale):
+    scaled_gs = {key: value.clone() for key, value in gs.items()}
+    if "means" in scaled_gs:
+        scaled_gs["means"] = scaled_gs["means"] * float(scale)
+    return scaled_gs
+
+
+def _unscale_means_origin(gs, scale):
+    unscaled_gs = {key: value.clone() for key, value in gs.items()}
+    if "means" in unscaled_gs:
+        unscaled_gs["means"] = unscaled_gs["means"] / float(scale)
+    return unscaled_gs
+
+
 def _feature_loss_value(key, pred, target, post_activate_loss=False, quat_direct_mse=False):
     if key == "means":
-        squared_error = (pred - target).square()
+        # squared_error = (pred - target).square()
+        squared_error = (pred - target).abs()
         if MEANS_LOSS_REDUCTION == "mean":
             return squared_error.mean()
         if MEANS_LOSS_REDUCTION == "sum":
@@ -391,36 +413,109 @@ def _chunked_nearest_indices(source_means, target_means, chunk_size=512):
     return _chunked_knn_indices(source_means, target_means, 1, chunk_size=chunk_size).squeeze(1)
 
 
+_POINTCEPT_POINTOPS = None
+
+
+def _get_pointcept_pointops():
+    global _POINTCEPT_POINTOPS
+    if _POINTCEPT_POINTOPS is not None:
+        return _POINTCEPT_POINTOPS
+
+    pointcept_libs = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Pointcept", "libs")
+    if pointcept_libs not in sys.path:
+        sys.path.append(pointcept_libs)
+    try:
+        import pointops
+    except Exception as exc:
+        raise ImportError(
+            "Could not import Pointcept pointops. Make sure Pointcept/libs/pointops "
+            "is built or installed in the active environment."
+        ) from exc
+    missing = [name for name in ["knn_query", "farthest_point_sampling"] if not hasattr(pointops, name)]
+    if missing:
+        raise ImportError(f"Pointcept pointops is missing required API(s): {missing}")
+    _POINTCEPT_POINTOPS = pointops
+    return _POINTCEPT_POINTOPS
+
+
 def _midpoint_interpolate_gs(input_gs, target_count):
     source_count = input_gs["means"].shape[0]
     if source_count <= 0:
         raise ValueError("Cannot densify an empty input GS")
-    k = min(source_count, max(2, int(np.ceil(2.0 * target_count / source_count))))
-    nn_idx = _chunked_knn_indices(input_gs["means"], input_gs["means"], k)
-    src_idx = torch.arange(source_count, device=input_gs["means"].device).repeat_interleave(k)
+    if target_count < source_count:
+        raise ValueError(
+            f"Cannot preserve {source_count} source Gaussians when target_count={target_count}"
+        )
+
+    new_count = target_count - source_count
+    if new_count == 0:
+        return {key: value.clone() for key, value in input_gs.items()}
+    if source_count == 1:
+        raise ValueError("Cannot create midpoint Gaussians from a single source Gaussian")
+
+    means = input_gs["means"].contiguous()
+    if not means.is_cuda:
+        raise ValueError("Pointcept pointops midpoint interpolation requires CUDA tensors")
+    pointops = _get_pointcept_pointops()
+
+    up_rate = float(target_count) / float(source_count)
+    k = min(source_count, int(2 * up_rate))
+    if k < 2:
+        raise ValueError(f"Need at least 2 neighbors for midpoint interpolation, got k={k}")
+
+    offset = torch.tensor([source_count], device=means.device, dtype=torch.int32)
+    nn_idx, _ = pointops.knn_query(k, means, offset, means, offset)
+    nn_idx = nn_idx.long()
+    src_idx = torch.arange(source_count, device=means.device).unsqueeze(1).expand(-1, k).reshape(-1)
     nbr_idx = nn_idx.reshape(-1)
+    non_self = src_idx != nbr_idx
+    src_idx = src_idx[non_self]
+    nbr_idx = nbr_idx[non_self]
+
+    candidate_count = src_idx.shape[0]
+    if candidate_count < new_count:
+        raise ValueError(
+            f"PUFM midpoint interpolation produced {candidate_count} new candidates, "
+            f"but target requires {new_count}. source_count={source_count}, k={k}"
+        )
+
+    candidate_means = ((means[src_idx] + means[nbr_idx]) * 0.5).contiguous()
+    if candidate_count > new_count:
+        candidate_offset = torch.tensor([candidate_count], device=means.device, dtype=torch.int32)
+        new_offset = torch.tensor([new_count], device=means.device, dtype=torch.int32)
+        keep_idx = pointops.farthest_point_sampling(candidate_means, candidate_offset, new_offset).long()
+        src_idx = src_idx[keep_idx]
+        nbr_idx = nbr_idx[keep_idx]
 
     interpolated = {}
     for key, value in input_gs.items():
         src_value = value[src_idx]
         nbr_value = value[nbr_idx]
-        if key == "quats":
-            sign = torch.sign((src_value * nbr_value).sum(dim=-1, keepdim=True))
-            sign = torch.where(sign == 0, torch.ones_like(sign), sign)
-            nbr_value = nbr_value * sign
-            interpolated[key] = F.normalize((src_value + nbr_value) * 0.5, dim=-1)
-        else:
-            interpolated[key] = (src_value + nbr_value) * 0.5
 
-    candidate_count = interpolated["means"].shape[0]
-    if candidate_count < target_count:
-        raise ValueError(
-            f"Midpoint interpolation produced {candidate_count} candidates, "
-            f"but target requires {target_count}. source_count={source_count}, k={k}"
-        )
-    if candidate_count > target_count:
-        keep_idx = torch.randperm(candidate_count, device=interpolated["means"].device)[:target_count]
-        interpolated = {key: value[keep_idx] for key, value in interpolated.items()}
+        # Previous midpoint behavior, kept here for quick local toggling:
+        # if key == "quats":
+        #     sign = torch.sign((src_value * nbr_value).sum(dim=-1, keepdim=True))
+        #     sign = torch.where(sign == 0, torch.ones_like(sign), sign)
+        #     nbr_value = nbr_value * sign
+        #     midpoint_value = F.normalize((src_value + nbr_value) * 0.5, dim=-1)
+        # else:
+        #     midpoint_value = (src_value + nbr_value) * 0.5
+
+        if key in ["means", "features_dc", "features_rest"]:
+            midpoint_value = (src_value + nbr_value) * 0.5
+        elif key == "quats":
+            midpoint_value = torch.zeros_like(src_value)
+            midpoint_value[:, 0] = 1
+        elif key == "opacities":
+            low_opacity = torch.full_like(src_value, 0.01)
+            midpoint_value = torch.logit(low_opacity)
+        elif key == "scales":
+            pair_min_scale = torch.minimum(src_value, nbr_value).min(dim=-1, keepdim=True).values
+            midpoint_value = pair_min_scale.repeat(1, src_value.shape[-1])
+        else:
+            midpoint_value = (src_value + nbr_value) * 0.5
+
+        interpolated[key] = torch.cat([value.clone(), midpoint_value], dim=0)
     return interpolated
 
 
@@ -647,6 +742,7 @@ def evaluate_single_scene(
     output_gt=True,
     fixed_gt_gs=None,
     fixed_attribute_keys=None,
+    means_origin_scale=1.0,
 ):
     model.eval()
     metric_computer = MetricComputer()
@@ -665,10 +761,6 @@ def evaluate_single_scene(
     eval_chunk_size = min(eval_chunk_size, num_views)
 
     os.makedirs(output_dir, exist_ok=True)
-    residual_dir = None
-    if save_residuals:
-        residual_dir = os.path.join(output_dir, "residuals")
-        os.makedirs(residual_dir, exist_ok=True)
 
     pred_single_dir = os.path.join(output_dir, f"pred/{scene_name}")
     os.makedirs(pred_single_dir, exist_ok=True)
@@ -682,6 +774,7 @@ def evaluate_single_scene(
         out_gs = model(batch_normalized_gs=[input_gs], batch_scene_idx=[scene_idx])[0]
         if fixed_gt_gs is not None:
             out_gs = _copy_gt_attributes(out_gs, fixed_gt_gs, fixed_attribute_keys)
+        out_gs = _unscale_means_origin(out_gs, means_origin_scale)
 
         pred_preview = []
         gt_preview = []
@@ -768,46 +861,6 @@ def evaluate_single_scene(
                     filename=os.path.join(viewerdir, "point_cloud/gt.ply"),
                 )
 
-        if save_residuals:
-            residual_type = "out_minus_input"
-            residual_keys = [key for key in predicted_keys if key in out_gs and key in input_gs]
-            if len(residual_keys) == 0:
-                residual_keys = sorted([key for key in out_gs.keys() if key in input_gs])
-
-            residuals = {}
-            residual_stats = {}
-            for key in residual_keys:
-                residual = out_gs[key] - input_gs[key]
-                residuals[key] = residual
-                residual_stats[key] = {
-                    "mean": float(residual.mean().item()),
-                    "abs_mean": float(residual.abs().mean().item()),
-                }
-
-            scene_stem = f"{int(scene_idx)}_{_sanitize_for_filename(scene_name)}"
-            pt_payload = {
-                "scene_idx": int(scene_idx),
-                "scene_name": scene_name,
-                "residual_type": residual_type,
-                "residual_keys": residual_keys,
-                "residuals": _to_cpu(residuals),
-                "input_gs": _to_cpu(input_gs),
-                "output_gs": _to_cpu(out_gs),
-                "cameras": _to_cpu(eval_cameras),
-            }
-            torch.save(pt_payload, os.path.join(residual_dir, f"{scene_stem}.pt"))
-
-            stats_payload = {
-                "scene_idx": int(scene_idx),
-                "scene_name": scene_name,
-                "num_gaussians": int(input_gs["means"].shape[0]),
-                "residual_type": residual_type,
-                "residual_keys": residual_keys,
-                "residual_stats": residual_stats,
-            }
-            with open(os.path.join(residual_dir, f"{scene_stem}.json"), "w") as f:
-                json.dump(stats_payload, f, indent=2)
-
     metrics = metric_computer.finalize()
     metric_computer.write_to_file(os.path.join(output_dir, "metrics.json"))
 
@@ -862,6 +915,10 @@ def main(argv):
 
     loss_features = _parse_loss_features(FLAGS.loss_features, model, target_gs)
     fixed_attribute_keys = _fixed_attribute_keys(loss_features, target_gs)
+    requested_means_origin_scale = float(FLAGS.means_origin_scale)
+    if requested_means_origin_scale <= 0.0:
+        raise ValueError(f"--means_origin_scale must be > 0, got {requested_means_origin_scale}")
+    means_origin_scale = requested_means_origin_scale if "means" in loss_features else 1.0
 
     densified_input_gs, densify_stage_gs = build_densified_input_gs(
         input_factor_entry=input_factor_entry,
@@ -874,6 +931,7 @@ def main(argv):
         return_stages=True,
     )
     densified_input_gs = _copy_gt_attributes(densified_input_gs, target_gs, fixed_attribute_keys)
+    loss_target_gs = _scale_means_origin(target_gs, means_origin_scale)
     densify_stage_gs["03_input_high_res_gs.ply"] = densified_input_gs
     _save_densify_stage_plys(
         output_dir=FLAGS.output_dir,
@@ -932,9 +990,15 @@ def main(argv):
         f"alignment={FLAGS.alignment} attribute_init={FLAGS.attribute_init} "
         f"loss_features={','.join(loss_features)} "
         f"post_activate_loss={FLAGS.post_activate_loss} "
+        f"means_origin_scale={requested_means_origin_scale} "
+        f"effective_means_origin_scale={means_origin_scale} "
         f"quat_direct_mse={mse_loss_cfg['quat_direct_mse']} "
         f"loss_weights={mse_loss_cfg['loss_weights']} "
         f"fixed_gt_attributes={','.join(fixed_attribute_keys) if fixed_attribute_keys else 'none'} "
+    )
+    logger.info(
+        f"means_origin_scale={requested_means_origin_scale} "
+        f"effective_means_origin_scale={means_origin_scale}"
     )
 
     os.makedirs(os.path.join(FLAGS.output_dir, "train"), exist_ok=True)
@@ -953,7 +1017,7 @@ def main(argv):
             out_gs = _copy_gt_attributes(out_batch_gs[0], target_gs, fixed_attribute_keys)
             total_loss, feature_losses, weighted_feature_losses = _feature_mse_loss(
                 out_gs,
-                target_gs,
+                loss_target_gs,
                 loss_features,
                 post_activate_loss=FLAGS.post_activate_loss,
                 loss_weights=mse_loss_cfg["loss_weights"],
@@ -998,6 +1062,7 @@ def main(argv):
             with torch.no_grad():
                 log_out_gs = model(batch_normalized_gs=batch_gs, batch_scene_idx=batch_scene_idx)[0]
                 log_out_gs = _copy_gt_attributes(log_out_gs, target_gs, fixed_attribute_keys)
+                log_out_gs = _unscale_means_origin(log_out_gs, means_origin_scale)
                 batch_cameras = gpu_utils.move_to_device(train_payload["cameras"], device)
                 pred_imgs, _ = gs_utils.rasterize_gaussians_to_multiimgs(log_out_gs, batch_cameras)
             pred_imgs_uint8 = [(im * 255).detach().cpu().numpy().astype(np.uint8) for im in pred_imgs]
@@ -1023,6 +1088,7 @@ def main(argv):
                 output_gt=(step == 0),
                 fixed_gt_gs=target_gs,
                 fixed_attribute_keys=fixed_attribute_keys,
+                means_origin_scale=means_origin_scale,
             )
             metric_str = " ".join([f"{k}: {v:.4f}" for k, v in metrics.items()])
             logger.info(f"Eval step {step}: {metric_str}")
@@ -1053,6 +1119,7 @@ def main(argv):
         output_gt=True,
         fixed_gt_gs=target_gs,
         fixed_attribute_keys=fixed_attribute_keys,
+        means_origin_scale=means_origin_scale,
     )
 
     metric_str = " ".join([f"{k}: {v:.4f}" for k, v in metrics.items()])

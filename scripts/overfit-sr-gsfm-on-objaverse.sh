@@ -5,16 +5,17 @@ echo "Using GPU: $GPU_ID"
 
 scene_name=${SCENE_NAME:-3e288ee8aced4a0797e66d53536112b1}
 
-total_steps=${1:-5000}
-save_interval=${2:-200}
-eval_interval=${3:-200}
-log_image_interval=${4:-200}
+total_steps=${1:-4000}
+save_interval=${2:-4000}
+eval_interval=${3:-400}
+log_image_interval=${4:-400}
 alignment=${5:-emd}
 attribute_init=${6:-3dgs}
 input_factor=${7:-4}
 target_factor=${8:-2}
+loss_features=${9:-${LOSS_FEATURES:-means,scales,opacities}}
 # loss_features=${9:-${LOSS_FEATURES:-means,quats,scales,opacities,features_dc}}
-loss_features=${9:-${LOSS_FEATURES:-scales,opacities}}
+# loss_features=${9:-${LOSS_FEATURES:-scales,opacities}}
 flow_space=raw
 if [[ "${10:-}" =~ ^(raw|render|bounded|raw_scale_opacity)$ ]]; then
     if [ "${10}" != "raw" ]; then
@@ -22,11 +23,11 @@ if [[ "${10:-}" =~ ^(raw|render|bounded|raw_scale_opacity)$ ]]; then
         exit 2
     fi
     flow_steps=${11:-${FLOW_STEPS:-1}}
-    flow_noise_std=${12:-${FLOW_NOISE_STD:-0.0}}
+    flow_noise_std=${12:-${FLOW_NOISE_STD:-0.0001}}
     post_activate_loss=${13:-${POST_ACTIVATE_LOSS:-true}}
 else
     flow_steps=${10:-${FLOW_STEPS:-1}}
-    flow_noise_std=${11:-${FLOW_NOISE_STD:-0.0}}
+    flow_noise_std=${11:-${FLOW_NOISE_STD:-0.0001}}
     post_activate_loss=${12:-${POST_ACTIVATE_LOSS:-true}}
 fi
 flow_t_eps=${FLOW_T_EPS:-1e-4}
