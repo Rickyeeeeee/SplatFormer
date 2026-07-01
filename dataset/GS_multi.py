@@ -24,8 +24,6 @@ class SplatFactoMultiLevelDataset(torch.utils.data.IterableDataset):
         image_per_scene: Optional[int],
         remove_outlier_ndevs: float,
         max_gs_num: int,
-        cache_steps: int,
-        cache_num_scenes: int,  # Default: cache_num_scenes=1, cache_steps=1
         split_across_gpus: bool,
         factors: list = [1, 2, 4],
         background_color: list = [0, 0, 0],
@@ -46,16 +44,14 @@ class SplatFactoMultiLevelDataset(torch.utils.data.IterableDataset):
         self.folders = self._build_scene_pairs(nerfstudio_folder, colmap_folder)
 
         self.remove_outlier_ndevs = remove_outlier_ndevs
-        self.cache_steps, self.cache_num_scenes = cache_steps, cache_num_scenes
+        # Accepted for existing gin configs; scenes are loaded directly each iteration.
         self.split_across_gpus = split_across_gpus
         self.max_gs_num = max_gs_num
-        self.cache_scenes = []
         self.background_color = background_color
 
         if train_or_test in ["test"]:
             # For test set, we need to split data across device deterministically
             self.remaining_scenes = list(range(len(self.folders)))
-            assert self.cache_num_scenes == 1 and self.cache_steps == 1, "For test, we do not cache"
             # For DDP evaluation, we need to chunk the data
             try:
                 world_size = torch.cuda.device_count()
@@ -71,6 +67,7 @@ class SplatFactoMultiLevelDataset(torch.utils.data.IterableDataset):
             self.counter = 0
 
 
+    # ----------- Parsing scene images, cameras and gs ---------------
     def _load_scene_roots(self, root_or_txt: str, tag: str):
         if root_or_txt.endswith(".txt"):
             scene_roots = []
@@ -167,6 +164,7 @@ class SplatFactoMultiLevelDataset(torch.utils.data.IterableDataset):
             raise ValueError("No scenes found for SplatFactoMultiLevelDataset")
 
         return folders
+    # ----------------------------------------------------------------------------
 
     def refresh_remaining_training(self):
         if self.split_across_gpus:
@@ -293,6 +291,23 @@ class SplatFactoMultiLevelDataset(torch.utils.data.IterableDataset):
         return gs_params, scaler
 
 
+    def _tensorize_camera_meta(self, meta):
+        for key in [
+            "train_camera_to_worlds",
+            "test_camera_to_worlds",
+            "camera_to_worlds",
+            "fx",
+            "fy",
+            "cx",
+            "cy",
+            "width",
+            "height",
+        ]:
+            if key in meta:
+                meta[key] = torch.as_tensor(meta[key], dtype=torch.float32)
+        return meta
+
+
     def load_images_cameras_fromnerfstudio(self, nerfstudio_dir, colmap_dir, image_dir):
         del colmap_dir
         with open(os.path.join(nerfstudio_dir, "camera_for-3d-denoise.pkl"), "rb") as f:
@@ -301,6 +316,7 @@ class SplatFactoMultiLevelDataset(torch.utils.data.IterableDataset):
         imgs_name = sorted(os.listdir(image_dir))
         imgs_path = [os.path.join(image_dir, name) for name in imgs_name]
         meta["camera_to_worlds"] = meta["train_camera_to_worlds"]
+        meta = self._tensorize_camera_meta(meta)
         return meta, imgs_path
 
 
@@ -371,30 +387,28 @@ class SplatFactoMultiLevelDataset(torch.utils.data.IterableDataset):
             "factor_data": factor_data,
         }
 
-    def get_scene_from_cache(self):
-        if len(self.cache_scenes) < self.cache_num_scenes:
-            idx = self.remaining_scenes.pop(0)
-            if self.train_or_test == "train" and len(self.remaining_scenes) == 0:
-                self.refresh_remaining_training()
-            new_scene = self.load_scene(idx)
-            if self.cache_steps != 1:
-                self.cache_scenes.append([new_scene, 1])
-            return new_scene
 
-        scene_i = random.randint(0, len(self.cache_scenes) - 1)
-        scene = self.cache_scenes[scene_i][0]
-        self.cache_scenes[scene_i][1] += 1
-        if self.cache_scenes[scene_i][1] == self.cache_steps:
-            self.cache_scenes.pop(scene_i)
-            return self.get_scene_from_cache()
-        return scene
+    def build_background(self):
+        if self.background_color == "random":
+            return torch.rand(3)
+        return torch.tensor(self.background_color, dtype=torch.float32) / 255.0
 
 
-    def _prepare_factor_payload(self, factor_entry, background, cam_ids):
+    def load_factor_views(self, factor_entry, cam_ids=None, background=None):
         meta = factor_entry["meta"]
+        total_num = len(meta["camera_to_worlds"])
+        if total_num == 0:
+            raise ValueError("Factor entry has zero views")
+
+        if cam_ids is None:
+            cam_ids = list(range(total_num))
+        else:
+            cam_ids = list(cam_ids)
+        if background is None:
+            background = self.build_background()
+
         imgs_path = factor_entry["imgs_path"]
         imgs_name = factor_entry["imgs_name"]
-
         images = [self.read_image(imgs_path[i], background=background) for i in cam_ids]
         images_names = [imgs_name[i] for i in cam_ids]
 
@@ -408,7 +422,13 @@ class SplatFactoMultiLevelDataset(torch.utils.data.IterableDataset):
             "height": meta["height"],
             "background_color": background,
         }
+        return images, images_names, cameras
 
+
+    def _prepare_factor_payload(self, factor_entry, background, cam_ids):
+        images, images_names, cameras = self.load_factor_views(
+            factor_entry, cam_ids=cam_ids, background=background
+        )
         return {
             "gs_params": factor_entry["gs_params"],
             "images": images,
@@ -420,24 +440,17 @@ class SplatFactoMultiLevelDataset(torch.utils.data.IterableDataset):
     def __iter__(self):
         if self.train_or_test == "train":
             self.refresh_remaining_training()
-        if len(self.remaining_scenes) < self.cache_num_scenes:
-            print(
-                f"Warning: The number of scenes is less than the cache_num_scenes, "
-                f"{len(self.remaining_scenes)} < {self.cache_num_scenes}"
-            )
-            self.cache_num_scenes = len(self.remaining_scenes)
-            print(f"cache_num_scenes is set to {self.cache_num_scenes}")
 
         while len(self.remaining_scenes) > 0:
-            scene = self.get_scene_from_cache()
+            scene_idx = self.remaining_scenes.pop(0)
+            if self.train_or_test == "train" and len(self.remaining_scenes) == 0:
+                self.refresh_remaining_training()
+            scene = self.load_scene(scene_idx)
             factor_data = scene["factor_data"]
             primary_entry = factor_data[self.primary_factor]
             total_num = len(primary_entry["meta"]["camera_to_worlds"])
 
-            if self.background_color == "random":
-                background = torch.rand(3)
-            else:
-                background = torch.tensor(self.background_color) / 255.0
+            background = self.build_background()
 
             if self.train_or_test == "train":
                 if self.image_per_scene is None:

@@ -12,6 +12,47 @@ from gsplat.rendering import rasterization
 BLOCK_WIDTH = 16 
 
 C0 = 0.28209479177387814
+
+
+def make_grid(imgs, nrow=3, ncols=3):
+    img_h, img_w = imgs[0].shape[:2]
+    if imgs[0].ndim == 3:
+        grid = np.zeros((img_h * nrow, img_w * ncols, 3), dtype=np.uint8)
+    else:
+        grid = np.zeros((img_h * nrow, img_w * ncols), dtype=np.uint8)
+    for i in range(nrow):
+        for j in range(ncols):
+            if i * ncols + j >= len(imgs):
+                break
+            grid[i * img_h : (i + 1) * img_h, j * img_w : (j + 1) * img_w] = imgs[i * ncols + j]
+    return grid
+
+
+def sanitize_for_filename(value):
+    return str(value).replace("/", "_").replace("\\", "_")
+
+
+def copy_gt_attributes(gs, target_gs, attribute_keys):
+    for key in attribute_keys:
+        if key in gs and key in target_gs:
+            gs[key] = target_gs[key].to(device=gs[key].device, dtype=gs[key].dtype).clone()
+    return gs
+
+
+def scale_means_origin(gs, scale):
+    scaled_gs = {key: value.clone() for key, value in gs.items()}
+    if "means" in scaled_gs:
+        scaled_gs["means"] = scaled_gs["means"] * float(scale)
+    return scaled_gs
+
+
+def unscale_means_origin(gs, scale):
+    unscaled_gs = {key: value.clone() for key, value in gs.items()}
+    if "means" in unscaled_gs:
+        unscaled_gs["means"] = unscaled_gs["means"] / float(scale)
+    return unscaled_gs
+
+
 def SH2RGB(sh):
     return sh * C0 + 0.5
 def RGB2SH(rgb):

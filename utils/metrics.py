@@ -1,3 +1,5 @@
+import os
+
 import torch
 import numpy as np
 import math
@@ -7,6 +9,7 @@ from math import exp
 import torch
 import lpips
 import json
+from utils import gpu_utils, gs_utils
 
 class MetricComputer:
     def __init__(self, forward_bs=8):
@@ -133,4 +136,50 @@ def _ssim(img1, img2, window, window_size, channel, size_average=True, keep_feat
         return ssim_map.mean()
     else:
         return ssim_map.mean(1).mean(1).mean(1)
-    
+
+def render_gs_average_metrics(gs, images, cameras, chunk_size, device):
+    metric_computer = MetricComputer()
+    num_views = len(images)
+    if num_views == 0:
+        raise ValueError("Cannot compute render metrics with zero views")
+    if chunk_size is None or chunk_size <= 0:
+        chunk_size = num_views
+    chunk_size = min(chunk_size, num_views)
+
+    with torch.no_grad():
+        for start in range(0, num_views, chunk_size):
+            end = min(start + chunk_size, num_views)
+            chunk_images = gpu_utils.move_to_device(images[start:end], device)
+            chunk_cameras = {
+                key: (value[start:end] if key == "camera_to_worlds" else value)
+                for key, value in cameras.items()
+            }
+            chunk_cameras = gpu_utils.move_to_device(chunk_cameras, device)
+
+            pred_imgs, _ = gs_utils.rasterize_gaussians_to_multiimgs(gs, chunk_cameras)
+            pred_imgs = torch.stack(pred_imgs, dim=0)
+            gt_imgs = torch.stack(chunk_images, dim=0)
+
+            if gt_imgs.shape[-1] == 4:
+                masks = gt_imgs[..., 3].unsqueeze(-1)
+                pred_imgs = (pred_imgs * masks * 255).to(torch.uint8)
+                gt_imgs = (gt_imgs[..., :3] * 255).to(torch.uint8)
+            else:
+                pred_imgs = (pred_imgs * 255).to(torch.uint8)
+                gt_imgs = (gt_imgs * 255).to(torch.uint8)
+
+            metric_computer.update(pred_imgs, gt_imgs, name=f"{start:06d}_{end:06d}")
+
+    return metric_computer.finalize()
+
+
+def write_densify_stage_render_metrics(output_dir, stage_gs, images, cameras, chunk_size, device):
+    stage_dir = os.path.join(output_dir, "densify_init")
+    os.makedirs(stage_dir, exist_ok=True)
+    metrics_by_ply = {}
+    for ply_name, gs in stage_gs.items():
+        metrics_by_ply[ply_name] = render_gs_average_metrics(gs, images, cameras, chunk_size, device)
+    with open(os.path.join(stage_dir, "render_metrics.json"), "w") as f:
+        json.dump(metrics_by_ply, f, indent=2)
+    return metrics_by_ply
+

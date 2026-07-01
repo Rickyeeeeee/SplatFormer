@@ -1,8 +1,8 @@
 import os
 
 import numpy as np
+import pointops
 import torch
-import torch.nn.functional as F
 
 from utils import gpu_utils, gs_utils
 
@@ -74,32 +74,69 @@ def midpoint_interpolate_gs(input_gs, target_count):
     source_count = input_gs["means"].shape[0]
     if source_count <= 0:
         raise ValueError("Cannot densify an empty input GS")
-    k = min(source_count, max(2, int(np.ceil(2.0 * target_count / source_count))))
-    nn_idx = chunked_knn_indices(input_gs["means"], input_gs["means"], k)
-    src_idx = torch.arange(source_count, device=input_gs["means"].device).repeat_interleave(k)
+    if target_count < source_count:
+        raise ValueError(
+            f"Cannot preserve {source_count} source Gaussians when target_count={target_count}"
+        )
+
+    new_count = target_count - source_count
+    if new_count == 0:
+        return {key: value.clone() for key, value in input_gs.items()}
+    if source_count == 1:
+        raise ValueError("Cannot create midpoint Gaussians from a single source Gaussian")
+
+    means = input_gs["means"].contiguous()
+    if not means.is_cuda:
+        raise ValueError("Pointcept pointops midpoint interpolation requires CUDA tensors")
+
+    up_rate = float(target_count) / float(source_count)
+    k = min(source_count, int(2 * up_rate))
+    if k < 2:
+        raise ValueError(f"Need at least 2 neighbors for midpoint interpolation, got k={k}")
+
+    offset = torch.tensor([source_count], device=means.device, dtype=torch.int32)
+    nn_idx, _ = pointops.knn_query(k, means, offset, means, offset)
+    nn_idx = nn_idx.long()
+    src_idx = torch.arange(source_count, device=means.device).unsqueeze(1).expand(-1, k).reshape(-1)
     nbr_idx = nn_idx.reshape(-1)
+    non_self = src_idx != nbr_idx
+    src_idx = src_idx[non_self]
+    nbr_idx = nbr_idx[non_self]
+
+    candidate_count = src_idx.shape[0]
+    if candidate_count < new_count:
+        raise ValueError(
+            f"PUFM midpoint interpolation produced {candidate_count} new candidates, "
+            f"but target requires {new_count}. source_count={source_count}, k={k}"
+        )
+    if candidate_count > new_count:
+        candidate_means = ((means[src_idx] + means[nbr_idx]) * 0.5).contiguous()
+        candidate_offset = torch.tensor([candidate_count], device=means.device, dtype=torch.int32)
+        new_offset = torch.tensor([new_count], device=means.device, dtype=torch.int32)
+        keep_idx = pointops.farthest_point_sampling(candidate_means, candidate_offset, new_offset).long()
+        src_idx = src_idx[keep_idx]
+        nbr_idx = nbr_idx[keep_idx]
 
     interpolated = {}
     for key, value in input_gs.items():
         src_value = value[src_idx]
         nbr_value = value[nbr_idx]
-        if key == "quats":
-            sign = torch.sign((src_value * nbr_value).sum(dim=-1, keepdim=True))
-            sign = torch.where(sign == 0, torch.ones_like(sign), sign)
-            nbr_value = nbr_value * sign
-            interpolated[key] = F.normalize((src_value + nbr_value) * 0.5, dim=-1)
-        else:
-            interpolated[key] = (src_value + nbr_value) * 0.5
 
-    candidate_count = interpolated["means"].shape[0]
-    if candidate_count < target_count:
-        raise ValueError(
-            f"Midpoint interpolation produced {candidate_count} candidates, "
-            f"but target requires {target_count}. source_count={source_count}, k={k}"
-        )
-    if candidate_count > target_count:
-        keep_idx = torch.randperm(candidate_count, device=interpolated["means"].device)[:target_count]
-        interpolated = {key: value[keep_idx] for key, value in interpolated.items()}
+        if key in ["means", "features_dc", "features_rest"]:
+            midpoint_value = (src_value + nbr_value) * 0.5
+        elif key == "quats":
+            midpoint_value = torch.zeros_like(src_value)
+            midpoint_value[:, 0] = 1
+        elif key == "opacities":
+            low_opacity = torch.full_like(src_value, 0.01)
+            midpoint_value = torch.logit(low_opacity)
+        elif key == "scales":
+            pair_min_scale = torch.minimum(src_value, nbr_value).min(dim=-1, keepdim=True).values
+            midpoint_value = pair_min_scale.repeat(1, src_value.shape[-1])
+        else:
+            midpoint_value = (src_value + nbr_value) * 0.5
+
+        interpolated[key] = torch.cat([value.clone(), midpoint_value], dim=0)
     return interpolated
 
 
@@ -200,17 +237,26 @@ def apply_gt_attribute_overrides(densified_gs, target_gs, gt_attribute_keys):
     return densified_gs
 
 
+def densify_stage_gs(low_res_gs, interpolated_gs, gt_high_res_gs, input_high_res_gs):
+    return {
+        "00_low_res_gs.ply": low_res_gs,
+        "01_interpolated_high_res_gs.ply": interpolated_gs,
+        "02_gt_high_res_gs.ply": gt_high_res_gs,
+        "03_input_high_res_gs.ply": input_high_res_gs,
+    }
+
+
 def save_densify_stage_plys(output_dir, low_res_gs, interpolated_gs, gt_high_res_gs, input_high_res_gs):
     stage_dir = os.path.join(output_dir, "densify_init")
-    gs_utils.export_ply_forviewer(low_res_gs, os.path.join(stage_dir, "00_low_res_gs.ply"))
-    gs_utils.export_ply_forviewer(interpolated_gs, os.path.join(stage_dir, "01_interpolated_high_res_gs.ply"))
-    gs_utils.export_ply_forviewer(gt_high_res_gs, os.path.join(stage_dir, "02_gt_high_res_gs.ply"))
-    gs_utils.export_ply_forviewer(input_high_res_gs, os.path.join(stage_dir, "03_input_high_res_gs.ply"))
+    for ply_name, gs in densify_stage_gs(
+        low_res_gs, interpolated_gs, gt_high_res_gs, input_high_res_gs
+    ).items():
+        gs_utils.export_ply_forviewer(gs, os.path.join(stage_dir, ply_name))
 
 
 def build_densified_input_gs(
-    input_factor_entry,
-    target_factor_entry,
+    input_factor_dict,
+    target_factor_dict,
     alignment,
     attribute_init,
     emd_eps,
@@ -218,15 +264,16 @@ def build_densified_input_gs(
     device,
     output_dir=None,
     gt_attribute_keys=None,
+    return_stages=False,
 ):
-    input_gs = gpu_utils.move_to_device(input_factor_entry["gs_params"], device)
-    target_gs = gpu_utils.move_to_device(target_factor_entry["gs_params"], device)
+    input_gs = gpu_utils.move_to_device(input_factor_dict["gs_params"], device)
+    target_gs = gpu_utils.move_to_device(target_factor_dict["gs_params"], device)
     target_count = target_gs["means"].shape[0]
 
     input_in_target_frame = convert_gs_to_target_frame(
         input_gs,
-        input_factor_entry["scaler"],
-        target_factor_entry["scaler"],
+        input_factor_dict["scaler"],
+        target_factor_dict["scaler"],
     )
     interpolated_gs = midpoint_interpolate_gs(input_in_target_frame, target_count)
 
@@ -241,7 +288,10 @@ def build_densified_input_gs(
 
     densified_gs = {}
     for key, value in target_gs.items():
-        densified_gs[key] = interpolated_gs[key][source_idx].clone()
+        if key in interpolated_gs:
+            densified_gs[key] = interpolated_gs[key][source_idx].clone()
+        else:
+            densified_gs[key] = value.clone()
 
     if attribute_init == "3dgs":
         densified_gs = apply_3dgs_attribute_init(densified_gs)
@@ -261,4 +311,11 @@ def build_densified_input_gs(
             input_high_res_gs=densified_gs,
         )
 
+    if return_stages:
+        return densified_gs, densify_stage_gs(
+            low_res_gs=input_in_target_frame,
+            interpolated_gs=interpolated_gs,
+            gt_high_res_gs=target_gs,
+            input_high_res_gs=densified_gs,
+        )
     return densified_gs

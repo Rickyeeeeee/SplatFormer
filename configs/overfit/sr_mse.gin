@@ -74,7 +74,5 @@ train_dataset/SplatFactoMultiLevelDataset.nerfstudio_folder = '/project/ricky/sp
 train_dataset/SplatFactoMultiLevelDataset.colmap_folder = '/project/ricky/splatformer-data/overfit-data-256/colmap'
 train_dataset/SplatFactoMultiLevelDataset.image_per_scene = 128
 train_dataset/SplatFactoMultiLevelDataset.sample_ratio_test = 0.7
-train_dataset/SplatFactoMultiLevelDataset.cache_steps = 1
-train_dataset/SplatFactoMultiLevelDataset.cache_num_scenes = 1
 train_dataset/SplatFactoMultiLevelDataset.split_across_gpus = True
 train_dataset/SplatFactoMultiLevelDataset.factors = [1, 2, 4]
