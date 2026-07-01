@@ -40,6 +40,8 @@ def build_optimizer(model,
     elif optimizer_type.lower() == 'sgd':
         optimizer = torch.optim.SGD(params_lr, 
                                     lr = lr_dict['base'])
+    # elif optimizer_type.lower() == 'muan':
+    #     optimizer = torch.optim.
     else:
         raise NotImplementedError
     return optimizer

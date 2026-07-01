@@ -325,7 +325,7 @@ def main(argv):
     # Step 2: Choose parameter subsets
     # Toggle this line to test the old behavior: non-loss attributes are replaced
     # with GT before the densified GS is used as model input.
-    densified_input_gs = copy_gt_attributes(densified_input_gs, target_gs, fixed_attribute_keys)
+    # densified_input_gs = copy_gt_attributes(densified_input_gs, target_gs, fixed_attribute_keys)
     loss_target_gs = scale_means_origin(target_gs, means_origin_scale)
     densify_stage_gs["03_input_high_res_gs.ply"] = densified_input_gs
     save_densify_stage_plys(

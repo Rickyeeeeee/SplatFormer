@@ -16,7 +16,7 @@ flow_matching.flow_noise_std = 0.0
 flow_matching.flow_t_eps = 1e-4
 
 feature_mse_loss.loss_weights = {
-    'means': 1.0,
+    'means': 100.0,
     'features_dc': 1.0,
     'features_rest': 1.0,
     'opacities': 1.0,
@@ -31,7 +31,7 @@ train2D/build_optimizer.lr_dict = {
     'backbone': 3e-4,
     'features_dc': 3e-4,
     'features_rest': 1.5e-6,
-    'scales': 3e-4,
+    'scales': 3e-3,
     'opacities': 3e-4,
     'quats': 3e-4,
     'means': 3e-4,
@@ -39,7 +39,7 @@ train2D/build_optimizer.lr_dict = {
 train2D/build_optimizer.optimizer_type = 'adam'
 train2D/build_optimizer.optimizer_params = {'eps': 1e-15}
 train2D/build_scheduler.total_step = %total_steps
-train2D/build_scheduler.schedule = 'constant'
+train2D/build_scheduler.schedule = 'linear'
 
 SplatFactoMultiLevelDataset.remove_outlier_ndevs = -1
 SplatFactoMultiLevelDataset.image_per_scene = None
@@ -52,7 +52,5 @@ train_dataset/SplatFactoMultiLevelDataset.nerfstudio_folder = '/project/ricky/sp
 train_dataset/SplatFactoMultiLevelDataset.colmap_folder = '/project/ricky/splatformer-data/overfit-data-256/colmap'
 train_dataset/SplatFactoMultiLevelDataset.image_per_scene = 128
 train_dataset/SplatFactoMultiLevelDataset.sample_ratio_test = 0.7
-train_dataset/SplatFactoMultiLevelDataset.cache_steps = 1
-train_dataset/SplatFactoMultiLevelDataset.cache_num_scenes = 1
 train_dataset/SplatFactoMultiLevelDataset.split_across_gpus = True
-train_dataset/SplatFactoMultiLevelDataset.factors = [1, 2, 4]
+train_dataset/SplatFactoMultiLevelDataset.factors = [2, 4]

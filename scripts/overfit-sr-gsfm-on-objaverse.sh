@@ -10,15 +10,12 @@ save_interval=${2:-4000}
 eval_interval=${3:-400}
 log_image_interval=${4:-400}
 alignment=${5:-emd}
-attribute_init=${6:-3dgs}
+attribute_init=${6:-aligned}
 input_factor=${7:-4}
 target_factor=${8:-2}
-loss_features=${9:-${LOSS_FEATURES:-means,scales,opacities}}
-# loss_features=${9:-${LOSS_FEATURES:-means,quats,scales,opacities,features_dc}}
-# loss_features=${9:-${LOSS_FEATURES:-scales,opacities}}
+loss_features=${9:-${LOSS_FEATURES:-means}}
 flow_steps=${10:-${FLOW_STEPS:-1}}
-flow_noise_std=${11:-${FLOW_NOISE_STD:-0.0001}}
-post_activate_loss=${12:-${POST_ACTIVATE_LOSS:-true}}
+flow_noise_std=${11:-${FLOW_NOISE_STD:-0.0}}
 flow_t_eps=${FLOW_T_EPS:-1e-4}
 
 sanitize_name() {
@@ -26,7 +23,7 @@ sanitize_name() {
 }
 
 loss_name="$(sanitize_name "${loss_features}")"
-out_name=${scene_name}_${alignment}_${attribute_init}_if${input_factor}_tf${target_factor}_gsfm_${loss_name}_steps${flow_steps}_n${flow_noise_std}
+out_name=${scene_name}_${alignment}_${attribute_init}_if${input_factor}_tf${target_factor}_gsfm_${loss_name}
 output_dir=${OUTPUT_DIR:-/project/ricky/outputs/objaverse_splatformer_overfit_sr_gsfm_512/${out_name}}
 
 CUDA_VISIBLE_DEVICES=$GPU_ID python overfit-sr-gsfm.py \
@@ -39,7 +36,6 @@ CUDA_VISIBLE_DEVICES=$GPU_ID python overfit-sr-gsfm.py \
     --loss_features=${loss_features} \
     --flow_steps=${flow_steps} \
     --flow_noise_std=${flow_noise_std} \
-    --post_activate_loss=${post_activate_loss} \
     --gin_param="flow_matching.flow_t_eps=${flow_t_eps}" \
     --gin_file=configs/model/ptv3_flow.gin \
     --gin_file=configs/overfit/sr_gsfm.gin \

@@ -68,8 +68,7 @@ def feature_loss_value(
             f"Unsupported means_loss_reduction={means_loss_reduction}; expected 'mean' or 'sum'"
         )
 
-    if not post_activate_loss:
-        return F.mse_loss(pred, target)
+
 
     if key == "opacities":
         return F.mse_loss(torch.sigmoid(pred), torch.sigmoid(target))
@@ -89,7 +88,6 @@ def feature_mse_loss(
     out_gs,
     target_gs,
     loss_features,
-    post_activate_loss=False,
     loss_weights=None,
     quat_direct_mse=False,
     means_loss_reduction="mean",
@@ -122,7 +120,6 @@ def feature_mse_loss(
             key,
             pred,
             target,
-            post_activate_loss=post_activate_loss,
             quat_direct_mse=quat_direct_mse,
             means_loss_reduction=means_loss_reduction,
         )

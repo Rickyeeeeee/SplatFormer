@@ -53,7 +53,7 @@ train2D/build_optimizer.lr_dict = {
     "backbone": 3e-4,
     "features_dc": 3e-4,
     "features_rest": 1.5e-6,
-    "scales": 3e-4,
+    "scales": 3e-3,
     "opacities": 3e-4,
     "quats": 3e-4,
     "means": 3e-4

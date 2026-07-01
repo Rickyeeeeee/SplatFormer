@@ -49,11 +49,6 @@ flags.DEFINE_float("emd_eps", 0.01, "Auction EMD epsilon")
 flags.DEFINE_integer("emd_iters", 100, "Auction EMD iterations")
 flags.DEFINE_integer("flow_steps", None, "Euler sampling steps; overrides gin flow_matching.flow_steps")
 flags.DEFINE_float("flow_noise_std", None, "Stochastic-interpolant noise scale multiplying sqrt(2t(1-t))")
-flags.DEFINE_boolean(
-    "post_activate_loss",
-    False,
-    "Use MSE-style feature loss transforms: sigmoid opacities and normalized quaternion loss.",
-)
 flags.DEFINE_string(
     "loss_features",
     "",
@@ -62,7 +57,7 @@ flags.DEFINE_string(
 )
 flags.DEFINE_float(
     "means_origin_scale",
-    1.0,
+    1.05,
     "Training-only origin scale for target Gaussian means when computing means flow loss. "
     "Predicted means are divided by this value before render/export.",
 )
@@ -502,7 +497,6 @@ def main(argv):
         f"flow_steps={flow_cfg['flow_steps']} "
         f"flow_noise_std={flow_cfg['flow_noise_std']} "
         f"flow_t_eps={flow_cfg['flow_t_eps']} "
-        f"post_activate_loss={FLAGS.post_activate_loss} "
         f"means_origin_scale={requested_means_origin_scale} "
         f"effective_means_origin_scale={means_origin_scale} "
         f"quat_direct_mse={mse_loss_cfg['quat_direct_mse']} "
@@ -542,7 +536,6 @@ def main(argv):
                 x1_pred_raw_gs,
                 loss_target_gs,
                 loss_features,
-                post_activate_loss=FLAGS.post_activate_loss,
                 loss_weights=mse_loss_cfg["loss_weights"],
                 quat_direct_mse=mse_loss_cfg["quat_direct_mse"],
                 means_loss_reduction=MEANS_LOSS_REDUCTION,
@@ -644,9 +637,10 @@ def main(argv):
                 )
                 metric_str = " ".join([f"{k}: {v:.4f}" for k, v in metrics.items()])
                 logger.info(f"Eval step {step} flow_steps={eval_flow_steps}: {metric_str}")
+                print(f"Eval step {step} flow_steps={eval_flow_steps}: {metric_str}")
                 if FLAGS.compare_with_input:
                     metric_str = " ".join([f"{k}: {v:.4f}" for k, v in metrics_input.items()])
-                    logger.info(f"Eval input step {step} flow_steps={eval_flow_steps}: {metric_str}")
+                    print(f"Eval input step {step} flow_steps={eval_flow_steps}: {metric_str}")
 
         if (step + 1) % save_interval == 0:
             torch.save(model.state_dict(), os.path.join(FLAGS.output_dir, "checkpoints", f"model_{step:08d}.pth"))
@@ -681,9 +675,11 @@ def main(argv):
 
         metric_str = " ".join([f"{k}: {v:.4f}" for k, v in metrics.items()])
         logger.info(f"Final eval flow_steps={eval_flow_steps}: {metric_str}")
+        print(f"Final eval flow_steps={eval_flow_steps}: {metric_str}")
         if FLAGS.compare_with_input:
             metric_str = " ".join([f"{k}: {v:.4f}" for k, v in metrics_input.items()])
             logger.info(f"Final eval input flow_steps={eval_flow_steps}: {metric_str}")
+            print(f"Final eval input flow_steps={eval_flow_steps}: {metric_str}")
 
 
 if __name__ == "__main__":

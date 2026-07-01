@@ -33,9 +33,14 @@
 # GPU_ID=2 bash scripts/overfit-sr-mse-on-objaverse.sh 2000 200 200 200 emd aligned 4 2 means,quats,scales,opacities,features_dc true false 1.001
 
 # GPU_ID=4 bash scripts/overfit-sr-mse-on-objaverse.sh 1000 200 200 200 emd aligned 4 2 means
-GPU_ID=4 bash scripts/overfit-sr-mse-on-objaverse.sh 1000 200 200 200 emd aligned 4 2 scales
+# GPU_ID=4 bash scripts/overfit-sr-mse-on-objaverse.sh 1000 200 200 200 emd aligned 4 2 scales
+# GPU_ID=4 bash scripts/overfit-sr-mse-on-objaverse.sh 1000 200 200 200 emd aligned 4 2 opacities
+# GPU_ID=4 bash scripts/overfit-sr-mse-on-objaverse.sh 1000 200 200 200 emd aligned 4 2 features_dc
+# GPU_ID=4 bash scripts/overfit-sr-mse-on-objaverse.sh 1000 200 200 200 emd aligned 4 2 features_rest
+# GPU_ID=4 bash scripts/overfit-sr-mse-on-objaverse.sh 1000 200 200 200 emd aligned 4 2 quats
 # GPU_ID=4 bash scripts/overfit-sr-mse-on-objaverse.sh 1000 200 200 200 emd aligned 4 2 means,opacities
 # GPU_ID=4 bash scripts/overfit-sr-mse-on-objaverse.sh 1000 200 200 200 emd aligned 4 2 means,opacities,features_dc
 # GPU_ID=4 bash scripts/overfit-sr-mse-on-objaverse.sh 1000 200 200 200 emd aligned 4 2 means,opacities,features_dc,scales
 # GPU_ID=4 bash scripts/overfit-sr-mse-on-objaverse.sh 1000 200 200 200 emd aligned 4 2 means,opacities,features_dc,scales,quats
-# GPU_ID=4 bash scripts/overfit-sr-mse-on-objaverse.sh 1000 200 200 200 emd aligned 4 2 means,opacities,features_dc,features_rest,scales,quats
+# GPU_ID=4 bash scripts/overfit-sr-mse-on-objaverse.sh 2000 200 200 200 emd aligned 4 2 means,opacities,features_dc,features_rest,scales,quats
+GPU_ID=4 bash scripts/overfit-sr-mse-on-objaverse.sh 2000 200 200 200 emd aligned 4 2 means,opacities,features_dc
