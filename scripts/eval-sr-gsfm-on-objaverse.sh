@@ -32,7 +32,7 @@ sanitize_name() {
 }
 
 loss_name="$(sanitize_name "${loss_features}")"
-out_name=${scene_name}_${alignment}_${attribute_init}_if${input_factor}_tf${target_factor}_gsfm_${loss_name}_raw_steps${flow_steps}_n${flow_noise_std}
+out_name=${scene_name}_${alignment}_${attribute_init}_if${input_factor}_tf${target_factor}_gsfm_${loss_name}_steps${flow_steps}_n${flow_noise_std}
 output_dir=${OUTPUT_DIR:-/project/ricky/outputs/objaverse_splatformer_overfit_sr_gsfm_512/${out_name}}
 checkpoint=${CHECKPOINT:-${output_dir}/checkpoints/model_last.pth}
 eval_output_dir=${EVAL_OUTPUT_DIR:-${output_dir}/eval_flow_steps_${eval_flow_steps}}
@@ -47,7 +47,6 @@ CUDA_VISIBLE_DEVICES=$GPU_ID python eval-sr-gsfm.py \
     --input_factor=${input_factor} \
     --target_factor=${target_factor} \
     --loss_features=${loss_features} \
-    --flow_space=raw \
     --flow_steps=${flow_steps} \
     --flow_noise_std=${flow_noise_std} \
     --post_activate_loss=${post_activate_loss} \

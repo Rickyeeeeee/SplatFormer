@@ -1,6 +1,6 @@
 #!/bin/bash
 
-GPU_ID=${GPU_ID:-5}
+GPU_ID=${GPU_ID:-4}
 echo "Using GPU: $GPU_ID"
 
 # for scene_name in $(ls /project/ricky/splatformer-data/test-set-512/colmap)
@@ -19,7 +19,7 @@ target_factor=${8:-2}
 loss_features=${9:-${LOSS_FEATURES:-means}}
 post_activate_loss=${10:-${POST_ACTIVATE_LOSS:-true}}
 direct_prediction=${11:-${DIRECT_PREDICTION:-false}}
-means_origin_scale=${12:-${MEANS_ORIGIN_SCALE:-1.0}}
+means_origin_scale=${12:-${MEANS_ORIGIN_SCALE:-1.01}}
 conda_env=${CONDA_ENV:-3dgs-sr}
 
 to_bit() {
@@ -45,7 +45,7 @@ else
 fi
 
 scale_name=$(sanitize_name "${means_origin_scale}")
-out_name=${scene_name}_${attribute_init}_if${input_factor}_tf${target_factor}_mse_${loss_name}_pa${post_activate_bit}_direct${direct_prediction_bit}_mos${scale_name}
+out_name=${scene_name}_${attribute_init}_if${input_factor}_tf${target_factor}_mse_${loss_name}
 output_dir=/project/ricky/experiments/objaverse_splatformer_overfit_sr_mse_512/${out_name}
 
 CUDA_VISIBLE_DEVICES=$GPU_ID python overfit-sr-mse.py \

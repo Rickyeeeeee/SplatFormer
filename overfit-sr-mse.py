@@ -323,6 +323,8 @@ def main(argv):
     )
 
     # Step 2: Choose parameter subsets
+    # Toggle this line to test the old behavior: non-loss attributes are replaced
+    # with GT before the densified GS is used as model input.
     densified_input_gs = copy_gt_attributes(densified_input_gs, target_gs, fixed_attribute_keys)
     loss_target_gs = scale_means_origin(target_gs, means_origin_scale)
     densify_stage_gs["03_input_high_res_gs.ply"] = densified_input_gs
@@ -387,7 +389,7 @@ def main(argv):
         f"effective_means_origin_scale={means_origin_scale} \n"
         f"quat_direct_mse={mse_loss_cfg['quat_direct_mse']} \n"
         f"loss_weights={mse_loss_cfg['loss_weights']} \n"
-        f"fixed_gt_attributes={','.join(fixed_attribute_keys) if fixed_attribute_keys else 'none'} \n"
+        f"eval_gt_attributes={','.join(fixed_attribute_keys) if fixed_attribute_keys else 'none'} \n"
     )
 
     print(training_brief)
@@ -408,7 +410,7 @@ def main(argv):
     for step in pbar:
         with torch.cuda.amp.autocast(enabled=enable_amp):
             out_batch_gs = model(batch_normalized_gs=batch_gs, batch_scene_idx=batch_scene_idx)
-            out_gs = copy_gt_attributes(out_batch_gs[0], target_gs, fixed_attribute_keys)
+            out_gs = out_batch_gs[0]
             total_loss, feature_losses, weighted_feature_losses = compute_feature_mse_loss(
                 out_gs,
                 loss_target_gs,
@@ -486,6 +488,7 @@ def main(argv):
             )
             metric_str = " ".join([f"{k}: {v:.4f}" for k, v in metrics.items()])
             logger.info(f"Eval step {step}: {metric_str}")
+            print(f"Eval step {step}: {metric_str}")
             if FLAGS.compare_with_input:
                 metric_str = " ".join([f"{k}: {v:.4f}" for k, v in metrics_input.items()])
                 logger.info(f"Eval input step {step}: {metric_str}")
@@ -517,9 +520,11 @@ def main(argv):
 
     metric_str = " ".join([f"{k}: {v:.4f}" for k, v in metrics.items()])
     logger.info(f"Final eval: {metric_str}")
+    print(f"Final eval input: {metric_str}")
     if FLAGS.compare_with_input:
         metric_str = " ".join([f"{k}: {v:.4f}" for k, v in metrics_input.items()])
         logger.info(f"Final eval input: {metric_str}")
+        print(f"Final eval input: {metric_str}")
 
 
 if __name__ == "__main__":

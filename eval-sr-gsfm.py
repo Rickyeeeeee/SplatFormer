@@ -13,7 +13,10 @@ from absl import app, flags
 
 from models.feature_flow_predictor import GSFlowPredictor
 from utils import gpu_utils
+from utils.gs_utils import copy_gt_attributes, scale_means_origin
 from utils.log_utils import ProcessSafeLogger
+from utils.loss_utils import fixed_attribute_keys as select_fixed_attribute_keys, parse_loss_features
+from utils.sr_dataset_utils import build_dataset, build_split_payload, find_scene_index
 from utils.sr_densify_utils import build_densified_input_gs
 
 
@@ -185,8 +188,8 @@ def main(argv):
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is not available")
 
-    dataset = gsfm._build_dataset()
-    scene_idx = gsfm._find_scene_index(dataset, FLAGS.scene_name)
+    dataset = build_dataset()
+    scene_idx = find_scene_index(dataset, FLAGS.scene_name)
     scene = dataset.load_scene(scene_idx)
     input_factor_entry = scene["factor_data"][FLAGS.input_factor]
     target_factor_entry = scene["factor_data"][FLAGS.target_factor]
@@ -194,14 +197,14 @@ def main(argv):
     # Mirror overfit-sr-gsfm.py setup order. The unused train payload matters when
     # the dataset uses random background color because it advances the RNG before
     # constructing the eval payload.
-    _train_payload = gsfm._build_split_payload(
+    _train_payload = build_split_payload(
         dataset,
         scene["idx"],
         scene["scene_name"],
         target_factor_entry,
         split="train",
     )
-    eval_payload = gsfm._build_split_payload(
+    eval_payload = build_split_payload(
         dataset,
         scene["idx"],
         scene["scene_name"],
@@ -220,12 +223,18 @@ def main(argv):
     model.load_state_dict(_state_dict_from_checkpoint(checkpoint_path), strict=FLAGS.strict_checkpoint)
     model.eval()
 
-    loss_features = gsfm._parse_loss_features(FLAGS.loss_features, model, target_gs_raw)
-    fixed_attribute_keys = gsfm._fixed_attribute_keys(loss_features, target_gs_raw)
+    loss_features = parse_loss_features(FLAGS.loss_features, model, target_gs_raw, no_features_message="No Gaussian attributes selected for flow loss")
+    fixed_attribute_keys = select_fixed_attribute_keys(loss_features, target_gs_raw)
+
+    requested_means_origin_scale = float(FLAGS.means_origin_scale)
+    if requested_means_origin_scale <= 0.0:
+        raise ValueError(f"--means_origin_scale must be > 0, got {requested_means_origin_scale}")
+    means_origin_scale = requested_means_origin_scale if "means" in loss_features else 1.0
+    loss_target_gs = scale_means_origin(target_gs_raw, means_origin_scale)
 
     input_gs_raw = build_densified_input_gs(
-        input_factor_entry=input_factor_entry,
-        target_factor_entry=target_factor_entry,
+        input_factor_dict=input_factor_entry,
+        target_factor_dict=target_factor_entry,
         alignment=FLAGS.alignment,
         attribute_init=FLAGS.attribute_init,
         emd_eps=FLAGS.emd_eps,
@@ -234,9 +243,9 @@ def main(argv):
         output_dir=eval_output_dir,
         gt_attribute_keys=fixed_attribute_keys,
     )
-    input_gs_raw = gsfm._copy_gt_attributes(input_gs_raw, target_gs_raw, fixed_attribute_keys)
-    source_flow_gs = gsfm.raw_to_flow_gs(input_gs_raw, flow_cfg["flow_space"])
-    target_flow_gs = gsfm.raw_to_flow_gs(target_gs_raw, flow_cfg["flow_space"])
+    input_gs_raw = copy_gt_attributes(input_gs_raw, target_gs_raw, fixed_attribute_keys)
+    source_flow_gs = {key: value.clone() for key, value in input_gs_raw.items()}
+    target_flow_gs = {key: value.clone() for key, value in loss_target_gs.items()}
     source_flow_gs = gsfm._apply_fixed_flow_attributes(source_flow_gs, target_flow_gs, fixed_attribute_keys)
 
     with open(os.path.join(eval_output_dir, "config.gin"), "w") as f:
@@ -252,7 +261,8 @@ def main(argv):
         "attribute_init": FLAGS.attribute_init,
         "loss_features": loss_features,
         "fixed_attribute_keys": fixed_attribute_keys,
-        "flow_space": flow_cfg["flow_space"],
+        "means_origin_scale": requested_means_origin_scale,
+        "effective_means_origin_scale": means_origin_scale,
         "eval_flow_steps": eval_steps,
         "eval_views": len(eval_images),
         "loaded_train_config": train_config if FLAGS.load_train_config and os.path.exists(train_config) else None,
@@ -262,11 +272,10 @@ def main(argv):
         json.dump(run_config, f, indent=2)
 
     logger.info(
-        "Evaluating checkpoint=%s scene=%s idx=%s flow_space=%s flow_steps=%s loss_features=%s fixed=%s config=%s",
+        "Evaluating checkpoint=%s scene=%s idx=%s flow_steps=%s loss_features=%s fixed=%s config=%s",
         checkpoint_path,
         scene["scene_name"],
         scene["idx"],
-        flow_cfg["flow_space"],
         eval_steps,
         ",".join(loss_features),
         ",".join(fixed_attribute_keys) if fixed_attribute_keys else "none",
@@ -288,11 +297,11 @@ def main(argv):
             image_names=eval_payload["images_name"],
             output_dir=step_dir,
             flow_steps=int(flow_steps),
-            flow_space=flow_cfg["flow_space"],
-            fixed_raw_gs=target_gs_raw,
+            fixed_raw_gs=loss_target_gs,
             fixed_flow_gs=target_flow_gs,
             fixed_attribute_keys=fixed_attribute_keys,
             eval_chunk_size=eval_chunk_size,
+            means_origin_scale=means_origin_scale,
             compare_with_input=FLAGS.compare_with_input,
             save_viewer=FLAGS.save_viewer,
             save_residuals=FLAGS.save_residuals,

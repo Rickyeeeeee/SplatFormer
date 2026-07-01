@@ -1,23 +1,33 @@
-import json
 import os
-import random
 
 import cv2
 import gin
 import numpy as np
 import torch
-import torch.nn.functional as F
 from absl import app, flags
 from tqdm import tqdm
 
-from dataset.GS_multi import SplatFactoMultiLevelDataset
 from models.feature_flow_predictor import GSFlowPredictor
 from models.feature_predictor import FeaturePredictor  # Registers legacy gin keys used by GS_multi.
 from utils import gpu_utils, gs_utils
+from utils.gpu_utils import seed_everything
+from utils.gs_utils import (
+    copy_gt_attributes,
+    make_grid,
+    unscale_means_origin,
+    scale_means_origin,
+)
 from utils.log_utils import ProcessSafeLogger
-from utils.metrics import MetricComputer
+from utils.loss_utils import (
+    SUPPORTED_GS_KEYS,
+    feature_mse_loss as compute_feature_mse_loss,
+    fixed_attribute_keys as select_fixed_attribute_keys,
+    parse_loss_features,
+)
+from utils.metrics import MetricComputer, write_densify_stage_render_metrics
 from utils.optimizers import build_optimizer, build_scheduler
-from utils.sr_densify_utils import build_densified_input_gs
+from utils.sr_dataset_utils import build_dataset, find_scene_index
+from utils.sr_densify_utils import build_densified_input_gs, save_densify_stage_plys
 
 
 flags.DEFINE_string("output_dir", "output_overfit_gsfm", "Output directory")
@@ -38,7 +48,6 @@ flags.DEFINE_enum(
 flags.DEFINE_float("emd_eps", 0.01, "Auction EMD epsilon")
 flags.DEFINE_integer("emd_iters", 100, "Auction EMD iterations")
 flags.DEFINE_integer("flow_steps", None, "Euler sampling steps; overrides gin flow_matching.flow_steps")
-flags.DEFINE_string("flow_space", None, "Flow space. GSFM only supports raw, matching overfit-sr-mse.py.")
 flags.DEFINE_float("flow_noise_std", None, "Stochastic-interpolant noise scale multiplying sqrt(2t(1-t))")
 flags.DEFINE_boolean(
     "post_activate_loss",
@@ -51,26 +60,25 @@ flags.DEFINE_string(
     "Comma-separated Gaussian attributes to include in point-wise flow loss. "
     "Defaults to GSFlowPredictor.output_features.",
 )
+flags.DEFINE_float(
+    "means_origin_scale",
+    1.0,
+    "Training-only origin scale for target Gaussian means when computing means flow loss. "
+    "Predicted means are divided by this value before render/export.",
+)
 flags.DEFINE_multi_string("gin_file", None, "List of paths to the config files.")
 flags.DEFINE_multi_string("gin_param", "", "Newline separated list of Gin parameter bindings.")
 
 FLAGS = flags.FLAGS
-FLOW_SPACES = {"raw"}
-FLOW_KEYS = ["means", "features_dc", "features_rest", "opacities", "scales", "quats"]
+FLOW_KEYS = SUPPORTED_GS_KEYS
 EVAL_FLOW_STEPS = [1, 2, 5]
-MEANS_LOSS_REDUCTION = "sum"  # Set to "mean" for per-coordinate averaging.
+MEANS_LOSS_REDUCTION = "mean"  # Set to "sum" to match PUFM-style summed point loss.
 EPS = 1e-6
 
 
 @gin.configurable
 def set_seed(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    seed_everything(seed)
 
 
 @gin.configurable
@@ -105,13 +113,11 @@ def training(
 @gin.configurable
 def flow_matching(
     flow_steps=5,
-    flow_space="raw",
     flow_noise_std=0.0,
     flow_t_eps=1e-4,
 ):
     return {
         "flow_steps": flow_steps,
-        "flow_space": flow_space,
         "flow_noise_std": flow_noise_std,
         "flow_t_eps": flow_t_eps,
     }
@@ -132,78 +138,6 @@ def feature_mse_loss(loss_weights=None, quat_direct_mse=False):
     return {"loss_weights": default_weights, "quat_direct_mse": quat_direct_mse}
 
 
-def make_grid(imgs, nrow=3, ncols=3):
-    img_h, img_w = imgs[0].shape[:2]
-    if imgs[0].ndim == 3:
-        grid = np.zeros((img_h * nrow, img_w * ncols, 3), dtype=np.uint8)
-    else:
-        grid = np.zeros((img_h * nrow, img_w * ncols), dtype=np.uint8)
-    for i in range(nrow):
-        for j in range(ncols):
-            if i * ncols + j >= len(imgs):
-                break
-            grid[i * img_h : (i + 1) * img_h, j * img_w : (j + 1) * img_w] = imgs[i * ncols + j]
-    return grid
-
-
-def _to_cpu(data):
-    if torch.is_tensor(data):
-        return data.detach().cpu()
-    if isinstance(data, dict):
-        return {k: _to_cpu(v) for k, v in data.items()}
-    if isinstance(data, list):
-        return [_to_cpu(v) for v in data]
-    if isinstance(data, tuple):
-        return tuple(_to_cpu(v) for v in data)
-    return data
-
-
-def _sanitize_for_filename(value):
-    return str(value).replace("/", "_").replace("\\", "_")
-
-
-def _unique_preserve_order(values):
-    seen = set()
-    unique = []
-    for value in values:
-        if value not in seen:
-            seen.add(value)
-            unique.append(value)
-    return unique
-
-
-def _parse_loss_features(raw_loss_features, model, target_gs):
-    if raw_loss_features is None or raw_loss_features.strip() == "":
-        loss_features = list(getattr(model, "output_features", []))
-    else:
-        loss_features = [feature.strip() for feature in raw_loss_features.split(",") if feature.strip()]
-
-    loss_features = _unique_preserve_order(loss_features)
-    if len(loss_features) == 0:
-        raise ValueError("No Gaussian attributes selected for flow loss")
-
-    unsupported = [feature for feature in loss_features if feature not in FLOW_KEYS]
-    if unsupported:
-        raise ValueError(f"Unsupported loss feature(s): {unsupported}. Supported features are: {FLOW_KEYS}")
-
-    missing = [feature for feature in loss_features if feature not in target_gs]
-    if missing:
-        raise ValueError(f"Selected loss feature(s) missing from target GS: {missing}")
-
-    return loss_features
-
-
-def _fixed_attribute_keys(loss_features, target_gs):
-    loss_set = set(loss_features)
-    return [key for key in FLOW_KEYS if key in target_gs and key not in loss_set]
-
-
-def _copy_gt_attributes(gs, target_gs, attribute_keys):
-    for key in attribute_keys:
-        if key in gs and key in target_gs:
-            gs[key] = target_gs[key].to(device=gs[key].device, dtype=gs[key].dtype).clone()
-    return gs
-
 
 def _apply_fixed_flow_attributes(flow_gs, fixed_flow_gs, attribute_keys):
     if fixed_flow_gs is None:
@@ -217,23 +151,6 @@ def _apply_fixed_flow_attributes(flow_gs, fixed_flow_gs, attribute_keys):
 def _clone_gs(gs):
     return {key: value.clone() for key, value in gs.items()}
 
-
-def _require_raw_flow_space(flow_space):
-    if flow_space != "raw":
-        raise ValueError(
-            f"GSFM only supports flow_space='raw' to match overfit-sr-mse.py residual prediction; "
-            f"got {flow_space!r}"
-        )
-
-
-def raw_to_flow_gs(gs, flow_space):
-    _require_raw_flow_space(flow_space)
-    return {key: value.clone() for key, value in gs.items()}
-
-
-def flow_to_raw_gs(flow, flow_space):
-    _require_raw_flow_space(flow_space)
-    return {key: value.clone() for key, value in flow.items()}
 
 
 def sample_stochastic_interpolant(source_flow_gs, target_flow_gs, t, noise_scale):
@@ -297,83 +214,8 @@ def predict_x1_from_velocity(model, query_flow_gs, pred_vel, flow_noise, gamma, 
     return x1_pred
 
 
-def _feature_loss_value(key, pred, target, post_activate_loss=False, quat_direct_mse=False):
-    if key == "means":
-        squared_error = (pred - target).square()
-        if MEANS_LOSS_REDUCTION == "mean":
-            return squared_error.mean()
-        if MEANS_LOSS_REDUCTION == "sum":
-            return squared_error.sum()
-        raise ValueError(
-            f"Unsupported MEANS_LOSS_REDUCTION={MEANS_LOSS_REDUCTION}; expected 'mean' or 'sum'"
-        )
 
-    if not post_activate_loss:
-        return F.mse_loss(pred, target)
-
-    if key == "opacities":
-        return F.mse_loss(torch.sigmoid(pred), torch.sigmoid(target))
-
-    if key == "quats":
-        if quat_direct_mse:
-            return F.mse_loss(pred, target)
-        pred_quat = F.normalize(pred, dim=-1)
-        target_quat = F.normalize(target, dim=-1)
-        cosine_sq = (pred_quat * target_quat).sum(dim=-1).square().clamp(max=1.0)
-        return (1.0 - cosine_sq).mean()
-
-    return F.mse_loss(pred, target)
-
-
-def _feature_mse_loss(
-    out_gs,
-    target_gs,
-    loss_features,
-    post_activate_loss=False,
-    loss_weights=None,
-    quat_direct_mse=False,
-):
-    losses = {}
-    weighted_losses = {}
-    total = None
-    if loss_weights is None:
-        loss_weights = {key: 1.0 for key in loss_features}
-
-    for key in loss_features:
-        if key not in out_gs:
-            raise ValueError(f"Selected loss feature '{key}' missing from predicted x1")
-        if key not in target_gs:
-            raise ValueError(f"Selected loss feature '{key}' missing from target GS")
-        if out_gs[key].shape != target_gs[key].shape:
-            raise ValueError(
-                f"Shape mismatch for loss feature '{key}': "
-                f"output {tuple(out_gs[key].shape)} vs target {tuple(target_gs[key].shape)}"
-            )
-        pred = out_gs[key]
-        target = target_gs[key].to(device=pred.device, dtype=pred.dtype)
-        loss = _feature_loss_value(
-            key,
-            pred,
-            target,
-            post_activate_loss=post_activate_loss,
-            quat_direct_mse=quat_direct_mse,
-        )
-        weighted = float(loss_weights.get(key, 1.0)) * loss
-        losses[key] = loss
-        weighted_losses[key] = weighted
-        total = weighted if total is None else total + weighted
-
-    if total is None:
-        raise ValueError("No x1_pred MSE losses were computed")
-    if not total.requires_grad:
-        raise ValueError(
-            "Selected loss features do not receive gradients. "
-            "Make sure GSFlowPredictor.output_features includes at least one selected loss feature."
-        )
-    return total, losses, weighted_losses
-
-
-def sample_flow_model(model, source_flow_gs, scene_idx, flow_steps, flow_space, fixed_flow_gs=None, fixed_attribute_keys=None):
+def sample_flow_model(model, source_flow_gs, scene_idx, flow_steps, fixed_flow_gs=None, fixed_attribute_keys=None):
     if flow_steps <= 0:
         raise ValueError("flow_steps must be positive")
     model.eval()
@@ -392,66 +234,8 @@ def sample_flow_model(model, source_flow_gs, scene_idx, flow_steps, flow_space, 
                         model, key, state[key], pred_vel[key], 1.0 / float(flow_steps)
                     )
             state = _apply_fixed_flow_attributes(state, fixed_flow_gs, fixed_attribute_keys)
-    return flow_to_raw_gs(state, flow_space)
+    return _clone_gs(state)
 
-
-def _build_dataset():
-    with gin.config_scope("train_dataset"):
-        return SplatFactoMultiLevelDataset()
-
-
-def _scene_name_from_dataset(dataset, idx):
-    return dataset.folders[idx]["scene_name"]
-
-
-def _find_scene_index(dataset, scene_name):
-    if scene_name == "":
-        return 0
-    for idx in range(len(dataset.folders)):
-        if _scene_name_from_dataset(dataset, idx) == scene_name:
-            return idx
-    return 0
-
-
-def _build_split_payload(dataset, scene_idx, scene_name, factor_entry, split):
-    meta = factor_entry["meta"]
-    imgs_path = factor_entry["imgs_path"]
-    imgs_name = factor_entry["imgs_name"]
-
-    if dataset.background_color == "random":
-        background = torch.rand(3)
-    else:
-        background = torch.tensor(dataset.background_color, dtype=torch.float32) / 255.0
-
-    total_num = len(meta["camera_to_worlds"])
-    if split in ["train", "test"]:
-        cam_ids = np.arange(total_num)
-    else:
-        raise ValueError(f"Unsupported split: {split}")
-
-    images = [dataset.read_image(imgs_path[i], background=background) for i in cam_ids]
-    images_name = [imgs_name[i] for i in cam_ids]
-    camera_to_worlds = meta["camera_to_worlds"][cam_ids]
-
-    cameras = {
-        "camera_to_worlds": torch.as_tensor(camera_to_worlds).float(),
-        "fx": torch.as_tensor(meta["fx"]).float(),
-        "fy": torch.as_tensor(meta["fy"]).float(),
-        "cx": torch.as_tensor(meta["cx"]).float(),
-        "cy": torch.as_tensor(meta["cy"]).float(),
-        "width": torch.as_tensor(meta["width"]).float(),
-        "height": torch.as_tensor(meta["height"]).float(),
-        "background_color": background,
-    }
-
-    return {
-        "gs_params": factor_entry["gs_params"],
-        "images": images,
-        "images_name": images_name,
-        "cameras": cameras,
-        "scene_idx": scene_idx,
-        "scene_name": scene_name,
-    }
 
 
 def evaluate_single_scene(
@@ -465,7 +249,6 @@ def evaluate_single_scene(
     image_names,
     output_dir,
     flow_steps,
-    flow_space,
     fixed_raw_gs=None,
     fixed_flow_gs=None,
     fixed_attribute_keys=None,
@@ -475,6 +258,7 @@ def evaluate_single_scene(
     save_viewer=True,
     save_residuals=True,
     output_gt=True,
+    means_origin_scale=1.0,
 ):
     if fixed_attribute_keys is None:
         fixed_attribute_keys = []
@@ -483,17 +267,15 @@ def evaluate_single_scene(
     device = next(model.parameters()).device
     num_views = len(eval_images)
     if num_views == 0:
-        raise ValueError("Evaluation payload has zero views")
+        raise ValueError("Evaluation has zero views")
 
     if eval_chunk_size is None or eval_chunk_size <= 0:
         eval_chunk_size = num_views
     eval_chunk_size = min(eval_chunk_size, num_views)
 
+    del save_residuals
+
     os.makedirs(output_dir, exist_ok=True)
-    residual_dir = None
-    if save_residuals:
-        residual_dir = os.path.join(output_dir, "residuals")
-        os.makedirs(residual_dir, exist_ok=True)
 
     pred_single_dir = os.path.join(output_dir, f"pred/{scene_name}")
     os.makedirs(pred_single_dir, exist_ok=True)
@@ -509,12 +291,12 @@ def evaluate_single_scene(
             source_flow_gs,
             scene_idx,
             flow_steps,
-            flow_space,
             fixed_flow_gs=fixed_flow_gs,
             fixed_attribute_keys=fixed_attribute_keys,
         )
         if fixed_raw_gs is not None:
-            out_gs = _copy_gt_attributes(out_gs, fixed_raw_gs, fixed_attribute_keys)
+            out_gs = copy_gt_attributes(out_gs, fixed_raw_gs, fixed_attribute_keys)
+        out_gs = unscale_means_origin(out_gs, means_origin_scale)
         pred_preview = []
         gt_preview = []
 
@@ -591,47 +373,6 @@ def evaluate_single_scene(
             if gt_gs is not None:
                 gs_utils.export_ply_forviewer(gt_gs, os.path.join(viewerdir, "point_cloud/gt.ply"))
 
-        if save_residuals:
-            residual_keys = sorted([key for key in out_gs.keys() if key in input_gs])
-            residuals = {}
-            residual_stats = {}
-            for key in residual_keys:
-                residual = out_gs[key] - input_gs[key]
-                residuals[key] = residual
-                residual_stats[key] = {
-                    "mean": float(residual.mean().item()),
-                    "abs_mean": float(residual.abs().mean().item()),
-                }
-
-            scene_stem = f"{int(scene_idx)}_{_sanitize_for_filename(scene_name)}"
-            pt_payload = {
-                "scene_idx": int(scene_idx),
-                "scene_name": scene_name,
-                "residual_type": "sampled_out_minus_input",
-                "flow_steps": int(flow_steps),
-                "flow_space": flow_space,
-                "residual_keys": residual_keys,
-                "residuals": _to_cpu(residuals),
-                "input_gs": _to_cpu(input_gs),
-                "output_gs": _to_cpu(out_gs),
-                "target_gs": _to_cpu(gt_gs) if gt_gs is not None else None,
-                "cameras": _to_cpu(eval_cameras),
-            }
-            torch.save(pt_payload, os.path.join(residual_dir, f"{scene_stem}.pt"))
-
-            stats_payload = {
-                "scene_idx": int(scene_idx),
-                "scene_name": scene_name,
-                "num_gaussians": int(input_gs["means"].shape[0]),
-                "residual_type": "sampled_out_minus_input",
-                "flow_steps": int(flow_steps),
-                "flow_space": flow_space,
-                "residual_keys": residual_keys,
-                "residual_stats": residual_stats,
-            }
-            with open(os.path.join(residual_dir, f"{scene_stem}.json"), "w") as f:
-                json.dump(stats_payload, f, indent=2)
-
     metrics = metric_computer.finalize()
     metric_computer.write_to_file(os.path.join(output_dir, "metrics.json"))
 
@@ -649,12 +390,8 @@ def _resolve_flow_cfg():
     cfg = flow_matching()
     if FLAGS.flow_steps is not None:
         cfg["flow_steps"] = FLAGS.flow_steps
-    if FLAGS.flow_space is not None:
-        cfg["flow_space"] = FLAGS.flow_space
     if FLAGS.flow_noise_std is not None:
         cfg["flow_noise_std"] = FLAGS.flow_noise_std
-    if cfg["flow_space"] not in FLOW_SPACES:
-        raise ValueError(f"Unsupported flow_space={cfg['flow_space']}; expected one of {sorted(FLOW_SPACES)}")
     if not (0.0 < float(cfg["flow_t_eps"]) < 0.5):
         raise ValueError(f"flow_t_eps must be in (0, 0.5), got {cfg['flow_t_eps']}")
     return cfg
@@ -676,46 +413,65 @@ def main(argv):
     logger = ProcessSafeLogger(os.path.join(FLAGS.output_dir, "overfit.log")).get_logger()
     device = torch.device("cuda")
 
-    dataset = _build_dataset()
-    scene_idx = _find_scene_index(dataset, FLAGS.scene_name)
+    dataset = build_dataset()
+    scene_idx = find_scene_index(dataset, FLAGS.scene_name)
     scene = dataset.load_scene(scene_idx)
-    input_factor_entry = scene["factor_data"][FLAGS.input_factor]
-    target_factor_entry = scene["factor_data"][FLAGS.target_factor]
+    input_factor_dict = scene["factor_data"][FLAGS.input_factor]
+    target_factor_dict = scene["factor_data"][FLAGS.target_factor]
 
-    train_payload = _build_split_payload(dataset, scene["idx"], scene["scene_name"], target_factor_entry, split="train")
-    eval_payload = _build_split_payload(dataset, scene["idx"], scene["scene_name"], target_factor_entry, split="test")
+    target_images, target_image_names, target_cameras = dataset.load_factor_views(target_factor_dict)
 
     model = GSFlowPredictor().to(device)
     if model.resume_ckpt is not None:
         model.load_state_dict(torch.load(model.resume_ckpt, map_location="cpu"))
     model.train()
 
-    target_gs_raw = gpu_utils.move_to_device(target_factor_entry["gs_params"], device)
-    loss_features = _parse_loss_features(FLAGS.loss_features, model, target_gs_raw)
-    fixed_attribute_keys = _fixed_attribute_keys(loss_features, target_gs_raw)
+    target_gs_raw = gpu_utils.move_to_device(target_factor_dict["gs_params"], device)
+    loss_features = parse_loss_features(FLAGS.loss_features, model, target_gs_raw, no_features_message="No Gaussian attributes selected for flow loss")
+    fixed_attribute_keys = select_fixed_attribute_keys(loss_features, target_gs_raw)
+    requested_means_origin_scale = float(FLAGS.means_origin_scale)
+    if requested_means_origin_scale <= 0.0:
+        raise ValueError(f"--means_origin_scale must be > 0, got {requested_means_origin_scale}")
+    means_origin_scale = requested_means_origin_scale if "means" in loss_features else 1.0
 
-    input_gs_raw = build_densified_input_gs(
-        input_factor_entry=input_factor_entry,
-        target_factor_entry=target_factor_entry,
+    input_gs_raw, densify_stage_gs = build_densified_input_gs(
+        input_factor_dict=input_factor_dict,
+        target_factor_dict=target_factor_dict,
         alignment=FLAGS.alignment,
         attribute_init=FLAGS.attribute_init,
         emd_eps=FLAGS.emd_eps,
         emd_iters=FLAGS.emd_iters,
         device=device,
-        output_dir=FLAGS.output_dir,
-        gt_attribute_keys=fixed_attribute_keys,
+        return_stages=True,
     )
-    input_gs_raw = _copy_gt_attributes(input_gs_raw, target_gs_raw, fixed_attribute_keys)
-    source_flow_gs = raw_to_flow_gs(input_gs_raw, flow_cfg["flow_space"])
-    target_flow_gs = raw_to_flow_gs(target_gs_raw, flow_cfg["flow_space"])
-    source_flow_gs = _apply_fixed_flow_attributes(source_flow_gs, target_flow_gs, fixed_attribute_keys)
+    densify_stage_gs["03_input_high_res_gs.ply"] = input_gs_raw
+    save_densify_stage_plys(
+        output_dir=FLAGS.output_dir,
+        low_res_gs=densify_stage_gs["00_low_res_gs.ply"],
+        interpolated_gs=densify_stage_gs["01_interpolated_high_res_gs.ply"],
+        gt_high_res_gs=densify_stage_gs["02_gt_high_res_gs.ply"],
+        input_high_res_gs=densify_stage_gs["03_input_high_res_gs.ply"],
+    )
+    loss_target_gs = scale_means_origin(target_gs_raw, means_origin_scale)
+    source_flow_gs = _clone_gs(input_gs_raw)
+    target_flow_gs = _clone_gs(loss_target_gs)
     batch_scene_idx = [scene["idx"]]
 
-    eval_images = eval_payload["images"]
-    eval_cameras = eval_payload["cameras"]
-    eval_chunk_size = dataset.image_per_scene if dataset.image_per_scene is not None else len(eval_images)
+    eval_chunk_size = dataset.image_per_scene if dataset.image_per_scene is not None else len(target_images)
     if eval_chunk_size <= 0:
-        eval_chunk_size = len(eval_images)
+        eval_chunk_size = len(target_images)
+
+    densify_metrics = write_densify_stage_render_metrics(
+        output_dir=FLAGS.output_dir,
+        stage_gs=densify_stage_gs,
+        images=target_images,
+        cameras=target_cameras,
+        chunk_size=eval_chunk_size,
+        device=device,
+    )
+    for ply_name, metrics in densify_metrics.items():
+        metric_str = " ".join([f"{k}: {v:.4f}" for k, v in metrics.items()])
+        logger.info(f"Densify init {ply_name}: {metric_str}")
 
     with gin.config_scope("train2D"):
         optimizer = build_optimizer(model)
@@ -735,27 +491,33 @@ def main(argv):
 
     print(
         f"GSFM scene={scene['scene_name']} idx={scene['idx']} "
-        f"train_views={len(train_payload['images'])} eval_views={len(eval_payload['images'])} "
-        f"input_gaussians={input_factor_entry['gs_params']['means'].shape[0]} "
+        f"target_views={len(target_images)} "
+        f"input_gaussians={input_factor_dict['gs_params']['means'].shape[0]} "
         f"densified_gaussians={input_gs_raw['means'].shape[0]} "
         f"target_gaussians={target_gs_raw['means'].shape[0]} "
         f"input_factor={FLAGS.input_factor} target_factor={FLAGS.target_factor} "
         f"alignment={FLAGS.alignment} attribute_init={FLAGS.attribute_init} "
         f"loss_features={','.join(loss_features)} "
-        f"fixed_gt_attributes={','.join(fixed_attribute_keys) if fixed_attribute_keys else 'none'} "
-        f"flow_space={flow_cfg['flow_space']} flow_steps={flow_cfg['flow_steps']} "
+        f"eval_gt_attributes={','.join(fixed_attribute_keys) if fixed_attribute_keys else 'none'} "
+        f"flow_steps={flow_cfg['flow_steps']} "
         f"flow_noise_std={flow_cfg['flow_noise_std']} "
         f"flow_t_eps={flow_cfg['flow_t_eps']} "
         f"post_activate_loss={FLAGS.post_activate_loss} "
+        f"means_origin_scale={requested_means_origin_scale} "
+        f"effective_means_origin_scale={means_origin_scale} "
         f"quat_direct_mse={mse_loss_cfg['quat_direct_mse']} "
         f"loss_weights={mse_loss_cfg['loss_weights']}"
+    )
+    logger.info(
+        f"means_origin_scale={requested_means_origin_scale} "
+        f"effective_means_origin_scale={means_origin_scale}"
     )
 
     os.makedirs(os.path.join(FLAGS.output_dir, "train"), exist_ok=True)
     os.makedirs(os.path.join(FLAGS.output_dir, "checkpoints"), exist_ok=True)
 
-    train_images_device = gpu_utils.move_to_device(train_payload["images"], device)
-    train_cameras_device = gpu_utils.move_to_device(train_payload["cameras"], device)
+    train_images_device = gpu_utils.move_to_device(target_images, device)
+    train_cameras_device = gpu_utils.move_to_device(target_cameras, device)
     gt_imgs_uint8 = [(img[..., :3] * 255).detach().cpu().numpy().astype(np.uint8) for img in train_images_device]
     if len(gt_imgs_uint8) > 0:
         gt_grid = cv2.cvtColor(make_grid(gt_imgs_uint8), cv2.COLOR_RGB2BGR)
@@ -770,22 +532,26 @@ def main(argv):
         query_flow_gs, flow_noise, gamma, gamma_dot = sample_stochastic_interpolant(
             source_flow_gs, target_flow_gs, t, flow_noise_std
         )
-        query_flow_gs = _apply_fixed_flow_attributes(query_flow_gs, target_flow_gs, fixed_attribute_keys)
-
         with torch.cuda.amp.autocast(enabled=enable_amp):
             pred_vel = model(batch_flow_gs=[query_flow_gs], batch_scene_idx=batch_scene_idx, t=t)[0]
             x1_pred_flow_gs = predict_x1_from_velocity(
                 model, query_flow_gs, pred_vel, flow_noise, gamma, gamma_dot, t
             )
-            x1_pred_raw_gs = flow_to_raw_gs(x1_pred_flow_gs, flow_cfg["flow_space"])
-            x1_pred_raw_gs = _copy_gt_attributes(x1_pred_raw_gs, target_gs_raw, fixed_attribute_keys)
-            total_loss, attr_losses, weighted_attr_losses = _feature_mse_loss(
+            x1_pred_raw_gs = x1_pred_flow_gs
+            total_loss, attr_losses, weighted_attr_losses = compute_feature_mse_loss(
                 x1_pred_raw_gs,
-                target_gs_raw,
+                loss_target_gs,
                 loss_features,
                 post_activate_loss=FLAGS.post_activate_loss,
                 loss_weights=mse_loss_cfg["loss_weights"],
                 quat_direct_mse=mse_loss_cfg["quat_direct_mse"],
+                means_loss_reduction=MEANS_LOSS_REDUCTION,
+                output_label="predicted x1",
+                total_loss_error="No x1_pred MSE losses were computed",
+                grad_error=(
+                    "Selected loss features do not receive gradients. "
+                    "Make sure GSFlowPredictor.output_features includes at least one selected loss feature."
+                ),
             )
 
         if enable_amp:
@@ -839,11 +605,11 @@ def main(argv):
                     source_flow_gs,
                     scene["idx"],
                     int(flow_cfg["flow_steps"]),
-                    flow_cfg["flow_space"],
                     fixed_flow_gs=target_flow_gs,
                     fixed_attribute_keys=fixed_attribute_keys,
                 )
-                train_out_gs = _copy_gt_attributes(train_out_gs, target_gs_raw, fixed_attribute_keys)
+                train_out_gs = copy_gt_attributes(train_out_gs, loss_target_gs, fixed_attribute_keys)
+                train_out_gs = unscale_means_origin(train_out_gs, means_origin_scale)
                 pred_imgs, _ = gs_utils.rasterize_gaussians_to_multiimgs(train_out_gs, train_cameras_device)
                 pred_imgs_uint8 = [(im * 255).detach().cpu().numpy().astype(np.uint8) for im in pred_imgs[:9]]
                 if len(pred_imgs_uint8) > 0:
@@ -859,18 +625,18 @@ def main(argv):
                     input_gs=input_gs_raw,
                     source_flow_gs=source_flow_gs,
                     gt_gs=target_gs_raw,
-                    scene_idx=eval_payload["scene_idx"],
-                    scene_name=eval_payload["scene_name"],
-                    eval_images=eval_images,
-                    eval_cameras=eval_cameras,
-                    image_names=eval_payload["images_name"],
+                    scene_idx=scene["idx"],
+                    scene_name=scene["scene_name"],
+                    eval_images=target_images,
+                    eval_cameras=target_cameras,
+                    image_names=target_image_names,
                     output_dir=eval_dir,
                     flow_steps=int(eval_flow_steps),
-                    flow_space=flow_cfg["flow_space"],
-                    fixed_raw_gs=target_gs_raw,
+                    fixed_raw_gs=loss_target_gs,
                     fixed_flow_gs=target_flow_gs,
                     fixed_attribute_keys=fixed_attribute_keys,
                     eval_chunk_size=eval_chunk_size,
+                    means_origin_scale=means_origin_scale,
                     compare_with_input=FLAGS.compare_with_input,
                     save_viewer=FLAGS.save_viewer,
                     save_residuals=FLAGS.save_residuals,
@@ -895,18 +661,18 @@ def main(argv):
             input_gs=input_gs_raw,
             source_flow_gs=source_flow_gs,
             gt_gs=target_gs_raw,
-            scene_idx=eval_payload["scene_idx"],
-            scene_name=eval_payload["scene_name"],
-            eval_images=eval_images,
-            eval_cameras=eval_cameras,
-            image_names=eval_payload["images_name"],
+            scene_idx=scene["idx"],
+            scene_name=scene["scene_name"],
+            eval_images=target_images,
+            eval_cameras=target_cameras,
+            image_names=target_image_names,
             output_dir=final_eval_dir,
             flow_steps=int(eval_flow_steps),
-            flow_space=flow_cfg["flow_space"],
-            fixed_raw_gs=target_gs_raw,
+            fixed_raw_gs=loss_target_gs,
             fixed_flow_gs=target_flow_gs,
             fixed_attribute_keys=fixed_attribute_keys,
             eval_chunk_size=eval_chunk_size,
+            means_origin_scale=means_origin_scale,
             compare_with_input=FLAGS.compare_with_input,
             save_viewer=FLAGS.save_viewer,
             save_residuals=FLAGS.save_residuals,

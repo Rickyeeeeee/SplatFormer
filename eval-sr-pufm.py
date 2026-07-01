@@ -211,8 +211,8 @@ def main(argv):
 
     gt_attribute_keys = _gt_attribute_keys()
     input_gs_raw = build_densified_input_gs(
-        input_factor_entry=input_factor_entry,
-        target_factor_entry=target_factor_entry,
+        input_factor_dict=input_factor_entry,
+        target_factor_dict=target_factor_entry,
         alignment=FLAGS.alignment,
         attribute_init=FLAGS.attribute_init,
         emd_eps=FLAGS.emd_eps,

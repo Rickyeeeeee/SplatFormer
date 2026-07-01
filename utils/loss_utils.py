@@ -51,13 +51,14 @@ def fixed_attribute_keys(loss_features, target_gs, supported_keys=SUPPORTED_GS_K
 
 def feature_loss_value(
     key,
-    pred,
-    target,
+    pred: torch.Tensor,
+    target: torch.Tensor,
     post_activate_loss=False,
     quat_direct_mse=False,
     means_loss_reduction="mean",
 ):
     if key == "means":
+        # error = (pred - target).square()
         error = (pred - target).abs()
         if means_loss_reduction == "mean":
             return error.mean()
