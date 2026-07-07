@@ -1,4 +1,3 @@
-import json
 import os
 import cv2
 import gin
@@ -11,7 +10,7 @@ from dataset.GS_multi import SplatFactoMultiLevelDataset
 from models.feature_predictor import FeaturePredictor
 from utils import gpu_utils, gs_utils, loss_utils
 from utils.gpu_utils import seed_everything
-from utils.gs_utils import make_grid, sanitize_for_filename
+from utils.gs_utils import make_grid
 from utils.log_utils import ProcessSafeLogger
 from utils.metrics import MetricComputer, psnr
 from utils.optimizers import build_optimizer, build_scheduler
@@ -23,9 +22,19 @@ flags.DEFINE_string("eval_subdir", "eval_final", "Eval subdirectory")
 flags.DEFINE_string("scene_name", "", "Scene name to overfit")
 flags.DEFINE_boolean("compare_with_input", False, "Compare with input 3DGS")
 flags.DEFINE_boolean("save_viewer", True, "Save viewer point clouds")
-flags.DEFINE_boolean("save_residuals", True, "Save residual tensors and stats")
 flags.DEFINE_integer("input_factor", 4, "Low-resolution GS factor used as densification source")
 flags.DEFINE_integer("target_factor", 2, "High-resolution GS/image factor used as overfit target")
+flags.DEFINE_integer(
+    "image_batch_size",
+    -1,
+    "Number of target views rendered per train step. Use <=0 to render all views.",
+)
+flags.DEFINE_enum(
+    "means_source",
+    "gt",
+    ["gt", "predicted"],
+    "Source for stage-2 input means: GT target means or residual output from a means predictor.",
+)
 flags.DEFINE_enum("alignment", "emd", ["emd", "nearest"], "Interpolated-to-target alignment method")
 flags.DEFINE_enum(
     "attribute_init",
@@ -35,11 +44,6 @@ flags.DEFINE_enum(
 )
 flags.DEFINE_float("emd_eps", 0.01, "Auction EMD epsilon")
 flags.DEFINE_integer("emd_iters", 100, "Auction EMD iterations")
-flags.DEFINE_boolean("gt_features_dc", False, "Initialize features_dc from GT high-res GS")
-flags.DEFINE_boolean("gt_features_rest", False, "Initialize features_rest from GT high-res GS")
-flags.DEFINE_boolean("gt_opacities", False, "Initialize opacities from GT high-res GS")
-flags.DEFINE_boolean("gt_scales", False, "Initialize scales from GT high-res GS")
-flags.DEFINE_boolean("gt_quats", False, "Initialize quats from GT high-res GS")
 flags.DEFINE_multi_string("gin_file", None, "List of paths to the config files.")
 flags.DEFINE_multi_string("gin_param", "", "Newline separated list of Gin parameter bindings.")
 
@@ -47,6 +51,8 @@ FLAGS = flags.FLAGS
 
 INPUT_FACTOR = 4
 TARGET_FACTOR = 2
+MEANS_FEATURES = ["means"]
+ATTRIBUTE_FEATURES = ["features_dc", "features_rest", "opacities", "scales", "quats"]
 
 
 @gin.configurable
@@ -88,17 +94,6 @@ def training(
 
 
 
-def _to_cpu(data):
-    if torch.is_tensor(data):
-        return data.detach().cpu()
-    if isinstance(data, dict):
-        return {k: _to_cpu(v) for k, v in data.items()}
-    if isinstance(data, list):
-        return [_to_cpu(v) for v in data]
-    if isinstance(data, tuple):
-        return tuple(_to_cpu(v) for v in data)
-    return data
-
 
 def _build_dataset():
     with gin.config_scope("train_dataset"):
@@ -118,7 +113,7 @@ def _find_scene_index(dataset, scene_name):
     return 0
 
 
-def _build_split_payload(dataset, scene_idx, scene_name, factor_entry, split):
+def _build_split_payload(dataset, scene_idx, scene_name, factor_entry, split, image_batch_size=None):
     meta = factor_entry["meta"]
     imgs_path = factor_entry["imgs_path"]
     imgs_name = factor_entry["imgs_name"]
@@ -129,7 +124,13 @@ def _build_split_payload(dataset, scene_idx, scene_name, factor_entry, split):
         background = torch.tensor(dataset.background_color, dtype=torch.float32) / 255.0
 
     total_num = len(meta["camera_to_worlds"])
-    if split in ["train", "test"]:
+    if split == "train":
+        if image_batch_size is None or int(image_batch_size) <= 0:
+            cam_ids = np.arange(total_num)
+        else:
+            sample_num = min(int(image_batch_size), total_num)
+            cam_ids = np.random.permutation(total_num)[:sample_num]
+    elif split == "test":
         cam_ids = np.arange(total_num)
     else:
         raise ValueError(f"Unsupported split: {split}")
@@ -160,9 +161,92 @@ def _build_split_payload(dataset, scene_idx, scene_name, factor_entry, split):
 
 
 
+def _clone_gs(gs):
+    return {key: value.clone() for key, value in gs.items()}
+
+
+def _replace_means(gs, means):
+    out_gs = _clone_gs(gs)
+    out_gs["means"] = means.to(device=gs["means"].device, dtype=gs["means"].dtype)
+    return out_gs
+
+
+def _bind_feature_predictor(output_features, output_features_type="res"):
+    with gin.unlock_config():
+        gin.bind_parameter("FeaturePredictor.output_features", list(output_features))
+        gin.bind_parameter("FeaturePredictor.output_features_type", output_features_type)
+
+
+def _build_feature_predictor(output_features, device, logger, checkpoint_key):
+    _bind_feature_predictor(output_features, output_features_type="res")
+    model = FeaturePredictor().to(device)
+    _load_resume_checkpoint(model, checkpoint_key, logger)
+    model.train()
+    return model
+
+
+def _load_resume_checkpoint(model, checkpoint_key, logger):
+    if model.resume_ckpt is None:
+        return
+    checkpoint = torch.load(model.resume_ckpt, map_location="cpu")
+    if isinstance(checkpoint, dict) and checkpoint_key in checkpoint:
+        state_dict = checkpoint[checkpoint_key]
+    else:
+        state_dict = checkpoint
+    model.load_state_dict(state_dict)
+    logger.info(f"Loaded {checkpoint_key} checkpoint from {model.resume_ckpt}")
+
+
+def _stage2_input_gs(input_gs, target_gs, means_model, means_source, scene_idx):
+    if means_source == "gt":
+        return _replace_means(input_gs, target_gs["means"])
+    if means_source == "predicted":
+        if means_model is None:
+            raise ValueError("means_model is required when --means_source=predicted")
+        return means_model(batch_normalized_gs=[input_gs], batch_scene_idx=[scene_idx])[0]
+    raise ValueError(f"Unsupported means_source={means_source}")
+
+
+def _forward_two_stage(
+    attribute_model,
+    input_gs,
+    scene_idx,
+    target_gs,
+    means_source,
+    means_model=None,
+    return_stage1=False,
+):
+    stage1_gs = _stage2_input_gs(input_gs, target_gs, means_model, means_source, scene_idx)
+    stage2_gs = attribute_model(batch_normalized_gs=[stage1_gs], batch_scene_idx=[scene_idx])[0]
+    if return_stage1:
+        return stage2_gs, stage1_gs
+    return stage2_gs
+
+
+def _active_models(attribute_model, means_model):
+    models = [attribute_model]
+    if means_model is not None:
+        models.insert(0, means_model)
+    return models
+
+
+def _trainable_parameters(models):
+    return [param for model in models for param in model.parameters() if param.requires_grad]
+
+
+def _checkpoint_payload(attribute_model, means_model, means_source):
+    payload = {
+        "means_source": means_source,
+        "attribute_model": attribute_model.state_dict(),
+    }
+    if means_model is not None:
+        payload["means_model"] = means_model.state_dict()
+    return payload
+
+
 
 def evaluate_single_scene(
-    model,
+    attribute_model,
     input_gs,
     scene_idx,
     scene_name,
@@ -174,15 +258,19 @@ def evaluate_single_scene(
     gt_gs=None,
     compare_with_input=False,
     save_viewer=True,
-    save_residuals=True,
     output_gt=True,
+    target_gs_for_means=None,
+    means_source="gt",
+    means_model=None,
 ):
-    model.eval()
+    if target_gs_for_means is None:
+        raise ValueError("target_gs_for_means is required for two-stage evaluation")
+    attribute_model.eval()
+    if means_model is not None:
+        means_model.eval()
     metric_computer = MetricComputer()
     metric_computer_input = MetricComputer() if compare_with_input else None
-    predicted_keys = list(getattr(model, "output_features", []))
-
-    device = next(model.parameters()).device
+    device = next(attribute_model.parameters()).device
     num_views = len(eval_images)
     if num_views == 0:
         raise ValueError("Evaluation payload has zero views")
@@ -192,10 +280,6 @@ def evaluate_single_scene(
     eval_chunk_size = min(eval_chunk_size, num_views)
 
     os.makedirs(output_dir, exist_ok=True)
-    residual_dir = None
-    if save_residuals:
-        residual_dir = os.path.join(output_dir, "residuals")
-        os.makedirs(residual_dir, exist_ok=True)
 
     pred_single_dir = os.path.join(output_dir, f"pred/{scene_name}")
     os.makedirs(pred_single_dir, exist_ok=True)
@@ -206,7 +290,15 @@ def evaluate_single_scene(
         os.makedirs(compare_dir, exist_ok=True)
 
     with torch.no_grad():
-        out_gs = model(batch_normalized_gs=[input_gs], batch_scene_idx=[scene_idx])[0]
+        out_gs, stage1_gs = _forward_two_stage(
+            attribute_model=attribute_model,
+            input_gs=input_gs,
+            scene_idx=scene_idx,
+            target_gs=target_gs_for_means,
+            means_source=means_source,
+            means_model=means_model,
+            return_stage1=True,
+        )
 
         pred_preview = []
         gt_preview = []
@@ -278,60 +370,25 @@ def evaluate_single_scene(
         if save_viewer:
             viewerdir = os.path.join(output_dir, f"viewer/{scene_name}")
             os.makedirs(viewerdir, exist_ok=True)
-            gs_utils.prepare_viewer(eval_cameras, viewerdir, model.sh_degree)
+            gs_utils.prepare_viewer(eval_cameras, viewerdir, attribute_model.sh_degree)
             gs_utils.export_ply_forviewer(
                 gs_params=input_gs,
-                filename=os.path.join(viewerdir, "point_cloud/input.ply"),
+                filename=os.path.join(viewerdir, "point_cloud/00_input_gs.ply"),
+            )
+            gs_utils.export_ply_forviewer(
+                gs_params=stage1_gs,
+                filename=os.path.join(viewerdir, "point_cloud/01_stage1_output_gs.ply"),
             )
             gs_utils.export_ply_forviewer(
                 gs_params=out_gs,
-                filename=os.path.join(viewerdir, "point_cloud/output.ply"),
+                filename=os.path.join(viewerdir, "point_cloud/02_stage2_output_gs.ply"),
             )
             if gt_gs is not None:
                 gs_utils.export_ply_forviewer(
                     gs_params=gt_gs,
-                    filename=os.path.join(viewerdir, "point_cloud/gt.ply"),
+                    filename=os.path.join(viewerdir, "point_cloud/03_gt_gs.ply"),
                 )
 
-        if save_residuals:
-            residual_type = "out_minus_input"
-            residual_keys = [key for key in predicted_keys if key in out_gs and key in input_gs]
-            if len(residual_keys) == 0:
-                residual_keys = sorted([key for key in out_gs.keys() if key in input_gs])
-
-            residuals = {}
-            residual_stats = {}
-            for key in residual_keys:
-                residual = out_gs[key] - input_gs[key]
-                residuals[key] = residual
-                residual_stats[key] = {
-                    "mean": float(residual.mean().item()),
-                    "abs_mean": float(residual.abs().mean().item()),
-                }
-
-            scene_stem = f"{int(scene_idx)}_{sanitize_for_filename(scene_name)}"
-            pt_payload = {
-                "scene_idx": int(scene_idx),
-                "scene_name": scene_name,
-                "residual_type": residual_type,
-                "residual_keys": residual_keys,
-                "residuals": _to_cpu(residuals),
-                "input_gs": _to_cpu(input_gs),
-                "output_gs": _to_cpu(out_gs),
-                "cameras": _to_cpu(eval_cameras),
-            }
-            torch.save(pt_payload, os.path.join(residual_dir, f"{scene_stem}.pt"))
-
-            stats_payload = {
-                "scene_idx": int(scene_idx),
-                "scene_name": scene_name,
-                "num_gaussians": int(input_gs["means"].shape[0]),
-                "residual_type": residual_type,
-                "residual_keys": residual_keys,
-                "residual_stats": residual_stats,
-            }
-            with open(os.path.join(residual_dir, f"{scene_stem}.json"), "w") as f:
-                json.dump(stats_payload, f, indent=2)
 
     metrics = metric_computer.finalize()
     metric_computer.write_to_file(os.path.join(output_dir, "metrics.json"))
@@ -342,7 +399,9 @@ def evaluate_single_scene(
     else:
         metrics_input = {}
 
-    model.train()
+    attribute_model.train()
+    if means_model is not None:
+        means_model.train()
     return metrics, metrics_input
 
 
@@ -354,9 +413,6 @@ def main(argv):
     train_cfg = training(output_dir=FLAGS.output_dir)
     set_seed()
 
-    with open(os.path.join(FLAGS.output_dir, "config.gin"), "w") as f:
-        f.writelines(gin.operative_config_str())
-
     logger = ProcessSafeLogger(os.path.join(FLAGS.output_dir, "overfit.log")).get_logger()
     device = torch.device("cuda")
 
@@ -367,7 +423,12 @@ def main(argv):
     target_factor_entry = scene["factor_data"][FLAGS.target_factor]
 
     train_payload = _build_split_payload(
-        dataset, scene["idx"], scene["scene_name"], target_factor_entry, split="train"
+        dataset,
+        scene["idx"],
+        scene["scene_name"],
+        target_factor_entry,
+        split="train",
+        image_batch_size=FLAGS.image_batch_size,
     )
     eval_payload = _build_split_payload(
         dataset, scene["idx"], scene["scene_name"], target_factor_entry, split="test"
@@ -377,17 +438,6 @@ def main(argv):
             dataset, scene["idx"], scene["scene_name"], target_factor_entry, split="train"
         )
 
-    gt_attribute_keys = []
-    for flag_name, key in [
-        ("gt_features_dc", "features_dc"),
-        ("gt_features_rest", "features_rest"),
-        ("gt_opacities", "opacities"),
-        ("gt_scales", "scales"),
-        ("gt_quats", "quats"),
-    ]:
-        if getattr(FLAGS, flag_name):
-            gt_attribute_keys.append(key)
-
     densified_input_gs, densify_stage_gs = build_densified_input_gs(
         input_factor_dict=input_factor_entry,
         target_factor_dict=target_factor_entry,
@@ -396,7 +446,6 @@ def main(argv):
         emd_eps=FLAGS.emd_eps,
         emd_iters=FLAGS.emd_iters,
         device=device,
-        gt_attribute_keys=gt_attribute_keys,
         return_stages=True,
     )
     save_densify_stage_plys(
@@ -406,6 +455,7 @@ def main(argv):
         gt_high_res_gs=densify_stage_gs["02_gt_high_res_gs.ply"],
         input_high_res_gs=densify_stage_gs["03_input_high_res_gs.ply"],
     )
+    target_gs = gpu_utils.move_to_device(target_factor_entry["gs_params"], device)
     batch_gs = gpu_utils.move_to_device([densified_input_gs], device)
     batch_scene_idx = [scene["idx"]]
 
@@ -415,14 +465,27 @@ def main(argv):
     if eval_chunk_size <= 0:
         eval_chunk_size = len(eval_images)
 
-    model = FeaturePredictor().to(device)
-    if model.resume_ckpt is not None:
-        model.load_state_dict(torch.load(model.resume_ckpt, map_location="cpu"))
-    model.train()
+    means_model = None
+    if FLAGS.means_source == "predicted":
+        means_model = _build_feature_predictor(MEANS_FEATURES, device, logger, "means_model")
+    attribute_model = _build_feature_predictor(ATTRIBUTE_FEATURES, device, logger, "attribute_model")
 
+    active_models = _active_models(attribute_model, means_model)
+    optimizers = []
+    schedulers = []
     with gin.config_scope("train2D"):
-        optimizer = build_optimizer(model)
-        scheduler = build_scheduler(optimizer)
+        if means_model is not None:
+            means_optimizer = build_optimizer(means_model)
+            means_scheduler = build_scheduler(means_optimizer)
+            optimizers.append(means_optimizer)
+            schedulers.append(means_scheduler)
+        attribute_optimizer = build_optimizer(attribute_model)
+        attribute_scheduler = build_scheduler(attribute_optimizer)
+        optimizers.append(attribute_optimizer)
+        schedulers.append(attribute_scheduler)
+
+    with open(os.path.join(FLAGS.output_dir, "config.gin"), "w") as f:
+        f.writelines(gin.operative_config_str())
 
     total_steps = train_cfg["total_steps"]
     log_interval = train_cfg["log_interval"]
@@ -442,14 +505,17 @@ def main(argv):
     training_brief = (
         f"Overfit scene={scene['scene_name']} idx={scene['idx']} \n"
         f"train_views={len(train_payload['images'])} eval_views={len(eval_payload['images'])} \n"
+        f"image_batch_size={FLAGS.image_batch_size} \n"
         f"input_gaussians={input_factor_entry['gs_params']['means'].shape[0]} \n"
         f"densified_gaussians={batch_gs[0]['means'].shape[0]} \n"
         f"target_gaussians={target_factor_entry['gs_params']['means'].shape[0]} \n"
         f"input_factor={FLAGS.input_factor} target_factor={FLAGS.target_factor} \n"
         f"alignment={FLAGS.alignment} attribute_init={FLAGS.attribute_init} \n"
-        f"gt_attributes={','.join(gt_attribute_keys) if gt_attribute_keys else 'none'} \n"
-        f"model_input_features={','.join(model.input_features)} \n"
-        f"model_output_features={','.join(model.output_features)} \n"
+        f"means_source={FLAGS.means_source} \n"
+        f"means_model_input_features={','.join(means_model.input_features) if means_model is not None else 'none'} \n"
+        f"means_model_output_features={','.join(means_model.output_features) if means_model is not None else 'none'} \n"
+        f"attribute_model_input_features={','.join(attribute_model.input_features)} \n"
+        f"attribute_model_output_features={','.join(attribute_model.output_features)} \n"
     )
     print(training_brief)
     logger.info(training_brief)
@@ -462,18 +528,30 @@ def main(argv):
     gt_grid = cv2.cvtColor(make_grid(gt_imgs_uint8), cv2.COLOR_RGB2BGR)
     cv2.imwrite(os.path.join(FLAGS.output_dir, "train", "00000000_gt.png"), gt_grid)
 
-    optimizer.zero_grad(set_to_none=True)
+    for optimizer in optimizers:
+        optimizer.zero_grad(set_to_none=True)
     pbar = tqdm(range(resume_from_step, total_steps))
     for step in pbar:
         train_payload = _build_split_payload(
-            dataset, scene["idx"], scene["scene_name"], target_factor_entry, split="train"
+            dataset,
+            scene["idx"],
+            scene["scene_name"],
+            target_factor_entry,
+            split="train",
+            image_batch_size=FLAGS.image_batch_size,
         )
         batch_cameras = gpu_utils.move_to_device([train_payload["cameras"]], device)
         batch_images = gpu_utils.move_to_device([train_payload["images"]], device)
 
         with torch.cuda.amp.autocast(enabled=enable_amp):
-            out_batch_gs = model(batch_normalized_gs=batch_gs, batch_scene_idx=batch_scene_idx)
-            out_gs = out_batch_gs[0]
+            out_gs = _forward_two_stage(
+                attribute_model=attribute_model,
+                input_gs=batch_gs[0],
+                scene_idx=batch_scene_idx[0],
+                target_gs=target_gs,
+                means_source=FLAGS.means_source,
+                means_model=means_model,
+            )
             pred_imgs, _ = gs_utils.rasterize_gaussians_to_multiimgs(out_gs, batch_cameras[0])
 
             image_l1 = 0
@@ -497,18 +575,23 @@ def main(argv):
         if enable_amp:
             scaler.scale(total_loss).backward()
             if grad_clip_norm > 0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
-            scaler.step(optimizer)
+                for optimizer in optimizers:
+                    scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(_trainable_parameters(active_models), grad_clip_norm)
+            for optimizer in optimizers:
+                scaler.step(optimizer)
             scaler.update()
         else:
             total_loss.backward()
             if grad_clip_norm > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
-            optimizer.step()
+                torch.nn.utils.clip_grad_norm_(_trainable_parameters(active_models), grad_clip_norm)
+            for optimizer in optimizers:
+                optimizer.step()
 
-        optimizer.zero_grad(set_to_none=True)
-        scheduler.step()
+        for optimizer in optimizers:
+            optimizer.zero_grad(set_to_none=True)
+        for scheduler in schedulers:
+            scheduler.step()
 
         lpips_value = lpips_loss.item() if lpips_loss_func is not None else 0.0
         pbar.set_postfix(
@@ -517,7 +600,7 @@ def main(argv):
                 "l1": f"{image_l1.item():.4f}",
                 "lpips": f"{lpips_value:.4f}",
                 "psnr": f"{train_psnr.item():.2f}",
-                "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
+                "attr_lr": f"{attribute_optimizer.param_groups[0]['lr']:.2e}",
             }
         )
 
@@ -528,8 +611,10 @@ def main(argv):
             log_msg = (
                 f"step={step} total={total_loss.item():.6f} "
                 f"l1={image_l1.item():.6f} psnr={train_psnr.item():.4f} "
-                f"lr={optimizer.param_groups[0]['lr']:.8f}"
+                f"attr_lr={attribute_optimizer.param_groups[0]['lr']:.8f}"
             )
+            if means_model is not None:
+                log_msg += f" means_lr={means_optimizer.param_groups[0]['lr']:.8f}"
             if lpips_loss_func is not None:
                 log_msg += f" lpips={lpips_loss.item():.6f}"
             logger.info(log_msg)
@@ -542,7 +627,7 @@ def main(argv):
         if step % eval_interval == 0:
             eval_dir = os.path.join(FLAGS.output_dir, "eval", f"{step:08d}")
             metrics, metrics_input = evaluate_single_scene(
-                model=model,
+                attribute_model=attribute_model,
                 input_gs=batch_gs[0],
                 gt_gs=target_factor_entry["gs_params"],
                 scene_idx=eval_payload["scene_idx"],
@@ -554,8 +639,10 @@ def main(argv):
                 eval_chunk_size=eval_chunk_size,
                 compare_with_input=FLAGS.compare_with_input,
                 save_viewer=FLAGS.save_viewer,
-                save_residuals=FLAGS.save_residuals,
                 output_gt=(step == 0),
+                target_gs_for_means=target_gs,
+                means_source=FLAGS.means_source,
+                means_model=means_model,
             )
             metric_str = " ".join([f"{k}: {v:.4f}" for k, v in metrics.items()])
             logger.info(f"Eval step {step}: {metric_str}")
@@ -564,13 +651,19 @@ def main(argv):
                 logger.info(f"Eval input step {step}: {metric_str}")
 
         if (step + 1) % save_interval == 0:
-            torch.save(model.state_dict(), os.path.join(FLAGS.output_dir, "checkpoints", f"model_{step:08d}.pth"))
+            torch.save(
+                _checkpoint_payload(attribute_model, means_model, FLAGS.means_source),
+                os.path.join(FLAGS.output_dir, "checkpoints", f"model_{step:08d}.pth"),
+            )
 
-    torch.save(model.state_dict(), os.path.join(FLAGS.output_dir, "checkpoints", "model_last.pth"))
+    torch.save(
+        _checkpoint_payload(attribute_model, means_model, FLAGS.means_source),
+        os.path.join(FLAGS.output_dir, "checkpoints", "model_last.pth"),
+    )
 
     final_eval_dir = os.path.join(FLAGS.output_dir, FLAGS.eval_subdir)
     metrics, metrics_input = evaluate_single_scene(
-        model=model,
+        attribute_model=attribute_model,
         input_gs=batch_gs[0],
         gt_gs=target_factor_entry["gs_params"],
         scene_idx=eval_payload["scene_idx"],
@@ -582,8 +675,10 @@ def main(argv):
         eval_chunk_size=eval_chunk_size,
         compare_with_input=FLAGS.compare_with_input,
         save_viewer=FLAGS.save_viewer,
-        save_residuals=FLAGS.save_residuals,
         output_gt=True,
+        target_gs_for_means=target_gs,
+        means_source=FLAGS.means_source,
+        means_model=means_model,
     )
 
     metric_str = " ".join([f"{k}: {v:.4f}" for k, v in metrics.items()])
