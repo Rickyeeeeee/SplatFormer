@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""Visualize SR densification assignments saved by overfit-sr-mse.py.
+"""Visualize interpolation between paired Gaussian PLY folders.
 
-The densify_init folder stores target-ordered point clouds. Row i in
-03_input_high_res_gs.ply is the assigned input Gaussian for row i in
-02_gt_high_res_gs.ply.
+For densify_init folders, row i in 03_input_high_res_gs.ply is paired with
+row i in 02_gt_high_res_gs.ply. For point_cloud folders, input.ply is paired
+with output.ply.
 """
 
 import argparse
 import re
 import threading
 import time
+import csv
 import traceback
 from pathlib import Path
 
@@ -18,21 +19,29 @@ from plyfile import PlyData
 
 SOURCE_PLY = "03_input_high_res_gs.ply"
 TARGET_PLY = "02_gt_high_res_gs.ply"
+POINT_CLOUD_INPUT_PLY = "input.ply"
+POINT_CLOUD_OUTPUT_PLY = "output.ply"
 C0 = 0.28209479177387814
 
 
 def _parse_args():
     parser = argparse.ArgumentParser(
-        description="Visualize assignment links and true gsplat renders from densify_init folders."
+        description="Visualize true gsplat renders from paired Gaussian PLY folders."
     )
-    parser.add_argument("--densify_init", action="append", required=True)
-    parser.add_argument("--mode", choices=("assignments", "splats", "both"), default="assignments")
-    parser.add_argument("--sample_count", type=int, default=512)
+    parser.add_argument("--densify_init", action="append", default=[])
+    parser.add_argument("--point_cloud_folder", action="append", default=[], help="Folder containing input.ply and output.ply to interpolate.")
+    parser.add_argument("--mode", choices=("splats",), default="splats")
+    parser.add_argument("--sample_count", type=int, default=0, help="Gaussians to render per folder. 0 means all points.")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--stats_dir",
+        default=None,
+        help="Directory for per-property distance stats/histograms. Defaults beside each input folder.",
+    )
+    parser.add_argument("--hist_bins", type=int, default=80, help="Number of bins for saved distance histograms.")
+    parser.add_argument("--no_stats", action="store_true", help="Disable property distance stats/histogram output.")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8080)
-    parser.add_argument("--point_size", type=float, default=0.015)
-    parser.add_argument("--line_width", type=float, default=1.0)
     parser.add_argument("--render_height", type=int, default=720)
     parser.add_argument("--near_plane", type=float, default=1e-2)
     parser.add_argument("--far_plane", type=float, default=1e2)
@@ -52,6 +61,11 @@ def _sigmoid(x):
 def _normalize_quats(quats):
     norm = np.linalg.norm(quats, axis=-1, keepdims=True)
     return quats / np.clip(norm, 1e-8, None)
+
+
+def _sorted_prefixed_fields(names, prefix):
+    fields = [name for name in names if name.startswith(prefix)]
+    return sorted(fields, key=lambda name: int(name[len(prefix):]))
 
 
 def _read_ply_gs(ply_path):
@@ -76,6 +90,12 @@ def _read_ply_gs(ply_path):
         features_dc = np.zeros((count, 3), dtype=np.float32)
         colors_u8 = np.full((count, 3), 220, dtype=np.uint8)
 
+    rest_fields = _sorted_prefixed_fields(names, "f_rest_")
+    if rest_fields:
+        features_rest = np.stack([vertex[name] for name in rest_fields], axis=-1).astype(np.float32)
+    else:
+        features_rest = np.zeros((count, 0), dtype=np.float32)
+
     scale_fields = ["scale_0", "scale_1", "scale_2"]
     if set(scale_fields).issubset(names):
         scales = np.stack([vertex[name] for name in scale_fields], axis=-1).astype(np.float32)
@@ -98,6 +118,7 @@ def _read_ply_gs(ply_path):
     return {
         "points": points,
         "features_dc": features_dc,
+        "features_rest": features_rest,
         "colors_u8": colors_u8,
         "scales": scales,
         "quats": quats,
@@ -105,11 +126,14 @@ def _read_ply_gs(ply_path):
     }
 
 
-def _label_from_densify_init(path):
+def _label_from_folder(path):
     path = Path(path)
-    label = path.parent.name if path.name == "densify_init" and path.parent.name else path.name
+    if path.name in {"densify_init", "point_cloud"} and path.parent.name:
+        label = path.parent.name
+    else:
+        label = path.name
     label = re.sub(r"[^A-Za-z0-9_.-]+", "_", label).strip("_")
-    return label or "assignment"
+    return label or "pair"
 
 
 def _unique_labels(labels):
@@ -121,32 +145,36 @@ def _unique_labels(labels):
     return out
 
 
-def _load_assignment_folder(densify_init, rng, sample_count):
-    densify_init = Path(densify_init).expanduser()
-    source_path = densify_init / SOURCE_PLY
-    target_path = densify_init / TARGET_PLY
-    if not densify_init.is_dir():
-        raise FileNotFoundError(f"densify_init folder does not exist: {densify_init}")
+def _load_paired_ply_folder(folder, source_name, target_name, rng, sample_count, kind):
+    folder = Path(folder).expanduser()
+    source_path = folder / source_name
+    target_path = folder / target_name
+    if not folder.is_dir():
+        raise FileNotFoundError(f"{kind} folder does not exist: {folder}")
     if not source_path.is_file():
-        raise FileNotFoundError(f"missing assigned input PLY: {source_path}")
+        raise FileNotFoundError(f"missing source PLY: {source_path}")
     if not target_path.is_file():
         raise FileNotFoundError(f"missing target PLY: {target_path}")
 
     source = _read_ply_gs(source_path)
     target = _read_ply_gs(target_path)
     if source["points"].shape != target["points"].shape:
-        raise ValueError(f"{densify_init} input/target point counts differ")
+        raise ValueError(f"{folder} source/target point counts differ")
     if source["points"].shape[0] == 0:
-        raise ValueError(f"{densify_init} contains zero points")
+        raise ValueError(f"{folder} contains zero points")
 
     count = source["points"].shape[0]
-    initial_count = min(max(int(sample_count), 0), count)
+    requested_count = int(sample_count)
+    initial_count = count if requested_count == 0 else min(max(requested_count, 0), count)
     permutation = rng.permutation(count)
     idx = permutation[:initial_count]
     distances = np.linalg.norm(source["points"] - target["points"], axis=1)
     return {
-        "path": densify_init,
-        "label": _label_from_densify_init(densify_init),
+        "path": folder,
+        "kind": kind,
+        "source_name": source_name,
+        "target_name": target_name,
+        "label": _label_from_folder(folder),
         "source": source,
         "target": target,
         "permutation": permutation,
@@ -160,12 +188,131 @@ def _load_assignment_folder(densify_init, rng, sample_count):
     }
 
 
+def _load_densify_init_folder(densify_init, rng, sample_count):
+    return _load_paired_ply_folder(densify_init, SOURCE_PLY, TARGET_PLY, rng, sample_count, "densify_init")
+
+
+def _load_point_cloud_folder(point_cloud_folder, rng, sample_count):
+    return _load_paired_ply_folder(
+        point_cloud_folder,
+        POINT_CLOUD_INPUT_PLY,
+        POINT_CLOUD_OUTPUT_PLY,
+        rng,
+        sample_count,
+        "point_cloud",
+    )
+
+
+def _safe_l2_distance(a, b):
+    if a.shape[-1] == 0:
+        return None
+    return np.linalg.norm(a.astype(np.float32) - b.astype(np.float32), axis=-1)
+
+
+def _quat_geodesic_distance(q0, q1):
+    dots = np.sum(_normalize_quats(q0) * _normalize_quats(q1), axis=-1)
+    dots = np.clip(np.abs(dots), 0.0, 1.0)
+    return 2.0 * np.arccos(dots)
+
+
+def _property_distances(source, target):
+    values = {
+        "means_l2": _safe_l2_distance(source["points"], target["points"]),
+        "features_dc_l2": _safe_l2_distance(source["features_dc"], target["features_dc"]),
+        "features_rest_l2": _safe_l2_distance(source["features_rest"], target["features_rest"]),
+        "opacities_abs": np.abs(source["opacities"].astype(np.float32) - target["opacities"].astype(np.float32)),
+        "scales_l2": _safe_l2_distance(source["scales"], target["scales"]),
+        "quats_geodesic_rad": _quat_geodesic_distance(source["quats"], target["quats"]),
+        "quats_l2": _safe_l2_distance(source["quats"], target["quats"]),
+    }
+    return {key: value for key, value in values.items() if value is not None}
+
+
+def _distance_summary(values):
+    values = np.asarray(values, dtype=np.float64)
+    return {
+        "count": int(values.size),
+        "min": float(values.min()),
+        "max": float(values.max()),
+        "mean": float(values.mean()),
+        "average": float(values.mean()),
+        "std": float(values.std()),
+        "median": float(np.median(values)),
+        "p95": float(np.percentile(values, 95.0)),
+        "p99": float(np.percentile(values, 99.0)),
+    }
+
+
+def _stats_output_dir(base_stats_dir, data):
+    if base_stats_dir is None:
+        dirname = "assignment_stats" if data.get("kind") == "densify_init" else "interpolation_stats"
+        return Path(data["path"]) / dirname
+    return Path(base_stats_dir).expanduser() / data["label"]
+
+
+def _write_property_distance_outputs(data, base_stats_dir, bins):
+    out_dir = _stats_output_dir(base_stats_dir, data)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    distances = _property_distances(data["source"], data["target"])
+    stats_path = out_dir / "property_distance_stats.csv"
+    hist_path = out_dir / "property_distance_histograms.csv"
+    summaries = {key: _distance_summary(value) for key, value in distances.items()}
+
+    with stats_path.open("w", newline="") as f:
+        fieldnames = ["property", "count", "min", "max", "mean", "average", "std", "median", "p95", "p99"]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for key, summary in summaries.items():
+            writer.writerow({"property": key, **summary})
+
+    with hist_path.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["property", "bin_left", "bin_right", "count"])
+        for key, values in distances.items():
+            counts, edges = np.histogram(values, bins=max(int(bins), 1))
+            for left, right, count in zip(edges[:-1], edges[1:], counts):
+                writer.writerow([key, float(left), float(right), int(count)])
+
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        names = list(distances.keys())
+        cols = 2
+        rows = int(np.ceil(len(names) / cols))
+        fig, axes = plt.subplots(rows, cols, figsize=(12, max(3.2 * rows, 3.2)))
+        axes = np.asarray(axes).reshape(-1)
+        for ax, name in zip(axes, names):
+            values = distances[name]
+            summary = summaries[name]
+            ax.hist(values, bins=max(int(bins), 1), color="#4C78A8", alpha=0.85)
+            ax.axvline(summary["mean"], color="#F58518", linewidth=1.5, label=f"mean={summary['mean']:.4g}")
+            ax.axvline(summary["median"], color="#54A24B", linewidth=1.2, label=f"median={summary['median']:.4g}")
+            ax.set_title(name)
+            ax.set_xlabel("distance")
+            ax.set_ylabel("count")
+            ax.legend(fontsize=8)
+        for ax in axes[len(names):]:
+            ax.axis("off")
+        fig.suptitle(f"{data.get('kind', 'pair')} property distances: {data['label']}", fontsize=14)
+        fig.tight_layout()
+        fig.savefig(out_dir / "property_distance_histograms.png", dpi=160)
+        plt.close(fig)
+    except Exception as exc:
+        print(f"Warning: failed to write histogram PNG for {data['label']}: {exc}", flush=True)
+
+    return stats_path
+
+
 def _format_stats(data, mode):
     distances = data["distances"][data["sample_idx"]]
     dist_stats = "empty" if distances.size == 0 else f"{distances.min():.6g}/{distances.mean():.6g}/{distances.max():.6g}"
     return (
-        f"{data['label']}: path={data['path']} total={data['total_count']} "
-        f"sampled={len(data['sample_idx'])} visible_percent={data['visible_percent']:.2f} "
+        f"{data['label']}: kind={data.get('kind', 'pair')} path={data['path']} "
+        f"source={data.get('source_name', 'source')} target={data.get('target_name', 'target')} "
+        f"total={data['total_count']} sampled={len(data['sample_idx'])} "
+        f"visible_percent={data['visible_percent']:.2f} "
         f"dist[min/mean/max]={dist_stats} global_mode={mode}"
     )
 
@@ -257,7 +404,7 @@ def _camera_intrinsics(camera, height):
 
 
 def _merged_render_gs(loaded, scene_state):
-    if scene_state["mode"] not in ("splats", "both"):
+    if scene_state["mode"] != "splats":
         return None
     groups = []
     for data in loaded:
@@ -314,40 +461,6 @@ def _render_gsplat_for_camera(camera, loaded, scene_state, render_cfg):
     return render_colors[0].detach().clamp(0.0, 1.0).mul(255.0).byte().cpu().numpy()
 
 
-def _add_assignment_nodes(server, data, point_size, line_width):
-    label = data["label"]
-    root = f"/assignments/{label}/assignment"
-    idx = _visible_indices(data)
-    data["sample_idx"] = idx
-    handles = []
-    if idx.size == 0:
-        handles.append(server.add_label(f"{root}/label", text=f"{label}: 0 links", position=(0.0, 0.0, 0.0)))
-        return handles
-    source = data["source"]["points"][idx]
-    target = data["target"]["points"][idx]
-    distances = data["distances"][idx]
-    diag = _bbox_diagonal([source, target])
-    cloud_gap = 0.8 * diag
-    source_vis = source + np.array([-0.5 * cloud_gap, 0.0, 0.0], dtype=np.float32)
-    target_vis = target + np.array([0.5 * cloud_gap, 0.0, 0.0], dtype=np.float32)
-    link_colors = _distance_colors(distances)
-    handles.append(server.add_point_cloud(f"{root}/assigned_input", points=source_vis, colors=data["source"]["colors_u8"][idx], point_size=point_size, point_shape="circle"))
-    handles.append(server.add_point_cloud(f"{root}/target", points=target_vis, colors=data["target"]["colors_u8"][idx], point_size=point_size, point_shape="circle"))
-    for i, (start, end, color) in enumerate(zip(source_vis, target_vis, link_colors)):
-        delta = end - start
-        control_points = np.stack([start + delta / 3.0, start + 2.0 * delta / 3.0], axis=0)
-        handles.append(server.add_spline_cubic_bezier(f"{root}/links/{i:06d}", positions=np.stack([start, end], axis=0), control_points=control_points, line_width=line_width, color=tuple(int(c) for c in color), segments=2))
-    center = np.concatenate([source_vis, target_vis], axis=0).mean(axis=0).astype(np.float32)
-    handles.append(server.add_label(f"{root}/label", text=f"{label}: {len(idx)} links", position=center + np.array([0.0, 0.0, 0.15 * diag], dtype=np.float32)))
-    return handles
-
-
-def _refresh_assignment_group(server, data, scene_state, point_size, line_width):
-    _remove_handles(data["assignment_handles"])
-    if scene_state["mode"] in ("assignments", "both"):
-        data["assignment_handles"] = _add_assignment_nodes(server, data, point_size, line_width)
-
-
 class GsplatBackgroundRenderer:
     def __init__(self, server, loaded, scene_state, render_cfg):
         self.server = server
@@ -355,10 +468,16 @@ class GsplatBackgroundRenderer:
         self.scene_state = scene_state
         self.render_cfg = render_cfg
         self.lock = threading.Lock()
+        self.last_render_time = {}
 
-    def render_client(self, client):
+    def render_client(self, client, force=False):
         if getattr(client.camera._state, "update_timestamp", 0.0) == 0.0:
             return
+        client_id = id(client)
+        now = time.monotonic()
+        if not force and now - self.last_render_time.get(client_id, 0.0) < float(self.render_cfg.get("min_render_interval", 0.25)):
+            return
+        self.last_render_time[client_id] = now
         try:
             with self.lock:
                 image = _render_gsplat_for_camera(client.camera, self.loaded, self.scene_state, self.render_cfg)
@@ -369,15 +488,10 @@ class GsplatBackgroundRenderer:
 
     def render_all(self):
         for client in self.server.get_clients().values():
-            self.render_client(client)
+            self.render_client(client, force=True)
 
 
-def _refresh_all_assignments(server, loaded, scene_state, point_size, line_width):
-    for data in loaded:
-        _refresh_assignment_group(server, data, scene_state, point_size, line_width)
-
-
-def _add_group_to_server(server, data, group_index, group_count, layout_diag, point_size, line_width, scene_state, bg_renderer):
+def _add_group_to_server(server, data, group_index, group_count, layout_diag, bg_renderer):
     label = data["label"]
     root = f"/assignments/{label}"
     group_gap = 1.4 * layout_diag
@@ -385,18 +499,34 @@ def _add_group_to_server(server, data, group_index, group_count, layout_diag, po
     if group_count > 1:
         group_y -= 0.5 * group_gap * (group_count - 1)
     data["group_position"] = np.array([0.0, float(group_y), 0.0], dtype=np.float32)
-    controls = server.add_transform_controls(root, scale=max(0.15 * layout_diag, 1e-3), line_width=2.0, disable_rotations=True, position=data["group_position"])
-    server.add_frame(f"{root}/assignment", show_axes=False, visible=True)
-    server.add_frame(f"{root}/assignment/links", show_axes=False, visible=True)
-    _refresh_assignment_group(server, data, scene_state, point_size, line_width)
+    controls = server.add_transform_controls(
+        root,
+        scale=max(0.15 * layout_diag, 1e-3),
+        line_width=2.0,
+        disable_rotations=True,
+        position=data["group_position"],
+    )
 
-    percent_slider = server.add_gui_slider(f"{label} visible %", min=0.0, max=100.0, step=1.0, initial_value=float(data["visible_percent"]), marks=((0.0, "0%"), (50.0, "50%"), (100.0, "100%")))
-    interp_slider = server.add_gui_slider(f"{label} input-target", min=0.0, max=1.0, step=0.01, initial_value=float(data["splat_t"]), marks=((0.0, "input"), (0.5, "mix"), (1.0, "target")))
+    percent_slider = server.add_gui_slider(
+        f"{label} visible %",
+        min=0.0,
+        max=100.0,
+        step=1.0,
+        initial_value=float(data["visible_percent"]),
+        marks=((0.0, "0%"), (50.0, "50%"), (100.0, "100%")),
+    )
+    interp_slider = server.add_gui_slider(
+        f"{label} input-target",
+        min=0.0,
+        max=1.0,
+        step=0.01,
+        initial_value=float(data["splat_t"]),
+        marks=((0.0, "input"), (0.5, "mix"), (1.0, "target")),
+    )
 
     def refresh_group():
         data["visible_percent"] = float(percent_slider.value)
         data["splat_t"] = float(interp_slider.value)
-        _refresh_assignment_group(server, data, scene_state, point_size, line_width)
         bg_renderer.render_all()
 
     @percent_slider.on_update
@@ -420,13 +550,21 @@ def main():
     if args.render_height <= 0:
         raise ValueError(f"--render_height must be positive, got {args.render_height}")
 
+    if not args.densify_init and not args.point_cloud_folder:
+        raise ValueError("Pass at least one --densify_init or --point_cloud_folder")
+
     rng = np.random.default_rng(args.seed)
-    loaded = [_load_assignment_folder(path, rng, args.sample_count) for path in args.densify_init]
+    loaded = []
+    loaded.extend(_load_densify_init_folder(path, rng, args.sample_count) for path in args.densify_init)
+    loaded.extend(_load_point_cloud_folder(path, rng, args.sample_count) for path in args.point_cloud_folder)
     labels = _unique_labels([data["label"] for data in loaded])
     scene_state = {"mode": args.mode}
     for data, label in zip(loaded, labels):
         data["label"] = label
         print(_format_stats(data, scene_state["mode"]), flush=True)
+        if not args.no_stats:
+            stats_path = _write_property_distance_outputs(data, args.stats_dir, args.hist_bins)
+            print(f"Wrote property distance stats: {stats_path}", flush=True)
     if args.dry_run:
         return
 
@@ -446,16 +584,9 @@ def main():
         "rasterize_mode": args.rasterize_mode,
         "background": tuple(float(v) for v in args.background),
         "device": args.device,
+        "min_render_interval": 0.25,
     }
     bg_renderer = GsplatBackgroundRenderer(server, loaded, scene_state, render_cfg)
-
-    mode_dropdown = server.add_gui_dropdown("Display mode", ("assignments", "splats", "both"), initial_value=scene_state["mode"])
-
-    @mode_dropdown.on_update
-    def _(_event):
-        scene_state["mode"] = mode_dropdown.value
-        _refresh_all_assignments(server, loaded, scene_state, args.point_size, args.line_width)
-        bg_renderer.render_all()
 
     @server.on_client_connect
     def _(client):
@@ -465,11 +596,12 @@ def main():
 
     layout_diag = max(_bbox_diagonal([data["source"]["points"], data["target"]["points"]]) for data in loaded)
     for group_index, data in enumerate(loaded):
-        _add_group_to_server(server, data, group_index, len(loaded), layout_diag, args.point_size, args.line_width, scene_state, bg_renderer)
+        _add_group_to_server(server, data, group_index, len(loaded), layout_diag, bg_renderer)
 
     print(f"Viser server running at http://{args.host}:{args.port}", flush=True)
-    print("Display mode is global. In splats/both, all loaded assignment folders render together with gsplat into the background.", flush=True)
-    print("Pass EMD and nearest densify_init folders to see two separate rendered splat clouds.", flush=True)
+    print("This viewer renders gsplat backgrounds only.", flush=True)
+    print("Loaded densify_init and point_cloud folders render together with gsplat into the background.", flush=True)
+    print("Use --point_cloud_folder /path/to/point_cloud to interpolate input.ply -> output.ply.", flush=True)
     try:
         while True:
             time.sleep(1.0)

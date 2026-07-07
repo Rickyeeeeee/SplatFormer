@@ -48,6 +48,12 @@ flags.DEFINE_string(
     "Defaults to FeaturePredictor.output_features.",
 )
 flags.DEFINE_boolean(
+    "model_features_from_loss",
+    False,
+    "Override FeaturePredictor.output_features to exactly match the selected loss_features. "
+    "FeaturePredictor.input_features always uses all available Gaussian attributes.",
+)
+flags.DEFINE_boolean(
     "post_activate_loss",
     False,
     "Use feature-specific loss transforms: log-space scales, sigmoid opacities, and geodesic quats.",
@@ -119,6 +125,28 @@ def feature_mse_loss(loss_weights=None, quat_direct_mse=False):
         )
     default_weights.update({key: float(value) for key, value in loss_weights.items()})
     return {"loss_weights": default_weights, "quat_direct_mse": quat_direct_mse}
+
+
+class _FeatureSpec:
+    def __init__(self, output_features):
+        self.output_features = output_features
+
+
+def resolve_loss_features(raw_loss_features, target_gs):
+    if raw_loss_features is None or raw_loss_features.strip() == "":
+        configured_output_features = gin.query_parameter("FeaturePredictor.output_features")
+        return parse_loss_features(raw_loss_features, _FeatureSpec(configured_output_features), target_gs)
+    return parse_loss_features(raw_loss_features, _FeatureSpec([]), target_gs)
+
+
+def resolve_model_input_features(target_gs):
+    configured_input_features = gin.query_parameter("FeaturePredictor.input_features")
+    available_features = [key for key in SUPPORTED_GS_KEYS if key in target_gs]
+    input_features = []
+    for key in list(configured_input_features) + available_features:
+        if key in available_features and key not in input_features:
+            input_features.append(key)
+    return input_features
 
 
 
@@ -279,9 +307,6 @@ def main(argv):
     mse_loss_cfg = feature_mse_loss()
     set_seed()
 
-    with open(os.path.join(FLAGS.output_dir, "config.gin"), "w") as f:
-        f.writelines(gin.operative_config_str())
-
     logger = ProcessSafeLogger(os.path.join(FLAGS.output_dir, "overfit.log")).get_logger()
     device = torch.device("cuda")
 
@@ -296,14 +321,20 @@ def main(argv):
 
     target_gs = gpu_utils.move_to_device(target_factor_dict["gs_params"], device)
 
+    # Loss Function
+    loss_features = resolve_loss_features(FLAGS.loss_features, target_gs)
+    model_input_features = resolve_model_input_features(target_gs)
+    with gin.unlock_config():
+        gin.bind_parameter("FeaturePredictor.input_features", model_input_features)
+        if FLAGS.model_features_from_loss:
+            gin.bind_parameter("FeaturePredictor.output_features", loss_features)
+
     # Model
     model = FeaturePredictor().to(device)
     if model.resume_ckpt is not None:
         model.load_state_dict(torch.load(model.resume_ckpt, map_location="cpu"))
     model.train()
 
-    # Loss Function
-    loss_features = parse_loss_features(FLAGS.loss_features, model, target_gs)
     fixed_attribute_keys = select_fixed_attribute_keys(loss_features, target_gs)
     requested_means_origin_scale = float(FLAGS.means_origin_scale)
     if requested_means_origin_scale <= 0.0:
@@ -360,6 +391,9 @@ def main(argv):
         optimizer = build_optimizer(model)
         scheduler = build_scheduler(optimizer)
 
+    with open(os.path.join(FLAGS.output_dir, "config.gin"), "w") as f:
+        f.writelines(gin.operative_config_str())
+
     total_steps = train_cfg["total_steps"]
     log_interval = train_cfg["log_interval"]
     log_image_interval = train_cfg["log_image_interval"]
@@ -384,6 +418,9 @@ def main(argv):
         f"input_factor={FLAGS.input_factor} target_factor={FLAGS.target_factor} \n"
         f"alignment={FLAGS.alignment} attribute_init={FLAGS.attribute_init} \n"
         f"loss_features={','.join(loss_features)} \n"
+        f"model_features_from_loss={FLAGS.model_features_from_loss} \n"
+        f"model_input_features={','.join(model.input_features)} \n"
+        f"model_output_features={','.join(model.output_features)} \n"
         f"post_activate_loss={FLAGS.post_activate_loss} \n"
         f"means_origin_scale={requested_means_origin_scale} \n"
         f"effective_means_origin_scale={means_origin_scale} \n"

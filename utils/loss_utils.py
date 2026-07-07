@@ -70,11 +70,11 @@ def feature_loss_value(
 
 
 
-    if key == "opacities":
+    if key == "opacities" and post_activate_loss:
         return F.mse_loss(torch.sigmoid(pred), torch.sigmoid(target))
 
     if key == "quats":
-        if quat_direct_mse:
+        if quat_direct_mse or not post_activate_loss:
             return F.mse_loss(pred, target)
         pred_quat = F.normalize(pred, dim=-1)
         target_quat = F.normalize(target, dim=-1)
@@ -89,6 +89,7 @@ def feature_mse_loss(
     target_gs,
     loss_features,
     loss_weights=None,
+    post_activate_loss=False,
     quat_direct_mse=False,
     means_loss_reduction="mean",
     output_label="model output",
@@ -120,6 +121,7 @@ def feature_mse_loss(
             key,
             pred,
             target,
+            post_activate_loss=post_activate_loss,
             quat_direct_mse=quat_direct_mse,
             means_loss_reduction=means_loss_reduction,
         )

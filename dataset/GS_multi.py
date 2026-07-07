@@ -431,6 +431,7 @@ class SplatFactoMultiLevelDataset(torch.utils.data.IterableDataset):
         )
         return {
             "gs_params": factor_entry["gs_params"],
+            "scaler": factor_entry["scaler"],
             "images": images,
             "cameras": cameras,
             "images_name": images_names,

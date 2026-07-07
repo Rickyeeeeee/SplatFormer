@@ -8,7 +8,7 @@ FeaturePredictor.resume_ckpt = None
 FeaturePredictor.output_features_type = 'res'
 FeaturePredictor.input_features = ['means','scales', 'opacities', 'quats', 'features_dc', 'features_rest']
 FeaturePredictor.output_features = ['means','scales', 'opacities', 'quats', 'features_dc', 'features_rest']
-FeaturePredictor.output_head_width = 128
+FeaturePredictor.output_head_width = 256
 FeaturePredictor.zeroinit = True
 FeaturePredictor.quat_residual_mode = "mul" #[add, mul]
  

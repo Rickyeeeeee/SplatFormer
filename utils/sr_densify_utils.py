@@ -70,6 +70,123 @@ def chunked_nearest_indices(source_means, target_means, chunk_size=512):
     return chunked_knn_indices(source_means, target_means, 1, chunk_size=chunk_size).squeeze(1)
 
 
+def _print_midpoint_sample(prefix, src_idx, nbr_idx, extra_idx=None, limit=8):
+    sample_count = min(int(src_idx.numel()), int(limit))
+    parts = []
+    for i in range(sample_count):
+        item = f"src={int(src_idx[i])} nbr={int(nbr_idx[i])}"
+        if extra_idx is not None:
+            item += f" match={int(extra_idx[i])}"
+        parts.append(item)
+    print(f"{prefix} samples: " + "; ".join(parts))
+
+
+def _format_coord(value):
+    return "[" + ", ".join(f"{float(v):.10f}" for v in value) + "]"
+
+
+def _print_midpoint_coordinate_examples(means, midpoint_means, src_idx, nbr_idx, matched_input, midpoint64, limit=3):
+    sample_count = min(int(src_idx.numel()), int(limit))
+    means_cpu = means.detach().cpu()
+    midpoint_cpu = midpoint_means.detach().cpu()
+    midpoint64_cpu = midpoint64.detach().cpu()
+    src_cpu = src_idx.detach().cpu()
+    nbr_cpu = nbr_idx.detach().cpu()
+    match_cpu = matched_input.detach().cpu()
+    for i in range(sample_count):
+        src_i = int(src_cpu[i])
+        nbr_i = int(nbr_cpu[i])
+        match_i = int(match_cpu[i])
+        print(
+            "[midpoint_interpolate_gs] midpoint-coordinate-example "
+            f"src={src_i} nbr={nbr_i} match={match_i} "
+            f"src_mean={_format_coord(means_cpu[src_i])} "
+            f"nbr_mean={_format_coord(means_cpu[nbr_i])} "
+            f"midpoint_float32={_format_coord(midpoint_cpu[i])} "
+            f"match_mean={_format_coord(means_cpu[match_i])} "
+            f"midpoint_float64={_format_coord(midpoint64_cpu[i])}"
+        )
+
+
+def _check_midpoint_pairs(means, src_idx, nbr_idx, label):
+    if src_idx.numel() == 0:
+        return
+    pair_abs_diff = (means[src_idx] - means[nbr_idx]).abs()
+    exact_same = pair_abs_diff.amax(dim=-1) == 0
+    close_same = pair_abs_diff.amax(dim=-1) <= 1e-8
+    if exact_same.any():
+        bad = exact_same.nonzero(as_tuple=False).squeeze(1)
+        print(
+            f"[midpoint_interpolate_gs] {label}: "
+            f"{int(exact_same.sum().item())}/{int(src_idx.numel())} distinct index pairs have exactly identical means."
+        )
+        _print_midpoint_sample(
+            "[midpoint_interpolate_gs] identical-pair",
+            src_idx[bad].detach().cpu(),
+            nbr_idx[bad].detach().cpu(),
+        )
+    elif close_same.any():
+        bad = close_same.nonzero(as_tuple=False).squeeze(1)
+        print(
+            f"[midpoint_interpolate_gs] {label}: "
+            f"{int(close_same.sum().item())}/{int(src_idx.numel())} distinct index pairs have means within 1e-8."
+        )
+        _print_midpoint_sample(
+            "[midpoint_interpolate_gs] near-identical-pair",
+            src_idx[bad].detach().cpu(),
+            nbr_idx[bad].detach().cpu(),
+        )
+
+
+def _check_midpoints_on_input(means, midpoint_means, src_idx, nbr_idx, label, chunk_size=512):
+    if midpoint_means.shape[0] == 0:
+        return
+    hit_chunks = []
+    match_chunks = []
+    for start in range(0, midpoint_means.shape[0], chunk_size):
+        end = min(start + chunk_size, midpoint_means.shape[0])
+        dist = torch.cdist(midpoint_means[start:end].float(), means.float())
+        min_dist, match_idx = dist.min(dim=1)
+        hit = min_dist == 0
+        if hit.any():
+            hit_chunks.append(hit.nonzero(as_tuple=False).squeeze(1) + start)
+            match_chunks.append(match_idx[hit])
+    if not hit_chunks:
+        return
+    bad = torch.cat(hit_chunks, dim=0)
+    matched_input = torch.cat(match_chunks, dim=0)
+    print(
+        f"[midpoint_interpolate_gs] {label}: "
+        f"{int(bad.numel())}/{int(midpoint_means.shape[0])} generated midpoint means exactly match an input mean."
+    )
+    _print_midpoint_sample(
+        "[midpoint_interpolate_gs] midpoint-on-input",
+        src_idx[bad].detach().cpu(),
+        nbr_idx[bad].detach().cpu(),
+        extra_idx=matched_input.detach().cpu(),
+    )
+
+    src64 = means[src_idx[bad]].double()
+    nbr64 = means[nbr_idx[bad]].double()
+    match64 = means[matched_input].double()
+    midpoint64 = (src64 + nbr64) * 0.5
+    still_exact64 = (midpoint64 == match64).all(dim=-1)
+    float32_only = ~still_exact64
+    print(
+        f"[midpoint_interpolate_gs] {label}: "
+        f"{int(float32_only.sum().item())}/{int(bad.numel())} exact input matches disappear when recomputed in float64; "
+        f"{int(still_exact64.sum().item())}/{int(bad.numel())} remain exact in float64."
+    )
+    _print_midpoint_coordinate_examples(
+        means,
+        midpoint_means[bad],
+        src_idx[bad],
+        nbr_idx[bad],
+        matched_input,
+        midpoint64,
+    )
+
+
 def midpoint_interpolate_gs(input_gs, target_count):
     source_count = input_gs["means"].shape[0]
     if source_count <= 0:
@@ -102,6 +219,7 @@ def midpoint_interpolate_gs(input_gs, target_count):
     non_self = src_idx != nbr_idx
     src_idx = src_idx[non_self]
     nbr_idx = nbr_idx[non_self]
+    _check_midpoint_pairs(means, src_idx, nbr_idx, "before FPS")
 
     candidate_count = src_idx.shape[0]
     if candidate_count < new_count:
@@ -117,19 +235,25 @@ def midpoint_interpolate_gs(input_gs, target_count):
         src_idx = src_idx[keep_idx]
         nbr_idx = nbr_idx[keep_idx]
 
+    _check_midpoint_pairs(means, src_idx, nbr_idx, "after FPS")
+    midpoint_means = ((means[src_idx] + means[nbr_idx]) * 0.5).contiguous()
+    _check_midpoints_on_input(means, midpoint_means, src_idx, nbr_idx, "after FPS")
+
     interpolated = {}
     for key, value in input_gs.items():
         src_value = value[src_idx]
         nbr_value = value[nbr_idx]
 
-        if key in ["means", "features_dc", "features_rest"]:
+        if key == "means":
+            midpoint_value = midpoint_means + 0.01 * (torch.rand_like(src_value) - 0.5)
+        elif key in ["features_dc", "features_rest"]:
             midpoint_value = (src_value + nbr_value) * 0.5
         elif key == "quats":
             midpoint_value = torch.zeros_like(src_value)
             midpoint_value[:, 0] = 1
         elif key == "opacities":
-            low_opacity = torch.full_like(src_value, 0.01)
-            midpoint_value = torch.logit(low_opacity)
+            low_opacity = torch.full_like(src_value, 0.99)
+            midpoint_value = torch.log(low_opacity)
         elif key == "scales":
             pair_min_scale = torch.minimum(src_value, nbr_value).min(dim=-1, keepdim=True).values
             midpoint_value = pair_min_scale.repeat(1, src_value.shape[-1])
@@ -191,6 +315,7 @@ def align_emd_target_to_source(source_means, target_means, eps, iters):
 
     missing = best_source < 0
     if missing.any():
+        print("Miss alignment.")
         missing_idx = missing.nonzero(as_tuple=False).squeeze(1).to(target_means.device)
         nearest = align_nearest_target_to_source(source_means, target_means[missing_idx]).detach().cpu()
         best_source[missing] = nearest

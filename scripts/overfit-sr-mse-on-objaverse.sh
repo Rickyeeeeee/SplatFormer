@@ -7,6 +7,7 @@ echo "Using GPU: $GPU_ID"
 # do
 
 scene_name=3e288ee8aced4a0797e66d53536112b1
+# scene_name=77cfbcdedb464431ae86f955dee8e9da
 
 total_steps=${1:-1000}
 save_interval=${2:-200}
@@ -20,6 +21,7 @@ loss_features=${9:-${LOSS_FEATURES:-means}}
 post_activate_loss=${10:-${POST_ACTIVATE_LOSS:-true}}
 direct_prediction=${11:-${DIRECT_PREDICTION:-false}}
 means_origin_scale=${12:-${MEANS_ORIGIN_SCALE:-1.01}}
+model_features_from_loss=${13:-${MODEL_FEATURE_FROM_LOSS:-true}}
 conda_env=${CONDA_ENV:-3dgs-sr}
 
 to_bit() {
@@ -36,6 +38,12 @@ sanitize_name() {
 loss_name="$(sanitize_name "${loss_features}")"
 post_activate_bit="$(to_bit ${post_activate_loss})"
 direct_prediction_bit="$(to_bit ${direct_prediction})"
+model_features_from_loss_bit="$(to_bit ${model_features_from_loss})"
+if [ "${model_features_from_loss_bit}" = "1" ]; then
+    model_output_suffix=lossout
+else
+    model_output_suffix=fullout
+fi
 if [ "${direct_prediction_bit}" = "1" ]; then
     output_features_type=dc
     max_scale_normalized=${MAX_SCALE_NORMALIZED:--1}
@@ -45,7 +53,7 @@ else
 fi
 
 scale_name=$(sanitize_name "${means_origin_scale}")
-out_name=${scene_name}_${attribute_init}_if${input_factor}_tf${target_factor}_mse_${loss_name}
+out_name=${scene_name}_${attribute_init}_if${input_factor}_tf${target_factor}_mse_${loss_name}_${model_output_suffix}
 output_dir=/project/ricky/experiments/objaverse_splatformer_overfit_sr_mse_512/${out_name}
 
 CUDA_VISIBLE_DEVICES=$GPU_ID python overfit-sr-mse.py \
@@ -56,6 +64,7 @@ CUDA_VISIBLE_DEVICES=$GPU_ID python overfit-sr-mse.py \
     --input_factor=${input_factor} \
     --target_factor=${target_factor} \
     --loss_features=${loss_features} \
+    --model_features_from_loss=${model_features_from_loss} \
     --post_activate_loss=${post_activate_loss} \
     --means_origin_scale=${means_origin_scale} \
     --gin_file=configs/model/ptv3.gin \

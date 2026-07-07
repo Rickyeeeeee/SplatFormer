@@ -55,6 +55,12 @@ flags.DEFINE_string(
     "Comma-separated Gaussian attributes to include in point-wise flow loss. "
     "Defaults to GSFlowPredictor.output_features.",
 )
+flags.DEFINE_boolean(
+    "model_features_from_loss",
+    False,
+    "Override GSFlowPredictor.input_features and GSFlowPredictor.output_features "
+    "to exactly match the selected loss_features.",
+)
 flags.DEFINE_float(
     "means_origin_scale",
     1.05,
@@ -131,6 +137,28 @@ def feature_mse_loss(loss_weights=None, quat_direct_mse=False):
         )
     default_weights.update({key: float(value) for key, value in loss_weights.items()})
     return {"loss_weights": default_weights, "quat_direct_mse": quat_direct_mse}
+
+
+class _FeatureSpec:
+    def __init__(self, output_features):
+        self.output_features = output_features
+
+
+def resolve_loss_features(raw_loss_features, target_gs):
+    if raw_loss_features is None or raw_loss_features.strip() == "":
+        configured_output_features = gin.query_parameter("GSFlowPredictor.output_features")
+        return parse_loss_features(
+            raw_loss_features,
+            _FeatureSpec(configured_output_features),
+            target_gs,
+            no_features_message="No Gaussian attributes selected for flow loss",
+        )
+    return parse_loss_features(
+        raw_loss_features,
+        _FeatureSpec([]),
+        target_gs,
+        no_features_message="No Gaussian attributes selected for flow loss",
+    )
 
 
 
@@ -402,9 +430,6 @@ def main(argv):
     mse_loss_cfg = feature_mse_loss()
     set_seed()
 
-    with open(os.path.join(FLAGS.output_dir, "config.gin"), "w") as f:
-        f.writelines(gin.operative_config_str())
-
     logger = ProcessSafeLogger(os.path.join(FLAGS.output_dir, "overfit.log")).get_logger()
     device = torch.device("cuda")
 
@@ -416,13 +441,18 @@ def main(argv):
 
     target_images, target_image_names, target_cameras = dataset.load_factor_views(target_factor_dict)
 
+    target_gs_raw = gpu_utils.move_to_device(target_factor_dict["gs_params"], device)
+    loss_features = resolve_loss_features(FLAGS.loss_features, target_gs_raw)
+    if FLAGS.model_features_from_loss:
+        with gin.unlock_config():
+            gin.bind_parameter("GSFlowPredictor.input_features", loss_features)
+            gin.bind_parameter("GSFlowPredictor.output_features", loss_features)
+
     model = GSFlowPredictor().to(device)
     if model.resume_ckpt is not None:
         model.load_state_dict(torch.load(model.resume_ckpt, map_location="cpu"))
     model.train()
 
-    target_gs_raw = gpu_utils.move_to_device(target_factor_dict["gs_params"], device)
-    loss_features = parse_loss_features(FLAGS.loss_features, model, target_gs_raw, no_features_message="No Gaussian attributes selected for flow loss")
     fixed_attribute_keys = select_fixed_attribute_keys(loss_features, target_gs_raw)
     requested_means_origin_scale = float(FLAGS.means_origin_scale)
     if requested_means_origin_scale <= 0.0:
@@ -472,6 +502,9 @@ def main(argv):
         optimizer = build_optimizer(model)
         scheduler = build_scheduler(optimizer)
 
+    with open(os.path.join(FLAGS.output_dir, "config.gin"), "w") as f:
+        f.writelines(gin.operative_config_str())
+
     total_steps = train_cfg["total_steps"]
     log_interval = train_cfg["log_interval"]
     log_image_interval = train_cfg["log_image_interval"]
@@ -493,6 +526,9 @@ def main(argv):
         f"input_factor={FLAGS.input_factor} target_factor={FLAGS.target_factor} "
         f"alignment={FLAGS.alignment} attribute_init={FLAGS.attribute_init} "
         f"loss_features={','.join(loss_features)} "
+        f"model_features_from_loss={FLAGS.model_features_from_loss} "
+        f"model_input_features={','.join(model.input_features)} "
+        f"model_output_features={','.join(model.output_features)} "
         f"eval_gt_attributes={','.join(fixed_attribute_keys) if fixed_attribute_keys else 'none'} "
         f"flow_steps={flow_cfg['flow_steps']} "
         f"flow_noise_std={flow_cfg['flow_noise_std']} "
