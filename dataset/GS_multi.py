@@ -12,6 +12,15 @@ from PIL import Image
 from utils.transform_utils import MinMaxScaler, remove_outliers
 
 
+EXPECTED_IMAGE_COUNT = 128
+FACTOR_TO_IMAGE_DIR = {
+    1: "images",
+    2: "images_2",
+    4: "images_4",
+}
+CAMERA_METADATA_NAME = "camera_for-3d-denoise.pkl"
+
+
 @gin.configurable
 class SplatFactoMultiLevelDataset(torch.utils.data.IterableDataset):
     def __init__(
@@ -27,12 +36,15 @@ class SplatFactoMultiLevelDataset(torch.utils.data.IterableDataset):
         split_across_gpus: bool,
         factors: list = [1, 2, 4],
         background_color: list = [0, 0, 0],
+        skip_invalid_scenes: bool = True,
     ):
         self.train_or_test = train_or_test
         self.image_per_scene = image_per_scene
         self.sample_ratio_test = sample_ratio_test
         self.factors = factors
         self.primary_factor = self.factors[0]
+        self.skip_invalid_scenes = skip_invalid_scenes
+        self.skipped_scenes = []
 
         if load_pose_src != "nerfstudio":
             raise ValueError(
@@ -102,9 +114,66 @@ class SplatFactoMultiLevelDataset(torch.utils.data.IterableDataset):
         return scene_map
 
     def _image_dir_for_factor(self, colmap_scene_root: str, factor: int) -> str:
-        if factor == 1:
-            return os.path.join(colmap_scene_root, "images")
-        return os.path.join(colmap_scene_root, f"images_{factor}")
+        image_dir_name = FACTOR_TO_IMAGE_DIR.get(factor, f"images_{factor}")
+        return os.path.join(colmap_scene_root, image_dir_name)
+
+    def _list_pngs(self, image_dir: str):
+        return sorted(
+            [
+                os.path.join(image_dir, name)
+                for name in os.listdir(image_dir)
+                if name.lower().endswith(".png")
+            ]
+        )
+
+    def _validate_scene_structure(self, scene_info):
+        scene_name = scene_info["scene_name"]
+        colmap_dir = scene_info["colmap_dir"]
+        if not os.path.isdir(colmap_dir):
+            return f"{scene_name}: missing_colmap_scene:{colmap_dir}"
+
+        factor_paths = scene_info["factor_paths"]
+        for factor in self.factors:
+            if factor not in FACTOR_TO_IMAGE_DIR:
+                return f"{scene_name}: unsupported_factor:{factor}"
+
+            paths = factor_paths[factor]
+            nerfstudio_dir = paths["nerfstudio_dir"]
+            image_dir = paths["image_dir"]
+            expected_image_dir = self._image_dir_for_factor(colmap_dir, factor)
+
+            if image_dir != expected_image_dir:
+                return (
+                    f"{scene_name}: factor={factor}: unexpected_image_dir: "
+                    f"got={image_dir} expected={expected_image_dir}"
+                )
+            if not os.path.isdir(nerfstudio_dir):
+                return f"{scene_name}: factor={factor}: missing_nerfstudio_dir:{nerfstudio_dir}"
+            if not os.path.isdir(image_dir):
+                return f"{scene_name}: factor={factor}: missing_image_dir:{image_dir}"
+
+            image_paths = self._list_pngs(image_dir)
+            if len(image_paths) != EXPECTED_IMAGE_COUNT:
+                return (
+                    f"{scene_name}: factor={factor}: bad_image_count: "
+                    f"got={len(image_paths)} expected={EXPECTED_IMAGE_COUNT} dir={image_dir}"
+                )
+
+            models_dir = os.path.join(nerfstudio_dir, "nerfstudio_models")
+            if not os.path.isdir(models_dir):
+                return f"{scene_name}: factor={factor}: missing_nerfstudio_models:{models_dir}"
+            if len(glob.glob(os.path.join(models_dir, "step-*.ckpt"))) == 0:
+                return f"{scene_name}: factor={factor}: missing_ckpt:{models_dir}"
+
+            camera_path = os.path.join(nerfstudio_dir, CAMERA_METADATA_NAME)
+            if not os.path.isfile(camera_path):
+                return f"{scene_name}: factor={factor}: missing_camera_metadata:{camera_path}"
+
+        return None
+
+    def _print_skip_summary(self, messages):
+        for message in messages:
+            print(f"[SplatFactoMultiLevelDataset] {message}")
 
     def _build_scene_pairs(self, nerfstudio_folder: str, colmap_folder: str):
         ns_roots = self._load_scene_roots(nerfstudio_folder, "nerfstudio")
@@ -114,55 +183,97 @@ class SplatFactoMultiLevelDataset(torch.utils.data.IterableDataset):
 
         ns_names = set(ns_map.keys())
         colmap_names = set(colmap_map.keys())
-        if ns_names != colmap_names:
-            missing_in_colmap = sorted(ns_names - colmap_names)
-            missing_in_nerfstudio = sorted(colmap_names - ns_names)
-            raise ValueError(
-                "Scene mismatch between nerfstudio and colmap folders. "
-                f"Missing in colmap: {missing_in_colmap[:10]}, "
-                f"missing in nerfstudio: {missing_in_nerfstudio[:10]}"
+        common_names = sorted(ns_names & colmap_names)
+        missing_in_colmap = sorted(ns_names - colmap_names)
+        missing_in_nerfstudio = sorted(colmap_names - ns_names)
+
+        messages = []
+        if missing_in_colmap:
+            preview = missing_in_colmap[:10]
+            message = f"skipping {len(missing_in_colmap)} scenes missing in colmap, e.g. {preview}"
+            if not self.skip_invalid_scenes:
+                raise ValueError(message)
+            self.skipped_scenes.extend(
+                {
+                    "scene_name": scene_name,
+                    "reason": "missing_in_colmap",
+                    "skip_reason": "missing_in_colmap",
+                    "exception_reason": None,
+                    "nerfstudio_dir": ns_map[scene_name],
+                    "colmap_dir": None,
+                }
+                for scene_name in missing_in_colmap
             )
+            messages.append(message)
+        if missing_in_nerfstudio:
+            preview = missing_in_nerfstudio[:10]
+            message = f"skipping {len(missing_in_nerfstudio)} scenes missing in nerfstudio, e.g. {preview}"
+            if not self.skip_invalid_scenes:
+                raise ValueError(message)
+            self.skipped_scenes.extend(
+                {
+                    "scene_name": scene_name,
+                    "reason": "missing_in_nerfstudio",
+                    "skip_reason": "missing_in_nerfstudio",
+                    "exception_reason": None,
+                    "nerfstudio_dir": None,
+                    "colmap_dir": colmap_map[scene_name],
+                }
+                for scene_name in missing_in_nerfstudio
+            )
+            messages.append(message)
 
         folders = []
-        for scene_name in sorted(ns_names):
+        invalid_messages = []
+        for scene_name in common_names:
             ns_scene_root = ns_map[scene_name]
             colmap_scene_root = colmap_map[scene_name]
             factor_paths = {}
-
             for factor in self.factors:
-                ns_factor_dir = os.path.join(ns_scene_root, f"df-{factor}", "splatfacto")
-                ns_models_dir = os.path.join(ns_factor_dir, "nerfstudio_models")
-                if not os.path.isdir(ns_factor_dir):
-                    raise FileNotFoundError(
-                        f"Missing nerfstudio folder for scene '{scene_name}', factor {factor}: {ns_factor_dir}"
-                    )
-                if not os.path.isdir(ns_models_dir):
-                    raise FileNotFoundError(
-                        f"Missing nerfstudio_models for scene '{scene_name}', factor {factor}: {ns_models_dir}"
-                    )
-
-                image_dir = self._image_dir_for_factor(colmap_scene_root, factor)
-                if not os.path.isdir(image_dir):
-                    raise FileNotFoundError(
-                        f"Missing image folder for scene '{scene_name}', factor {factor}: {image_dir}"
-                    )
-
                 factor_paths[factor] = {
-                    "nerfstudio_dir": ns_factor_dir,
-                    "image_dir": image_dir,
+                    "nerfstudio_dir": os.path.join(ns_scene_root, f"df-{factor}", "splatfacto"),
+                    "image_dir": self._image_dir_for_factor(colmap_scene_root, factor),
                 }
 
-            folders.append(
-                {
-                    "scene_name": scene_name,
-                    "colmap_dir": colmap_scene_root,
-                    "factor_paths": factor_paths,
-                }
+            scene_info = {
+                "scene_name": scene_name,
+                "colmap_dir": colmap_scene_root,
+                "factor_paths": factor_paths,
+            }
+            problem = self._validate_scene_structure(scene_info)
+            if problem is not None:
+                if not self.skip_invalid_scenes:
+                    raise ValueError(problem)
+                invalid_messages.append(problem)
+                self.skipped_scenes.append(
+                    {
+                        "scene_name": scene_name,
+                        "reason": problem,
+                        "skip_reason": problem,
+                        "exception_reason": None,
+                        "nerfstudio_dir": ns_scene_root,
+                        "colmap_dir": colmap_scene_root,
+                    }
+                )
+                continue
+
+            folders.append(scene_info)
+
+        if invalid_messages:
+            preview = invalid_messages[:20]
+            messages.append(
+                f"skipping {len(invalid_messages)} structurally invalid scenes:\n"
+                + "\n".join(preview)
             )
+            if len(invalid_messages) > 20:
+                messages.append(f"... and {len(invalid_messages) - 20} more invalid scenes")
 
         if len(folders) == 0:
-            raise ValueError("No scenes found for SplatFactoMultiLevelDataset")
+            details = "\n".join(messages) if messages else "No shared valid scenes found."
+            raise ValueError(f"No scenes found for SplatFactoMultiLevelDataset.\n{details}")
 
+        messages.append(f"using {len(folders)} shared valid scenes")
+        self._print_skip_summary(messages)
         return folders
     # ----------------------------------------------------------------------------
 
@@ -243,14 +354,24 @@ class SplatFactoMultiLevelDataset(torch.utils.data.IterableDataset):
         if gin.query_parameter("training.pretrain_steps") > 0:
             skip_params = skip_params + gin.query_parameter("create_pseudo_target.take_from_input")
 
-        ckpt_list = glob.glob(nerfstudio_dir + "/nerfstudio_models/step-*.ckpt")
+        ckpt_list = sorted(
+            glob.glob(nerfstudio_dir + "/nerfstudio_models/step-*.ckpt"),
+            key=lambda path: int(os.path.splitext(os.path.basename(path))[0].split("-")[-1]),
+        )
         if len(ckpt_list) == 0:
             raise FileNotFoundError(
                 f"{nerfstudio_dir} does not have nerfstudio_models/step-*.ckpt"
             )
         ckpt_file = ckpt_list[-1]
 
-        ckpt = torch.load(ckpt_file, map_location="cpu")
+        try:
+            ckpt = torch.load(ckpt_file, map_location="cpu")
+        except Exception as exc:
+            scene_name = self.folders[idx]["scene_name"] if idx < len(self.folders) else str(idx)
+            raise RuntimeError(
+                f"Failed to load GS checkpoint for scene_idx={idx} "
+                f"scene_name={scene_name} ckpt_file={ckpt_file}"
+            ) from exc
         ckpt = {k.replace("_model.gauss_params.", ""): v for k, v in ckpt.items() if "gauss_params" in k}
         gs_params = {k: ckpt[k] for k in set(skip_params)}
 

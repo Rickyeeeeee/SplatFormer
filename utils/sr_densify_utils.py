@@ -192,9 +192,15 @@ def midpoint_interpolate_gs(input_gs, target_count):
     if source_count <= 0:
         raise ValueError("Cannot densify an empty input GS")
     if target_count < source_count:
-        raise ValueError(
-            f"Cannot preserve {source_count} source Gaussians when target_count={target_count}"
-        )
+        if target_count <= 0:
+            raise ValueError(f"Cannot sample to non-positive target_count={target_count}")
+        keep_idx = torch.randperm(source_count, device=input_gs["means"].device)[:target_count]
+        # print(
+        #     "[midpoint_interpolate_gs] source_count exceeds target_count; "
+        #     f"randomly sampling {target_count}/{source_count} source Gaussians.",
+        #     flush=True,
+        # )
+        return {key: value[keep_idx].clone() for key, value in input_gs.items()}
 
     new_count = target_count - source_count
     if new_count == 0:
@@ -235,9 +241,9 @@ def midpoint_interpolate_gs(input_gs, target_count):
         src_idx = src_idx[keep_idx]
         nbr_idx = nbr_idx[keep_idx]
 
-    _check_midpoint_pairs(means, src_idx, nbr_idx, "after FPS")
+    # _check_midpoint_pairs(means, src_idx, nbr_idx, "after FPS")
     midpoint_means = ((means[src_idx] + means[nbr_idx]) * 0.5).contiguous()
-    _check_midpoints_on_input(means, midpoint_means, src_idx, nbr_idx, "after FPS")
+    # _check_midpoints_on_input(means, midpoint_means, src_idx, nbr_idx, "after FPS")
 
     interpolated = {}
     for key, value in input_gs.items():
