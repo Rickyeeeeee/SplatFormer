@@ -11,6 +11,13 @@ ATTRIBUTE_INIT=${6:-${ATTRIBUTE_INIT:-aligned}}
 INPUT_FACTOR=${7:-${INPUT_FACTOR:-4}}
 TARGET_FACTOR=${8:-${TARGET_FACTOR:-2}}
 MEANS_SOURCE=${9:-${MEANS_SOURCE:-gt}}
+case "${MEANS_SOURCE}" in
+    gt|predicted|splatformer) ;;
+    *)
+        echo "Unsupported MEANS_SOURCE='${MEANS_SOURCE}'. Expected gt, predicted, or splatformer." >&2
+        exit 1
+        ;;
+esac
 
 TRAIN_NS_ROOT=${TRAIN_NS_ROOT:-/project2/ricky/splatformer-data/train-set-512/objaverse/nerfstudio}
 TRAIN_COLMAP_ROOT=${TRAIN_COLMAP_ROOT:-/project2/ricky/splatformer-data/train-set-512/objaverse/colmap}

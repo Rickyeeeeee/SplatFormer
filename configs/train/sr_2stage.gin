@@ -36,7 +36,7 @@ SplatFactoMultiLevelDataset.load_pose_src = 'nerfstudio'
 train_dataset/SplatFactoMultiLevelDataset.train_or_test = 'train'
 train_dataset/SplatFactoMultiLevelDataset.nerfstudio_folder = '/project/ricky/splatformer-data/train-set-512/objaverse/nerfstudio'
 train_dataset/SplatFactoMultiLevelDataset.colmap_folder = '/project/ricky/splatformer-data/train-set-512/objaverse/colmap'
-train_dataset/SplatFactoMultiLevelDataset.image_per_scene = 32
+train_dataset/SplatFactoMultiLevelDataset.image_per_scene = 16
 train_dataset/SplatFactoMultiLevelDataset.split_across_gpus = False
 train_dataset/SplatFactoMultiLevelDataset.factors = [2, 4]
 

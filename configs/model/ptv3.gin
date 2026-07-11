@@ -10,11 +10,11 @@ FeaturePredictor.input_features = ['means','scales', 'opacities', 'quats', 'feat
 FeaturePredictor.output_features = ['means','scales', 'opacities', 'quats', 'features_dc', 'features_rest']
 FeaturePredictor.output_head_width = 256
 FeaturePredictor.zeroinit = True
-FeaturePredictor.quat_residual_mode = "mul" #[add, mul]
+FeaturePredictor.quat_residual_mode = "add" #[add, mul]
  
 
 FeaturePredictor.res_feature_activation = {
-    "means":  @Identity(),    # "means":  @Tanh(),
+    "means":  @Tanh(),
     "features_dc": @Identity(),
     "features_rest": @Identity(),
     "scales": @Identity(),

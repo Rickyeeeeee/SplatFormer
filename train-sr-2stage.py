@@ -15,7 +15,7 @@ except ImportError:
     wandb = None
 
 from dataset.GS_multi import SplatFactoMultiLevelDataset
-from models.feature_predictor import FeaturePredictor
+from models.feature_predictor import ALL_FEATURES, FeaturePredictor
 from utils import gpu_utils, gs_utils, loss_utils
 from utils.gpu_utils import seed_everything
 from utils.log_utils import ProcessSafeLogger
@@ -38,8 +38,8 @@ flags.DEFINE_integer("target_factor", 2, "High-resolution GS/image factor used a
 flags.DEFINE_enum(
     "means_source",
     "gt",
-    ["gt", "predicted"],
-    "Source for stage-2 input means: GT target means or residual output from a means predictor.",
+    ["gt", "predicted", "splatformer"],
+    "Source/model path: GT target means, residual means predictor, or direct full-feature SplatFormer.",
 )
 flags.DEFINE_enum("alignment", "emd", ["emd", "nearest"], "Interpolated-to-target alignment method")
 flags.DEFINE_enum(
@@ -58,6 +58,7 @@ FLAGS = flags.FLAGS
 WANDB_EVAL_IMAGE_SCENE = "3e288ee8aced4a0797e66d53536112b1"
 MEANS_FEATURES = ["means"]
 ATTRIBUTE_FEATURES = ["features_dc", "features_rest", "opacities", "scales", "quats"]
+FULL_FEATURES = list(ALL_FEATURES)
 
 
 @gin.configurable
@@ -216,8 +217,10 @@ def _replace_means(gs, means):
     return out_gs
 
 
-def _bind_feature_predictor(output_features, output_features_type="res"):
+def _bind_feature_predictor(output_features, output_features_type="res", input_features=None):
     with gin.unlock_config():
+        if input_features is not None:
+            gin.bind_parameter("FeaturePredictor.input_features", list(input_features))
         gin.bind_parameter("FeaturePredictor.output_features", list(output_features))
         gin.bind_parameter("FeaturePredictor.output_features_type", output_features_type)
 
@@ -234,8 +237,8 @@ def _load_resume_checkpoint(model, checkpoint_key, logger):
     logger.info(f"Loaded {checkpoint_key} checkpoint from {model.resume_ckpt}")
 
 
-def _build_feature_predictor(output_features, device, logger, checkpoint_key):
-    _bind_feature_predictor(output_features, output_features_type="res")
+def _build_feature_predictor(output_features, device, logger, checkpoint_key, input_features=None):
+    _bind_feature_predictor(output_features, output_features_type="res", input_features=input_features)
     model = FeaturePredictor().to(device)
     _load_resume_checkpoint(model, checkpoint_key, logger)
     return model
@@ -248,6 +251,8 @@ def _stage2_input_gs(input_gs, target_gs, means_model, means_source, scene_idx):
         if means_model is None:
             raise ValueError("means_model is required when --means_source=predicted")
         return means_model(batch_normalized_gs=[input_gs], batch_scene_idx=[scene_idx])[0]
+    if means_source == "splatformer":
+        return input_gs
     raise ValueError(f"Unsupported means_source={means_source}")
 
 
@@ -594,6 +599,7 @@ def evaluate_dataset(
     os.makedirs(output_dir, exist_ok=True)
     all_metrics = []
     all_metrics_input = []
+    scene_average_metrics = []
     eval_skipped_scenes = []
     _write_skipped_scenes(output_dir, {"test": dataset}, eval_skipped_scenes)
     logger = ProcessSafeLogger(os.path.join(output_dir, "eval.log")).get_logger()
@@ -663,6 +669,14 @@ def evaluate_dataset(
         all_metrics.append(metrics)
         if compare_with_input:
             all_metrics_input.append(metrics_input)
+        scene_average_metrics.append(
+            {
+                "scene_idx": scene["idx"],
+                "scene_name": scene["scene_name"],
+                "output_gs": metrics,
+                "input_gs": metrics_input if compare_with_input else None,
+            }
+        )
         logger.info(
             f"Scene {scene['scene_name']}: "
             + " ".join([f"{key}: {value:.4f}" for key, value in metrics.items()])
@@ -679,6 +693,9 @@ def evaluate_dataset(
         metric_keys = all_metrics_input[0].keys()
         for key in metric_keys:
             reduced_metrics_input[key] = float(np.mean([metrics[key] for metrics in all_metrics_input]))
+
+    with open(os.path.join(output_dir, "scene_average_metrics.json"), "w") as f:
+        json.dump(scene_average_metrics, f, indent=2)
 
     with open(os.path.join(output_dir, "metrics.json"), "w") as f:
         json.dump(reduced_metrics, f, indent=2)
@@ -713,7 +730,16 @@ def main(argv):
     means_model = None
     if FLAGS.means_source == "predicted":
         means_model = _build_feature_predictor(MEANS_FEATURES, device, logger, "means_model")
-    attribute_model = _build_feature_predictor(ATTRIBUTE_FEATURES, device, logger, "attribute_model")
+    if FLAGS.means_source == "splatformer":
+        attribute_model = _build_feature_predictor(
+            FULL_FEATURES,
+            device,
+            logger,
+            "attribute_model",
+            input_features=FULL_FEATURES,
+        )
+    else:
+        attribute_model = _build_feature_predictor(ATTRIBUTE_FEATURES, device, logger, "attribute_model")
 
     if FLAGS.only_eval:
         _models_eval(attribute_model, means_model)

@@ -229,6 +229,8 @@ class FeaturePredictor(nn.Module):
                             out_normalized_gs[feature] = torch.nn.functional.normalize(
                                 _quat_multiply(delta_quat, input_quat), dim=-1
                             )
+                        elif feature == 'means':
+                            out_normalized_gs[feature] = in_gs[feature] + 0.015 * feature_res
                         else:
                             out_normalized_gs[feature] = in_gs[feature] + feature_res #Residual
                 out_batch_normalized_gs.append(out_normalized_gs)

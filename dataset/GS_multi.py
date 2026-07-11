@@ -21,6 +21,12 @@ FACTOR_TO_IMAGE_DIR = {
 CAMERA_METADATA_NAME = "camera_for-3d-denoise.pkl"
 
 
+class _GSCheckpointLoadError(RuntimeError):
+    def __init__(self, message, nerfstudio_dir):
+        super().__init__(message)
+        self.nerfstudio_dir = nerfstudio_dir
+
+
 @gin.configurable
 class SplatFactoMultiLevelDataset(torch.utils.data.IterableDataset):
     def __init__(
@@ -37,6 +43,8 @@ class SplatFactoMultiLevelDataset(torch.utils.data.IterableDataset):
         factors: list = [1, 2, 4],
         background_color: list = [0, 0, 0],
         skip_invalid_scenes: bool = True,
+        cache_steps: Optional[int] = None,
+        cache_num_scenes: Optional[int] = None,
     ):
         self.train_or_test = train_or_test
         self.image_per_scene = image_per_scene
@@ -45,6 +53,7 @@ class SplatFactoMultiLevelDataset(torch.utils.data.IterableDataset):
         self.primary_factor = self.factors[0]
         self.skip_invalid_scenes = skip_invalid_scenes
         self.skipped_scenes = []
+        self._runtime_skipped_scene_indices = set()
 
         if load_pose_src != "nerfstudio":
             raise ValueError(
@@ -58,6 +67,8 @@ class SplatFactoMultiLevelDataset(torch.utils.data.IterableDataset):
         self.remove_outlier_ndevs = remove_outlier_ndevs
         # Accepted for existing gin configs; scenes are loaded directly each iteration.
         self.split_across_gpus = split_across_gpus
+        self.cache_steps = cache_steps
+        self.cache_num_scenes = cache_num_scenes
         self.max_gs_num = max_gs_num
         self.background_color = background_color
 
@@ -283,6 +294,9 @@ class SplatFactoMultiLevelDataset(torch.utils.data.IterableDataset):
         else:
             self.remaining_scenes = self.get_thisworker_split(N=len(self.folders))
             random.shuffle(self.remaining_scenes)
+        self.remaining_scenes = [
+            idx for idx in self.remaining_scenes if idx not in self._runtime_skipped_scene_indices
+        ]
         self.counter += 1
         return
 
@@ -368,9 +382,10 @@ class SplatFactoMultiLevelDataset(torch.utils.data.IterableDataset):
             ckpt = torch.load(ckpt_file, map_location="cpu")
         except Exception as exc:
             scene_name = self.folders[idx]["scene_name"] if idx < len(self.folders) else str(idx)
-            raise RuntimeError(
+            raise _GSCheckpointLoadError(
                 f"Failed to load GS checkpoint for scene_idx={idx} "
-                f"scene_name={scene_name} ckpt_file={ckpt_file}"
+                f"scene_name={scene_name} ckpt_file={ckpt_file}",
+                nerfstudio_dir,
             ) from exc
         ckpt = {k.replace("_model.gauss_params.", ""): v for k, v in ckpt.items() if "gauss_params" in k}
         gs_params = {k: ckpt[k] for k in set(skip_params)}
@@ -559,6 +574,33 @@ class SplatFactoMultiLevelDataset(torch.utils.data.IterableDataset):
         }
 
 
+    def _skip_checkpoint_load_failure(self, scene_idx, exc):
+        self._runtime_skipped_scene_indices.add(scene_idx)
+        self.remaining_scenes = [idx for idx in self.remaining_scenes if idx != scene_idx]
+
+        cause = exc.__cause__
+        exception_reason = (
+            f"{type(cause).__name__}: {cause}" if cause is not None else "unknown"
+        )
+        scene_info = self.folders[scene_idx]
+        skip_reason = "checkpoint_load_error"
+        self.skipped_scenes.append(
+            {
+                "scene_name": scene_info["scene_name"],
+                "reason": skip_reason,
+                "skip_reason": skip_reason,
+                "exception_reason": exception_reason,
+                "nerfstudio_dir": exc.nerfstudio_dir,
+                "colmap_dir": scene_info["colmap_dir"],
+            }
+        )
+        print(
+            f"[SplatFactoMultiLevelDataset] skipping scene_idx={scene_idx} "
+            f"scene_name={scene_info['scene_name']}: {exc}; cause={exception_reason}",
+            flush=True,
+        )
+
+
     def __iter__(self):
         if self.train_or_test == "train":
             self.refresh_remaining_training()
@@ -567,7 +609,11 @@ class SplatFactoMultiLevelDataset(torch.utils.data.IterableDataset):
             scene_idx = self.remaining_scenes.pop(0)
             if self.train_or_test == "train" and len(self.remaining_scenes) == 0:
                 self.refresh_remaining_training()
-            scene = self.load_scene(scene_idx)
+            try:
+                scene = self.load_scene(scene_idx)
+            except _GSCheckpointLoadError as exc:
+                self._skip_checkpoint_load_failure(scene_idx, exc)
+                continue
             factor_data = scene["factor_data"]
             primary_entry = factor_data[self.primary_factor]
             total_num = len(primary_entry["meta"]["camera_to_worlds"])
