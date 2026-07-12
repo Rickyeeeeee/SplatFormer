@@ -10,11 +10,11 @@ ALIGNMENT=${5:-${ALIGNMENT:-emd}}
 ATTRIBUTE_INIT=${6:-${ATTRIBUTE_INIT:-aligned}}
 INPUT_FACTOR=${7:-${INPUT_FACTOR:-4}}
 TARGET_FACTOR=${8:-${TARGET_FACTOR:-2}}
-MEANS_SOURCE=${9:-${MEANS_SOURCE:-gt}}
+MEANS_SOURCE=${9:-${MEANS_SOURCE:-high_res}}
 case "${MEANS_SOURCE}" in
-    gt|predicted|splatformer) ;;
+    high_res|low_res|predicted|splatformer) ;;
     *)
-        echo "Unsupported MEANS_SOURCE='${MEANS_SOURCE}'. Expected gt, predicted, or splatformer." >&2
+        echo "Unsupported MEANS_SOURCE='${MEANS_SOURCE}'. Expected high_res, low_res, predicted, or splatformer." >&2
         exit 1
         ;;
 esac

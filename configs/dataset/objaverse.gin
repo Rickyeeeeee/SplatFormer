@@ -1,7 +1,7 @@
 SplatfactoDataset.remove_outlier_ndevs=-1
 SplatfactoDataset.image_per_scene = None # Only used for train_dataset
 SplatfactoDataset.sample_ratio_test = None # Only used for train_dataset
-SplatfactoDataset.max_gs_num = 100000
+SplatfactoDataset.max_gs_num = 1000000
 SplatfactoDataset.load_pose_src = 'nerfstudio'
 
 collate_fn = @GS_collate_fn

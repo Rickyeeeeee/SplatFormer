@@ -30,16 +30,16 @@ train2D/build_scheduler.schedule = 'constant'
 SplatFactoMultiLevelDataset.remove_outlier_ndevs = -1
 SplatFactoMultiLevelDataset.image_per_scene = None
 SplatFactoMultiLevelDataset.sample_ratio_test = None
-SplatFactoMultiLevelDataset.max_gs_num = 100000
+SplatFactoMultiLevelDataset.max_gs_num = 1000000
 SplatFactoMultiLevelDataset.load_pose_src = 'nerfstudio'
 
 train_dataset/SplatFactoMultiLevelDataset.train_or_test = 'train'
 train_dataset/SplatFactoMultiLevelDataset.nerfstudio_folder = '/project/ricky/splatformer-data/train-set-512/objaverse/nerfstudio'
 train_dataset/SplatFactoMultiLevelDataset.colmap_folder = '/project/ricky/splatformer-data/train-set-512/objaverse/colmap'
-train_dataset/SplatFactoMultiLevelDataset.image_per_scene = 32
+train_dataset/SplatFactoMultiLevelDataset.image_per_scene = 16
 train_dataset/SplatFactoMultiLevelDataset.cache_steps = 1
 train_dataset/SplatFactoMultiLevelDataset.cache_num_scenes = 1
-train_dataset/SplatFactoMultiLevelDataset.split_across_gpus = False
+train_dataset/SplatFactoMultiLevelDataset.split_across_gpus = True
 train_dataset/SplatFactoMultiLevelDataset.factors = [1, 4]
 
 test_dataset/SplatFactoMultiLevelDataset.train_or_test = 'test'

@@ -76,10 +76,10 @@ class SplatFactoMultiLevelDataset(torch.utils.data.IterableDataset):
             # For test set, we need to split data across device deterministically
             self.remaining_scenes = list(range(len(self.folders)))
             # For DDP evaluation, we need to chunk the data
-            try:
-                world_size = torch.cuda.device_count()
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                world_size = torch.distributed.get_world_size()
                 rank = torch.distributed.get_rank()
-            except Exception:
+            else:
                 world_size, rank = 1, 0
             chunk_size = len(self.remaining_scenes) // world_size
             if rank == world_size - 1:
@@ -313,18 +313,15 @@ class SplatFactoMultiLevelDataset(torch.utils.data.IterableDataset):
 
     def random_split_to_remaining(self):
         """Generate a new permutation of the folders."""
-        np.random.seed(torch.distributed.get_rank())
-        torch.manual_seed(torch.distributed.get_rank())
-        rng_state = np.random.get_state()
-        world_size = torch.cuda.device_count()
-        rank = torch.distributed.get_rank()
-        np.random.seed(self.counter)
-
-        permutation = np.random.permutation(len(self.folders))
-        pad_num = world_size - len(self.folders) % world_size
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            world_size = torch.distributed.get_world_size()
+            rank = torch.distributed.get_rank()
+        else:
+            world_size, rank = 1, 0
+        permutation = np.random.RandomState(self.counter).permutation(len(self.folders))
+        pad_num = (world_size - len(self.folders) % world_size) % world_size
         if pad_num > 0 and world_size > 1:
             permutation = np.concatenate([permutation, permutation[:pad_num]])
-        np.random.set_state(rng_state)
 
         chunk_size = len(permutation) // world_size
         if rank == world_size - 1:

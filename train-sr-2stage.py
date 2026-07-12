@@ -21,7 +21,7 @@ from utils.gpu_utils import seed_everything
 from utils.log_utils import ProcessSafeLogger
 from utils.metrics import MetricComputer, psnr
 from utils.optimizers import build_optimizer, build_scheduler
-from utils.sr_densify_utils import build_densified_input_gs
+from utils.sr_densify_utils import build_densified_input_gs, convert_gs_to_target_frame
 
 
 flags.DEFINE_string("output_dir", "output_sr_2stage", "Output directory")
@@ -33,13 +33,14 @@ flags.DEFINE_boolean("use_wandb", True, "Log training and evaluation metrics to 
 flags.DEFINE_string("wandb_project", "3dgs-super-resolution", "Weights & Biases project")
 flags.DEFINE_string("wandb_dir", None, "Weights & Biases output directory")
 flags.DEFINE_string("wandb_name", None, "Weights & Biases run name")
-flags.DEFINE_integer("input_factor", 4, "Low-resolution GS factor used as densification source")
+flags.DEFINE_integer("input_factor", 4, "Low-resolution GS factor used as the model-input source")
 flags.DEFINE_integer("target_factor", 2, "High-resolution GS/image factor used as training target")
 flags.DEFINE_enum(
     "means_source",
-    "gt",
-    ["gt", "predicted", "splatformer"],
-    "Source/model path: GT target means, residual means predictor, or direct full-feature SplatFormer.",
+    "high_res",
+    ["high_res", "low_res", "predicted", "splatformer"],
+    "Source/model path: high-res target means, unchanged low-res means, residual means predictor, "
+    "or direct full-feature SplatFormer.",
 )
 flags.DEFINE_enum("alignment", "emd", ["emd", "nearest", "none"], "Interpolated-to-target alignment method")
 flags.DEFINE_enum(
@@ -184,7 +185,14 @@ def _next_train_batch(train_iter, train_dataset):
         return train_iter, next(train_iter)
 
 
-def _densify_input(input_factor_entry, target_factor_entry, device):
+def _prepare_model_input(input_factor_entry, target_factor_entry, device):
+    if FLAGS.means_source == "low_res":
+        input_gs = gpu_utils.move_to_device(input_factor_entry["gs_params"], device)
+        return convert_gs_to_target_frame(
+            input_gs,
+            input_factor_entry["scaler"],
+            target_factor_entry["scaler"],
+        )
     return build_densified_input_gs(
         input_factor_dict=input_factor_entry,
         target_factor_dict=target_factor_entry,
@@ -245,8 +253,10 @@ def _build_feature_predictor(output_features, device, logger, checkpoint_key, in
 
 
 def _stage2_input_gs(input_gs, target_gs, means_model, means_source, scene_idx):
-    if means_source == "gt":
+    if means_source == "high_res":
         return _replace_means(input_gs, target_gs["means"])
+    if means_source == "low_res":
+        return input_gs
     if means_source == "predicted":
         if means_model is None:
             raise ValueError("means_model is required when --means_source=predicted")
@@ -382,7 +392,7 @@ def evaluate_single_scene(
     target_gs_for_means=None,
     low_res_gt_gs=None,
     evaluate_baselines=False,
-    means_source="gt",
+    means_source="high_res",
     means_model=None,
 ):
     if target_gs_for_means is None:
@@ -657,13 +667,18 @@ def evaluate_dataset(
 
             target_gs = gpu_utils.move_to_device(target_factor_entry["gs_params"], device)
             _print_densify_scene_context(
-                "eval_densify",
+                "eval_input",
                 scene["idx"],
                 scene["scene_name"],
                 input_factor_entry,
                 target_factor_entry,
             )
-            input_gs = _densify_input(input_factor_entry, target_factor_entry, device)
+            input_gs = _prepare_model_input(input_factor_entry, target_factor_entry, device)
+            low_res_gt_gs = convert_gs_to_target_frame(
+                gpu_utils.move_to_device(input_factor_entry["gs_params"], device),
+                input_factor_entry["scaler"],
+                target_factor_entry["scaler"],
+            )
 
             scene_output_dir = os.path.join(output_dir, scene["scene_name"])
             metrics, metrics_input, metrics_gt_low_res, metrics_gt_high_res = evaluate_single_scene(
@@ -683,7 +698,7 @@ def evaluate_dataset(
                 output_gt=output_gt,
                 wandb_step=wandb_step,
                 target_gs_for_means=target_gs,
-                low_res_gt_gs=input_factor_entry["gs_params"],
+                low_res_gt_gs=low_res_gt_gs,
                 evaluate_baselines=evaluate_baselines,
                 means_source=FLAGS.means_source,
             )
@@ -811,7 +826,7 @@ def main(argv):
     means_model = None
     if FLAGS.means_source == "predicted":
         means_model = _build_feature_predictor(MEANS_FEATURES, device, logger, "means_model")
-    if FLAGS.means_source == "splatformer":
+    if FLAGS.means_source in ["splatformer", "low_res"]:
         attribute_model = _build_feature_predictor(
             FULL_FEATURES,
             device,
@@ -894,7 +909,7 @@ def main(argv):
             #     input_factor_entry,
             #     target_factor_entry,
             # )
-            densified_input_gs = _densify_input(input_factor_entry, target_factor_entry, device)
+            model_input_gs = _prepare_model_input(input_factor_entry, target_factor_entry, device)
             batch_scene_idx = [batch["scene_idx"]]
             batch_cameras = gpu_utils.move_to_device(target_factor_entry["cameras"], device)
             batch_images = gpu_utils.move_to_device(target_factor_entry["images"], device)
@@ -902,7 +917,7 @@ def main(argv):
             with torch.cuda.amp.autocast(enabled=enable_amp):
                 out_gs = _forward_two_stage(
                     attribute_model=attribute_model,
-                    input_gs=densified_input_gs,
+                    input_gs=model_input_gs,
                     scene_idx=batch_scene_idx[0],
                     target_gs=target_gs,
                     means_source=FLAGS.means_source,
@@ -963,12 +978,14 @@ def main(argv):
                     "train/attr_lr": attribute_optimizer.param_groups[0]["lr"],
                     "train/scene_idx": batch["scene_idx"],
                     "train/input_gaussians": input_factor_entry["gs_params"]["means"].shape[0],
-                    "train/densified_gaussians": densified_input_gs["means"].shape[0],
+                    "train/model_input_gaussians": model_input_gs["means"].shape[0],
                     "train/target_gaussians": target_factor_entry["gs_params"]["means"].shape[0],
                     "train/views": len(batch_images),
                 }
                 if means_model is not None:
                     train_log["train/means_lr"] = means_optimizer.param_groups[0]["lr"]
+                if FLAGS.means_source != "low_res":
+                    train_log["train/densified_gaussians"] = model_input_gs["means"].shape[0]
                 _wandb_log(train_log, step=step)
 
                 log_msg = (
@@ -986,7 +1003,7 @@ def main(argv):
                 with torch.no_grad():
                     log_out_gs = _forward_two_stage(
                         attribute_model=attribute_model,
-                        input_gs=densified_input_gs,
+                        input_gs=model_input_gs,
                         scene_idx=batch_scene_idx[0],
                         target_gs=target_gs,
                         means_source=FLAGS.means_source,

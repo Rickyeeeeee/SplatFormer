@@ -1,7 +1,9 @@
 #!/bin/bash
 set -euo pipefail
 
-GPU_ID=${GPU_ID:-8}
+NGPUS=${NGPUS:-8}
+GPU_IDS=${GPU_IDS:-}
+MASTER_PORT=${MASTER_PORT:-29518}
 total_steps=${1:-20000}
 save_interval=${2:-1000}
 eval_interval=${3:-1000}
@@ -16,7 +18,12 @@ TRAIN_COLMAP_ROOT=${TRAIN_COLMAP_ROOT:-/project2/ricky/splatformer-data/train-se
 TEST_NS_ROOT=${TEST_NS_ROOT:-/project/ricky/splatformer-data/test-set-512/objaverse/nerfstudio}
 TEST_COLMAP_ROOT=${TEST_COLMAP_ROOT:-/project/ricky/splatformer-data/test-set-512/objaverse/colmap}
 
-CUDA_VISIBLE_DEVICES=${GPU_ID} python train-sr.py \
+if [[ -n "${GPU_IDS}" ]]; then
+    export CUDA_VISIBLE_DEVICES="${GPU_IDS}"
+fi
+
+torchrun --nnodes=1 --nproc_per_node="${NGPUS}" --rdzv-endpoint="localhost:${MASTER_PORT}" \
+    train-sr.py \
     --output_dir="${OUTPUT_DIR}" \
     --min_train_splats_per_factor="${MIN_TRAIN_SPLATS}" \
     --input_factor="${input_factor}" \

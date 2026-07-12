@@ -6,7 +6,9 @@ import cv2
 import gin
 import numpy as np
 import torch
+import torch.distributed as dist
 from absl import app, flags
+from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
 
 try:
@@ -21,6 +23,7 @@ from utils.gpu_utils import seed_everything
 from utils.log_utils import ProcessSafeLogger
 from utils.metrics import MetricComputer, psnr
 from utils.optimizers import build_optimizer, build_scheduler
+from utils.sr_densify_utils import convert_gs_to_target_frame
 
 
 flags.DEFINE_string("output_dir", "output_sr", "Output directory")
@@ -49,8 +52,16 @@ WANDB_EVAL_IMAGE_SCENE = "3e288ee8aced4a0797e66d53536112b1"
 
 
 @gin.configurable
-def set_seed(seed):
-    seed_everything(seed)
+def set_seed(seed, rank=0):
+    seed_everything(seed + rank)
+
+
+def _reduce_mean(value):
+    reduced = value.detach().clone()
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(reduced, op=dist.ReduceOp.SUM)
+        reduced /= dist.get_world_size()
+    return reduced
 
 
 @gin.configurable
@@ -98,22 +109,20 @@ def _to_cpu(data):
     return data
 
 
-def _default_wandb_name(output_dir):
-    output_dir = output_dir.rstrip("/")
-    parts = Path(output_dir).parts
-    return "/".join(parts[-2:]) if len(parts) >= 2 else output_dir
-
-
 def _init_wandb(output_dir):
-    if not FLAGS.use_wandb:
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+    if not FLAGS.use_wandb or rank != 0:
         return None
     if wandb is None:
         raise ImportError("wandb is not installed. Install it or run without --use_wandb.")
 
+    output_dir_parts = Path(output_dir.rstrip("/")).parts
     return wandb.init(
         project=FLAGS.wandb_project,
         dir=FLAGS.wandb_dir,
-        name=FLAGS.wandb_name or _default_wandb_name(output_dir),
+        name=FLAGS.wandb_name or (
+            "/".join(output_dir_parts[-2:]) if len(output_dir_parts) >= 2 else output_dir
+        ),
         config={
             "output_dir": output_dir,
             "eval_subdir": FLAGS.eval_subdir,
@@ -126,12 +135,6 @@ def _init_wandb(output_dir):
             "gin_config": gin.operative_config_str(),
         },
     )
-
-
-def _wandb_log(data, step=None):
-    if wandb is not None and wandb.run is not None:
-        wandb.log(data, step=step)
-
 
 def _build_dataset(scope):
     with gin.config_scope(scope):
@@ -174,14 +177,6 @@ def _write_skipped_scenes(output_dir, datasets_by_split, extra_skipped_scenes=No
     return skipped_scenes
 
 
-def _next_train_batch(train_iter, train_dataset):
-    try:
-        return train_iter, next(train_iter)
-    except StopIteration:
-        train_iter = iter(train_dataset)
-        return train_iter, next(train_iter)
-
-
 def _compute_render_loss(pred_imgs, batch_images, lpips_loss_func, image_l1_loss_weight, lpips_loss_weight):
     image_l1 = 0
     lpips_loss = 0
@@ -215,10 +210,6 @@ def _image_png_name(image_names, image_id):
         if stem:
             return f"{stem}.png"
     return f"{image_id:04d}.png"
-
-
-def _metric_counts(metric_computer):
-    return {metric: len(values) for metric, values in metric_computer.results.items()}
 
 
 def _append_image_metric_records(records, metric_computer, previous_counts, start, image_names):
@@ -261,11 +252,12 @@ def evaluate_single_scene(
     wandb_step=None,
 ):
     model.eval()
+    model_module = model.module if isinstance(model, DDP) else model
     metric_computer = MetricComputer()
     metric_computer_input = MetricComputer() if evaluate_baselines else None
     metric_computer_gt_low_res = MetricComputer() if evaluate_baselines else None
     metric_computer_gt_high_res = MetricComputer() if evaluate_baselines else None
-    predicted_keys = list(getattr(model, "output_features", []))
+    predicted_keys = list(getattr(model_module, "output_features", []))
 
     device = next(model.parameters()).device
     num_views = len(eval_images)
@@ -340,7 +332,9 @@ def evaluate_single_scene(
                 if output_gt:
                     gt_preview.extend([im.cpu().numpy().astype(np.uint8) for im in gt_imgs[:preview_slots]])
 
-            metric_counts = _metric_counts(metric_computer)
+            metric_counts = {
+                metric: len(values) for metric, values in metric_computer.results.items()
+            }
             metric_computer.update(pred_imgs, gt_imgs, name=chunk_name)
             _append_image_metric_records(image_metrics, metric_computer, metric_counts, start, image_names)
 
@@ -359,18 +353,26 @@ def evaluate_single_scene(
                 low_res_imgs = (low_res_imgs * 255).to(torch.uint8)
                 gt_high_res_imgs = (gt_high_res_imgs * 255).to(torch.uint8)
 
-                input_counts = _metric_counts(metric_computer_input)
+                input_counts = {
+                    metric: len(values) for metric, values in metric_computer_input.results.items()
+                }
                 metric_computer_input.update(input_imgs, gt_imgs, name=chunk_name)
                 _append_image_metric_records(
                     image_metrics_input, metric_computer_input, input_counts, start, image_names
                 )
-                low_res_counts = _metric_counts(metric_computer_gt_low_res)
+                low_res_counts = {
+                    metric: len(values)
+                    for metric, values in metric_computer_gt_low_res.results.items()
+                }
                 metric_computer_gt_low_res.update(low_res_imgs, gt_imgs, name=chunk_name)
                 _append_image_metric_records(
                     image_metrics_gt_low_res, metric_computer_gt_low_res,
                     low_res_counts, start, image_names
                 )
-                high_res_counts = _metric_counts(metric_computer_gt_high_res)
+                high_res_counts = {
+                    metric: len(values)
+                    for metric, values in metric_computer_gt_high_res.results.items()
+                }
                 metric_computer_gt_high_res.update(gt_high_res_imgs, gt_imgs, name=chunk_name)
                 _append_image_metric_records(
                     image_metrics_gt_high_res, metric_computer_gt_high_res,
@@ -409,7 +411,8 @@ def evaluate_single_scene(
             gt_grid = cv2.cvtColor(gt_grid_rgb, cv2.COLOR_RGB2BGR)
             cv2.imwrite(os.path.join(output_dir, f"scene{scene_idx}_gt.png"), gt_grid)
 
-        if wandb is not None and wandb.run is not None and scene_name == WANDB_EVAL_IMAGE_SCENE:
+        rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+        if rank == 0 and wandb is not None and wandb.run is not None and scene_name == WANDB_EVAL_IMAGE_SCENE:
             wandb_images = {}
             if len(pred_preview) > 0:
                 wandb_images[f"eval_images/{scene_name}/pred_grid"] = wandb.Image(
@@ -428,12 +431,12 @@ def evaluate_single_scene(
                     caption=f"{scene_name} GT | input | pred",
                 )
             if wandb_images:
-                _wandb_log(wandb_images, step=wandb_step)
+                wandb.log(wandb_images, step=wandb_step)
 
         if save_viewer:
             viewerdir = os.path.join(output_dir, f"viewer/{scene_name}")
             os.makedirs(viewerdir, exist_ok=True)
-            gs_utils.prepare_viewer(eval_cameras, viewerdir, model.sh_degree)
+            gs_utils.prepare_viewer(eval_cameras, viewerdir, model_module.sh_degree)
             gs_utils.export_ply_forviewer(
                 gs_params=input_gs_device,
                 filename=os.path.join(viewerdir, "point_cloud/00_input_gs.ply"),
@@ -522,16 +525,19 @@ def evaluate_dataset(
     evaluate_baselines=False,
 ):
     os.makedirs(output_dir, exist_ok=True)
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+    world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
     all_metrics = []
     all_metrics_input = []
     all_metrics_gt_low_res = []
     all_metrics_gt_high_res = []
     scene_average_metrics = []
     eval_skipped_scenes = []
-    _write_skipped_scenes(output_dir, {"test": dataset}, eval_skipped_scenes)
-    logger = ProcessSafeLogger(os.path.join(output_dir, "eval.log")).get_logger()
+    logger_name = "eval.log" if rank == 0 else f"eval.rank{rank}.log"
+    logger = ProcessSafeLogger(os.path.join(output_dir, logger_name)).get_logger()
 
-    for scene_idx in tqdm(range(len(dataset.folders)), desc="Evaluating"):
+    scene_indices = range(rank, len(dataset.folders), world_size)
+    for scene_idx in tqdm(scene_indices, desc=f"Evaluating rank {rank}", disable=rank != 0):
         scene_info = dataset.folders[scene_idx]
         scene_name = scene_info["scene_name"]
         try:
@@ -539,13 +545,18 @@ def evaluate_dataset(
             input_factor_entry = scene["factor_data"][FLAGS.input_factor]
             target_factor_entry = scene["factor_data"][FLAGS.target_factor]
             eval_images, image_names, eval_cameras = dataset.load_factor_views(target_factor_entry)
+            input_gs = convert_gs_to_target_frame(
+                input_factor_entry["gs_params"],
+                input_factor_entry["scaler"],
+                target_factor_entry["scaler"],
+            )
 
             scene_output_dir = os.path.join(output_dir, scene["scene_name"])
             metrics, metrics_input, metrics_gt_low_res, metrics_gt_high_res = evaluate_single_scene(
                 model=model,
-                input_gs=input_factor_entry["gs_params"],
+                input_gs=input_gs,
                 gt_gs=target_factor_entry["gs_params"],
-                low_res_gt_gs=input_factor_entry["gs_params"],
+                low_res_gt_gs=input_gs,
                 evaluate_baselines=evaluate_baselines,
                 scene_idx=scene["idx"],
                 scene_name=scene["scene_name"],
@@ -577,7 +588,6 @@ def evaluate_dataset(
                 },
             )
             eval_skipped_scenes.append(skipped_scene)
-            _write_skipped_scenes(output_dir, {"test": dataset}, eval_skipped_scenes)
             logger.exception(f"Skipping eval scene {scene_name} after exception")
             continue
 
@@ -613,6 +623,29 @@ def evaluate_dataset(
                 [f"{key}: {value:.4f}" for key, value in metrics_gt_high_res.items()]
             ))
 
+    if dist.is_available() and dist.is_initialized():
+        gathered = [None for _ in range(world_size)]
+        dist.all_gather_object(
+            gathered,
+            {
+                "scene_metrics": scene_average_metrics,
+                "skipped_scenes": eval_skipped_scenes,
+            },
+        )
+        scene_average_metrics = sorted(
+            [item for payload in gathered for item in payload["scene_metrics"]],
+            key=lambda item: item["scene_idx"],
+        )
+        eval_skipped_scenes = [
+            item for payload in gathered for item in payload["skipped_scenes"]
+        ]
+
+    all_metrics = [item["output_gs"] for item in scene_average_metrics]
+    if evaluate_baselines:
+        all_metrics_input = [item["input_gs"] for item in scene_average_metrics]
+        all_metrics_gt_low_res = [item["gt_low_res_gs"] for item in scene_average_metrics]
+        all_metrics_gt_high_res = [item["gt_high_res_gs"] for item in scene_average_metrics]
+
     reduced_metrics = {}
     if len(all_metrics) > 0:
         metric_keys = all_metrics[0].keys()
@@ -641,18 +674,20 @@ def evaluate_dataset(
                 [metrics[key] for metrics in all_metrics_gt_high_res]
             ))
 
-    with open(os.path.join(output_dir, "scene_average_metrics.json"), "w") as f:
-        json.dump(scene_average_metrics, f, indent=2)
+    if rank == 0:
+        _write_skipped_scenes(output_dir, {"test": dataset}, eval_skipped_scenes)
+        with open(os.path.join(output_dir, "scene_average_metrics.json"), "w") as f:
+            json.dump(scene_average_metrics, f, indent=2)
 
-    with open(os.path.join(output_dir, "metrics.json"), "w") as f:
-        json.dump(reduced_metrics, f, indent=2)
-    if evaluate_baselines:
-        with open(os.path.join(output_dir, "metrics_input.json"), "w") as f:
-            json.dump(reduced_metrics_input, f, indent=2)
-        with open(os.path.join(output_dir, "metrics_gt_low_res.json"), "w") as f:
-            json.dump(reduced_metrics_gt_low_res, f, indent=2)
-        with open(os.path.join(output_dir, "metrics_gt_high_res.json"), "w") as f:
-            json.dump(reduced_metrics_gt_high_res, f, indent=2)
+        with open(os.path.join(output_dir, "metrics.json"), "w") as f:
+            json.dump(reduced_metrics, f, indent=2)
+        if evaluate_baselines:
+            with open(os.path.join(output_dir, "metrics_input.json"), "w") as f:
+                json.dump(reduced_metrics_input, f, indent=2)
+            with open(os.path.join(output_dir, "metrics_gt_low_res.json"), "w") as f:
+                json.dump(reduced_metrics_gt_low_res, f, indent=2)
+            with open(os.path.join(output_dir, "metrics_gt_high_res.json"), "w") as f:
+                json.dump(reduced_metrics_gt_high_res, f, indent=2)
 
     return (
         reduced_metrics, reduced_metrics_input,
@@ -662,30 +697,55 @@ def evaluate_dataset(
 
 def main(argv):
     del argv
+    distributed = int(os.environ.get("WORLD_SIZE", "1")) > 1
+    if distributed:
+        dist.init_process_group(backend="nccl")
+    rank = dist.get_rank() if distributed else 0
+    world_size = dist.get_world_size() if distributed else 1
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
+
     os.makedirs(FLAGS.output_dir, exist_ok=True)
 
     gin.bind_parameter("training.output_dir", FLAGS.output_dir)
     gin.parse_config_files_and_bindings(FLAGS.gin_file, FLAGS.gin_param)
     train_cfg = training(output_dir=FLAGS.output_dir)
-    set_seed()
+    set_seed(rank=rank)
 
-    logger = ProcessSafeLogger(os.path.join(FLAGS.output_dir, "train.log")).get_logger()
+    logger = (
+        ProcessSafeLogger(os.path.join(FLAGS.output_dir, "train.log")).get_logger()
+        if rank == 0
+        else None
+    )
     wandb_run = _init_wandb(FLAGS.output_dir)
-    device = torch.device("cuda")
 
     train_dataset = _build_dataset("train_dataset")
     test_dataset = _build_dataset("test_dataset")
-    skipped_scenes = _write_skipped_scenes(
-        FLAGS.output_dir,
-        {"train": train_dataset, "test": test_dataset},
-    )
-    if skipped_scenes:
+    skipped_scenes = []
+    if rank == 0:
+        skipped_scenes = _write_skipped_scenes(
+            FLAGS.output_dir,
+            {"train": train_dataset, "test": test_dataset},
+        )
+    if skipped_scenes and rank == 0:
         logger.info(f"Saved {len(skipped_scenes)} skipped scenes to skipped_scenes.json")
 
-    model = FeaturePredictor().to(device)
+    model = FeaturePredictor()
+    model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
     if model.resume_ckpt is not None:
         model.load_state_dict(torch.load(model.resume_ckpt, map_location="cpu"))
-        logger.info(f"Loaded model checkpoint from {model.resume_ckpt}")
+        if rank == 0:
+            logger.info(f"Loaded model checkpoint from {model.resume_ckpt}")
+    model = model.to(device)
+    if distributed:
+        model = DDP(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            broadcast_buffers=False,
+        )
+    model_module = model.module if isinstance(model, DDP) else model
 
     if FLAGS.only_eval:
         model.eval()
@@ -693,20 +753,23 @@ def main(argv):
         model.train()
 
     with gin.config_scope("train2D"):
-        optimizer = build_optimizer(model)
+        optimizer = build_optimizer(model_module)
         scheduler = build_scheduler(optimizer)
 
-    with open(os.path.join(FLAGS.output_dir, "config.gin"), "w") as f:
-        f.writelines(gin.operative_config_str())
+    if rank == 0:
+        with open(os.path.join(FLAGS.output_dir, "config.gin"), "w") as f:
+            f.writelines(gin.operative_config_str())
 
     training_brief = (
         f"Train SR input_factor={FLAGS.input_factor} target_factor={FLAGS.target_factor}\n"
         f"train_scenes={len(train_dataset.folders)} test_scenes={len(test_dataset.folders)}\n"
-        f"model_input_features={','.join(model.input_features)}\n"
-        f"model_output_features={','.join(model.output_features)}"
+        f"world_size={world_size}\n"
+        f"model_input_features={','.join(model_module.input_features)}\n"
+        f"model_output_features={','.join(model_module.output_features)}"
     )
-    print(training_brief)
-    logger.info(training_brief)
+    if rank == 0:
+        print(training_brief)
+        logger.info(training_brief)
 
     total_steps = train_cfg["total_steps"]
     log_interval = train_cfg["log_interval"]
@@ -724,19 +787,35 @@ def main(argv):
     scaler = torch.cuda.amp.GradScaler(enabled=enable_amp)
     lpips_loss_func = loss_utils.lpips_loss_fn() if lpips_loss_weight > 0 else None
 
-    os.makedirs(os.path.join(FLAGS.output_dir, "train"), exist_ok=True)
-    os.makedirs(os.path.join(FLAGS.output_dir, "checkpoints"), exist_ok=True)
+    if rank == 0:
+        os.makedirs(os.path.join(FLAGS.output_dir, "train"), exist_ok=True)
+        os.makedirs(os.path.join(FLAGS.output_dir, "checkpoints"), exist_ok=True)
+    if distributed:
+        dist.barrier()
 
     if not FLAGS.only_eval:
         optimizer.zero_grad(set_to_none=True)
         train_iter = iter(train_dataset)
-        pbar = tqdm(range(resume_from_step, total_steps), desc="Training")
+        pbar = tqdm(
+            range(resume_from_step, total_steps),
+            desc="Training",
+            disable=rank != 0,
+        )
         for step in pbar:
-            train_iter, batch = _next_train_batch(train_iter, train_dataset)
+            try:
+                batch = next(train_iter)
+            except StopIteration:
+                train_iter = iter(train_dataset)
+                batch = next(train_iter)
             input_factor_entry = batch["multilevel"][FLAGS.input_factor]
             target_factor_entry = batch["multilevel"][FLAGS.target_factor]
 
             input_gs = gpu_utils.move_to_device(input_factor_entry["gs_params"], device)
+            input_gs = convert_gs_to_target_frame(
+                input_gs,
+                input_factor_entry["scaler"],
+                target_factor_entry["scaler"],
+            )
             batch_scene_idx = [batch["scene_idx"]]
             batch_cameras = gpu_utils.move_to_device(target_factor_entry["cameras"], device)
             batch_images = gpu_utils.move_to_device(target_factor_entry["images"], device)
@@ -769,47 +848,54 @@ def main(argv):
             scheduler.step()
 
             lpips_value = lpips_loss.item() if lpips_loss_func is not None else 0.0
-            pbar.set_postfix(
-                {
-                    "scene": batch["scene_name"],
-                    "loss": f"{total_loss.item():.4f}",
-                    "l1": f"{image_l1.item():.4f}",
-                    "lpips": f"{lpips_value:.4f}",
-                    "psnr": f"{train_psnr.item():.2f}",
-                    "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
-                }
-            )
+            if rank == 0:
+                pbar.set_postfix(
+                    {
+                        "scene": batch["scene_name"],
+                        "loss": f"{total_loss.item():.4f}",
+                        "l1": f"{image_l1.item():.4f}",
+                        "lpips": f"{lpips_value:.4f}",
+                        "psnr": f"{train_psnr.item():.2f}",
+                        "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
+                    }
+                )
 
             if empty_cache_fre > 0 and (step + 1) % empty_cache_fre == 0:
                 torch.cuda.empty_cache()
 
             if step % log_interval == 0:
-                train_log = {
-                    "train/total_loss": total_loss.item(),
-                    "train/image_l1": image_l1.item(),
-                    "train/lpips": lpips_value,
-                    "train/psnr": train_psnr.item(),
-                    "train/lr": optimizer.param_groups[0]["lr"],
-                    "train/scene_idx": batch["scene_idx"],
-                    "train/input_gaussians": input_factor_entry["gs_params"]["means"].shape[0],
-                    "train/target_gaussians": target_factor_entry["gs_params"]["means"].shape[0],
-                    "train/views": len(batch_images),
+                lpips_tensor = lpips_loss if torch.is_tensor(lpips_loss) else total_loss.new_tensor(0.0)
+                reduced_values = {
+                    "total_loss": _reduce_mean(total_loss),
+                    "image_l1": _reduce_mean(image_l1),
+                    "lpips": _reduce_mean(lpips_tensor),
+                    "psnr": _reduce_mean(train_psnr),
+                    "input_gaussians": _reduce_mean(
+                        total_loss.new_tensor(input_factor_entry["gs_params"]["means"].shape[0])
+                    ),
+                    "target_gaussians": _reduce_mean(
+                        total_loss.new_tensor(target_factor_entry["gs_params"]["means"].shape[0])
+                    ),
+                    "views": _reduce_mean(total_loss.new_tensor(len(batch_images))),
                 }
-                _wandb_log(train_log, step=step)
+                if rank == 0:
+                    train_log = {
+                        f"train/{key}": value.item() for key, value in reduced_values.items()
+                    }
+                    train_log["train/lr"] = optimizer.param_groups[0]["lr"]
+                    if wandb is not None and wandb.run is not None:
+                        wandb.log(train_log, step=step)
+                    logger.info(
+                        f"step={step} total={reduced_values['total_loss'].item():.6f} "
+                        f"l1={reduced_values['image_l1'].item():.6f} "
+                        f"lpips={reduced_values['lpips'].item():.6f} "
+                        f"psnr={reduced_values['psnr'].item():.4f} "
+                        f"lr={optimizer.param_groups[0]['lr']:.8f}"
+                    )
 
-                log_msg = (
-                    f"step={step} scene={batch['scene_name']} total={total_loss.item():.6f} "
-                    f"l1={image_l1.item():.6f} psnr={train_psnr.item():.4f} "
-                    f"lr={optimizer.param_groups[0]['lr']:.8f}"
-                )
-                if lpips_loss_func is not None:
-                    log_msg += f" lpips={lpips_loss.item():.6f}"
-                logger.info(log_msg)
-
-            if step % log_image_interval == 0:
+            if step % log_image_interval == 0 and rank == 0:
                 with torch.no_grad():
-                    log_out_gs = model(batch_normalized_gs=[input_gs], batch_scene_idx=batch_scene_idx)[0]
-                    log_pred_imgs, _ = gs_utils.rasterize_gaussians_to_multiimgs(log_out_gs, batch_cameras)
+                    log_pred_imgs, _ = gs_utils.rasterize_gaussians_to_multiimgs(out_gs, batch_cameras)
 
                 pred_imgs_uint8 = [(im * 255).detach().cpu().numpy().astype(np.uint8) for im in log_pred_imgs]
                 pred_grid_rgb = gs_utils.make_grid(pred_imgs_uint8)
@@ -826,7 +912,7 @@ def main(argv):
                 cv2.imwrite(gt_path, gt_grid)
 
                 if wandb is not None and wandb.run is not None:
-                    _wandb_log(
+                    wandb.log(
                         {
                             "train/pred_grid": wandb.Image(pred_grid_rgb, caption=f"step={step} pred"),
                             "train/gt_grid": wandb.Image(gt_grid_rgb, caption=f"step={step} gt"),
@@ -847,29 +933,42 @@ def main(argv):
                     wandb_step=step,
                     evaluate_baselines=(step == 0),
                 )
-                metric_str = " ".join([f"{key}: {value:.4f}" for key, value in metrics.items()])
-                logger.info(f"Eval step {step}: {metric_str}")
-                _wandb_log({f"eval/{key}": value for key, value in metrics.items()}, step=step)
-                if step == 0:
-                    metric_str = " ".join([f"{key}: {value:.4f}" for key, value in metrics_input.items()])
-                    logger.info(f"Eval step {step} input: {metric_str}")
-                    _wandb_log({f"eval_input/{key}": value for key, value in metrics_input.items()}, step=step)
-                    metric_str = " ".join([f"{key}: {value:.4f}" for key, value in metrics_gt_low_res.items()])
-                    logger.info(f"Eval step {step} GT low-res GS: {metric_str}")
-                    _wandb_log({f"eval_gt_low_res/{key}": value for key, value in metrics_gt_low_res.items()}, step=step)
-                    metric_str = " ".join([f"{key}: {value:.4f}" for key, value in metrics_gt_high_res.items()])
-                    logger.info(f"Eval step {step} GT high-res GS: {metric_str}")
-                    _wandb_log({f"eval_gt_high_res/{key}": value for key, value in metrics_gt_high_res.items()}, step=step)
+                if rank == 0:
+                    metric_str = " ".join([f"{key}: {value:.4f}" for key, value in metrics.items()])
+                    logger.info(f"Eval step {step}: {metric_str}")
+                    if wandb is not None and wandb.run is not None:
+                        wandb.log({f"eval/{key}": value for key, value in metrics.items()}, step=step)
+                    if step == 0:
+                        metric_str = " ".join([f"{key}: {value:.4f}" for key, value in metrics_input.items()])
+                        logger.info(f"Eval step {step} input: {metric_str}")
+                        if wandb is not None and wandb.run is not None:
+                            wandb.log({f"eval_input/{key}": value for key, value in metrics_input.items()}, step=step)
+                        metric_str = " ".join([f"{key}: {value:.4f}" for key, value in metrics_gt_low_res.items()])
+                        logger.info(f"Eval step {step} GT low-res GS: {metric_str}")
+                        if wandb is not None and wandb.run is not None:
+                            wandb.log({f"eval_gt_low_res/{key}": value for key, value in metrics_gt_low_res.items()}, step=step)
+                        metric_str = " ".join([f"{key}: {value:.4f}" for key, value in metrics_gt_high_res.items()])
+                        logger.info(f"Eval step {step} GT high-res GS: {metric_str}")
+                        if wandb is not None and wandb.run is not None:
+                            wandb.log({f"eval_gt_high_res/{key}": value for key, value in metrics_gt_high_res.items()}, step=step)
+                if distributed:
+                    dist.barrier()
                 model.train()
 
             if (step + 1) % save_interval == 0:
-                ckpt_path = os.path.join(FLAGS.output_dir, "checkpoints", f"model_{step:08d}.pth")
-                torch.save(model.state_dict(), ckpt_path)
-                logger.info(f"Saved model checkpoint to {ckpt_path}")
+                if rank == 0:
+                    ckpt_path = os.path.join(FLAGS.output_dir, "checkpoints", f"model_{step:08d}.pth")
+                    torch.save(model_module.state_dict(), ckpt_path)
+                    logger.info(f"Saved model checkpoint to {ckpt_path}")
+                if distributed:
+                    dist.barrier()
 
-        last_ckpt_path = os.path.join(FLAGS.output_dir, "checkpoints", "model_last.pth")
-        torch.save(model.state_dict(), last_ckpt_path)
-        logger.info(f"Saved model checkpoint to {last_ckpt_path}")
+        if rank == 0:
+            last_ckpt_path = os.path.join(FLAGS.output_dir, "checkpoints", "model_last.pth")
+            torch.save(model_module.state_dict(), last_ckpt_path)
+            logger.info(f"Saved model checkpoint to {last_ckpt_path}")
+        if distributed:
+            dist.barrier()
 
     final_eval_dir = os.path.join(FLAGS.output_dir, FLAGS.eval_subdir)
     metrics, metrics_input, metrics_gt_low_res, metrics_gt_high_res = evaluate_dataset(
@@ -882,21 +981,29 @@ def main(argv):
         output_gt=True,
         evaluate_baselines=True,
     )
-    metric_str = " ".join([f"{key}: {value:.4f}" for key, value in metrics.items()])
-    logger.info(f"Final eval: {metric_str}")
-    _wandb_log({f"final_eval/{key}": value for key, value in metrics.items()})
-    metric_str = " ".join([f"{key}: {value:.4f}" for key, value in metrics_input.items()])
-    logger.info(f"Final eval input: {metric_str}")
-    _wandb_log({f"final_eval_input/{key}": value for key, value in metrics_input.items()})
-    metric_str = " ".join([f"{key}: {value:.4f}" for key, value in metrics_gt_low_res.items()])
-    logger.info(f"Final eval GT low-res GS: {metric_str}")
-    _wandb_log({f"final_eval_gt_low_res/{key}": value for key, value in metrics_gt_low_res.items()})
-    metric_str = " ".join([f"{key}: {value:.4f}" for key, value in metrics_gt_high_res.items()])
-    logger.info(f"Final eval GT high-res GS: {metric_str}")
-    _wandb_log({f"final_eval_gt_high_res/{key}": value for key, value in metrics_gt_high_res.items()})
+    if rank == 0:
+        metric_str = " ".join([f"{key}: {value:.4f}" for key, value in metrics.items()])
+        logger.info(f"Final eval: {metric_str}")
+        if wandb is not None and wandb.run is not None:
+            wandb.log({f"final_eval/{key}": value for key, value in metrics.items()})
+        metric_str = " ".join([f"{key}: {value:.4f}" for key, value in metrics_input.items()])
+        logger.info(f"Final eval input: {metric_str}")
+        if wandb is not None and wandb.run is not None:
+            wandb.log({f"final_eval_input/{key}": value for key, value in metrics_input.items()})
+        metric_str = " ".join([f"{key}: {value:.4f}" for key, value in metrics_gt_low_res.items()])
+        logger.info(f"Final eval GT low-res GS: {metric_str}")
+        if wandb is not None and wandb.run is not None:
+            wandb.log({f"final_eval_gt_low_res/{key}": value for key, value in metrics_gt_low_res.items()})
+        metric_str = " ".join([f"{key}: {value:.4f}" for key, value in metrics_gt_high_res.items()])
+        logger.info(f"Final eval GT high-res GS: {metric_str}")
+        if wandb is not None and wandb.run is not None:
+            wandb.log({f"final_eval_gt_high_res/{key}": value for key, value in metrics_gt_high_res.items()})
 
     if wandb_run is not None:
         wandb_run.finish()
+    if distributed:
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
