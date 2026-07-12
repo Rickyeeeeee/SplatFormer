@@ -321,7 +321,7 @@ def align_emd_target_to_source(source_means, target_means, eps, iters):
 
     missing = best_source < 0
     if missing.any():
-        print("Miss alignment.")
+        # print("Miss alignment.")
         missing_idx = missing.nonzero(as_tuple=False).squeeze(1).to(target_means.device)
         nearest = align_nearest_target_to_source(source_means, target_means[missing_idx]).detach().cpu()
         best_source[missing] = nearest
@@ -414,6 +414,8 @@ def build_densified_input_gs(
         )
     elif alignment == "nearest":
         source_idx = align_nearest_target_to_source(interpolated_gs["means"], target_gs["means"])
+    elif alignment == "none":
+        source_idx = torch.arange(target_count, device=interpolated_gs["means"].device)
     else:
         raise ValueError(f"Unsupported alignment method: {alignment}")
 

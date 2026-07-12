@@ -38,7 +38,7 @@ flags.DEFINE_boolean("save_viewer", True, "Save viewer point clouds")
 flags.DEFINE_boolean("save_residuals", True, "Save residual tensors and stats")
 flags.DEFINE_integer("input_factor", 4, "Low-resolution GS factor used as densification source")
 flags.DEFINE_integer("target_factor", 2, "High-resolution GS/image factor used as flow target")
-flags.DEFINE_enum("alignment", "emd", ["emd", "nearest"], "Interpolated-to-target alignment method")
+flags.DEFINE_enum("alignment", "emd", ["emd", "nearest", "none"], "Interpolated-to-target alignment method")
 flags.DEFINE_enum(
     "attribute_init",
     "aligned",

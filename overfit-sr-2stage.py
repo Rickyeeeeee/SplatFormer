@@ -35,7 +35,7 @@ flags.DEFINE_enum(
     ["gt", "predicted"],
     "Source for stage-2 input means: GT target means or residual output from a means predictor.",
 )
-flags.DEFINE_enum("alignment", "emd", ["emd", "nearest"], "Interpolated-to-target alignment method")
+flags.DEFINE_enum("alignment", "emd", ["emd", "nearest", "none"], "Interpolated-to-target alignment method")
 flags.DEFINE_enum(
     "attribute_init",
     "aligned",

@@ -252,6 +252,8 @@ def evaluate_single_scene(
     output_dir,
     eval_chunk_size=None,
     gt_gs=None,
+    low_res_gt_gs=None,
+    evaluate_baselines=False,
     compare_with_input=True,
     save_viewer=False,
     save_residuals=False,
@@ -260,7 +262,9 @@ def evaluate_single_scene(
 ):
     model.eval()
     metric_computer = MetricComputer()
-    metric_computer_input = MetricComputer() if compare_with_input else None
+    metric_computer_input = MetricComputer() if evaluate_baselines else None
+    metric_computer_gt_low_res = MetricComputer() if evaluate_baselines else None
+    metric_computer_gt_high_res = MetricComputer() if evaluate_baselines else None
     predicted_keys = list(getattr(model, "output_features", []))
 
     device = next(model.parameters()).device
@@ -277,7 +281,7 @@ def evaluate_single_scene(
     os.makedirs(pred_single_dir, exist_ok=True)
 
     compare_dir = None
-    if compare_with_input:
+    if compare_with_input and evaluate_baselines:
         compare_dir = os.path.join(output_dir, "compare")
         os.makedirs(compare_dir, exist_ok=True)
 
@@ -288,9 +292,17 @@ def evaluate_single_scene(
 
     image_metrics = []
     image_metrics_input = []
+    image_metrics_gt_low_res = []
+    image_metrics_gt_high_res = []
 
     with torch.no_grad():
         input_gs_device = gpu_utils.move_to_device(input_gs, device)
+        gt_gs_device = (
+            gpu_utils.move_to_device(gt_gs, device) if evaluate_baselines or save_viewer else None
+        )
+        low_res_gt_gs_device = (
+            gpu_utils.move_to_device(low_res_gt_gs, device) if evaluate_baselines else None
+        )
         out_gs = model(batch_normalized_gs=[input_gs_device], batch_scene_idx=[scene_idx])[0]
 
         pred_preview = []
@@ -332,6 +344,39 @@ def evaluate_single_scene(
             metric_computer.update(pred_imgs, gt_imgs, name=chunk_name)
             _append_image_metric_records(image_metrics, metric_computer, metric_counts, start, image_names)
 
+            if evaluate_baselines:
+                input_imgs, _ = gs_utils.rasterize_gaussians_to_multiimgs(input_gs_device, chunk_cameras)
+                low_res_imgs, _ = gs_utils.rasterize_gaussians_to_multiimgs(low_res_gt_gs_device, chunk_cameras)
+                gt_high_res_imgs, _ = gs_utils.rasterize_gaussians_to_multiimgs(gt_gs_device, chunk_cameras)
+                input_imgs = torch.stack(input_imgs, dim=0)
+                low_res_imgs = torch.stack(low_res_imgs, dim=0)
+                gt_high_res_imgs = torch.stack(gt_high_res_imgs, dim=0)
+                if masks is not None:
+                    input_imgs = input_imgs * masks
+                    low_res_imgs = low_res_imgs * masks
+                    gt_high_res_imgs = gt_high_res_imgs * masks
+                input_imgs = (input_imgs * 255).to(torch.uint8)
+                low_res_imgs = (low_res_imgs * 255).to(torch.uint8)
+                gt_high_res_imgs = (gt_high_res_imgs * 255).to(torch.uint8)
+
+                input_counts = _metric_counts(metric_computer_input)
+                metric_computer_input.update(input_imgs, gt_imgs, name=chunk_name)
+                _append_image_metric_records(
+                    image_metrics_input, metric_computer_input, input_counts, start, image_names
+                )
+                low_res_counts = _metric_counts(metric_computer_gt_low_res)
+                metric_computer_gt_low_res.update(low_res_imgs, gt_imgs, name=chunk_name)
+                _append_image_metric_records(
+                    image_metrics_gt_low_res, metric_computer_gt_low_res,
+                    low_res_counts, start, image_names
+                )
+                high_res_counts = _metric_counts(metric_computer_gt_high_res)
+                metric_computer_gt_high_res.update(gt_high_res_imgs, gt_imgs, name=chunk_name)
+                _append_image_metric_records(
+                    image_metrics_gt_high_res, metric_computer_gt_high_res,
+                    high_res_counts, start, image_names
+                )
+
             for global_idx, pred_img in enumerate(pred_imgs, start=start):
                 pred_img = pred_img.cpu().numpy().astype(np.uint8)
                 cv2.imwrite(
@@ -339,20 +384,7 @@ def evaluate_single_scene(
                     pred_img[:, :, ::-1],
                 )
 
-            if compare_with_input:
-                input_imgs, _ = gs_utils.rasterize_gaussians_to_multiimgs(input_gs_device, chunk_cameras)
-                input_imgs = torch.stack(input_imgs, dim=0)
-                if masks is not None:
-                    input_imgs = input_imgs * masks
-                    input_imgs = (input_imgs * 255).to(torch.uint8)
-                else:
-                    input_imgs = (input_imgs * 255).to(torch.uint8)
-                input_metric_counts = _metric_counts(metric_computer_input)
-                metric_computer_input.update(input_imgs, gt_imgs, name=chunk_name)
-                _append_image_metric_records(
-                    image_metrics_input, metric_computer_input, input_metric_counts, start, image_names
-                )
-
+            if compare_with_input and evaluate_baselines:
                 for global_idx, (gt_img, input_img, pred_img) in enumerate(
                     zip(gt_imgs, input_imgs, pred_imgs), start=start
                 ):
@@ -389,7 +421,7 @@ def evaluate_single_scene(
                     gt_grid_rgb,
                     caption=f"{scene_name} ground truth",
                 )
-            if compare_with_input and len(compare_preview) > 0:
+            if compare_with_input and evaluate_baselines and len(compare_preview) > 0:
                 compare_grid = gs_utils.make_grid(compare_preview)
                 wandb_images[f"eval_images/{scene_name}/compare_grid"] = wandb.Image(
                     compare_grid,
@@ -410,8 +442,7 @@ def evaluate_single_scene(
                 gs_params=out_gs,
                 filename=os.path.join(viewerdir, "point_cloud/01_output_gs.ply"),
             )
-            if gt_gs is not None:
-                gt_gs_device = gpu_utils.move_to_device(gt_gs, device)
+            if gt_gs_device is not None:
                 gs_utils.export_ply_forviewer(
                     gs_params=gt_gs_device,
                     filename=os.path.join(viewerdir, "point_cloud/02_gt_gs.ply"),
@@ -460,16 +491,23 @@ def evaluate_single_scene(
     metrics = metric_computer.finalize()
     with open(os.path.join(output_dir, "metrics.json"), "w") as f:
         json.dump(image_metrics, f, indent=2)
-
-    if compare_with_input:
+    if evaluate_baselines:
         metrics_input = metric_computer_input.finalize()
         with open(os.path.join(output_dir, "metrics_input.json"), "w") as f:
             json.dump(image_metrics_input, f, indent=2)
+        metrics_gt_low_res = metric_computer_gt_low_res.finalize()
+        with open(os.path.join(output_dir, "metrics_gt_low_res.json"), "w") as f:
+            json.dump(image_metrics_gt_low_res, f, indent=2)
+        metrics_gt_high_res = metric_computer_gt_high_res.finalize()
+        with open(os.path.join(output_dir, "metrics_gt_high_res.json"), "w") as f:
+            json.dump(image_metrics_gt_high_res, f, indent=2)
     else:
         metrics_input = {}
+        metrics_gt_low_res = {}
+        metrics_gt_high_res = {}
 
     model.train()
-    return metrics, metrics_input
+    return metrics, metrics_input, metrics_gt_low_res, metrics_gt_high_res
 
 
 def evaluate_dataset(
@@ -481,10 +519,13 @@ def evaluate_dataset(
     save_residuals=False,
     output_gt=False,
     wandb_step=None,
+    evaluate_baselines=False,
 ):
     os.makedirs(output_dir, exist_ok=True)
     all_metrics = []
     all_metrics_input = []
+    all_metrics_gt_low_res = []
+    all_metrics_gt_high_res = []
     scene_average_metrics = []
     eval_skipped_scenes = []
     _write_skipped_scenes(output_dir, {"test": dataset}, eval_skipped_scenes)
@@ -500,10 +541,12 @@ def evaluate_dataset(
             eval_images, image_names, eval_cameras = dataset.load_factor_views(target_factor_entry)
 
             scene_output_dir = os.path.join(output_dir, scene["scene_name"])
-            metrics, metrics_input = evaluate_single_scene(
+            metrics, metrics_input, metrics_gt_low_res, metrics_gt_high_res = evaluate_single_scene(
                 model=model,
                 input_gs=input_factor_entry["gs_params"],
                 gt_gs=target_factor_entry["gs_params"],
+                low_res_gt_gs=input_factor_entry["gs_params"],
+                evaluate_baselines=evaluate_baselines,
                 scene_idx=scene["idx"],
                 scene_name=scene["scene_name"],
                 eval_images=eval_images,
@@ -539,20 +582,36 @@ def evaluate_dataset(
             continue
 
         all_metrics.append(metrics)
-        if compare_with_input:
+        if evaluate_baselines:
+            all_metrics_gt_low_res.append(metrics_gt_low_res)
+            all_metrics_gt_high_res.append(metrics_gt_high_res)
             all_metrics_input.append(metrics_input)
-        scene_average_metrics.append(
-            {
-                "scene_idx": scene["idx"],
-                "scene_name": scene["scene_name"],
-                "output_gs": metrics,
-                "input_gs": metrics_input if compare_with_input else None,
-            }
-        )
+        scene_metrics = {
+            "scene_idx": scene["idx"],
+            "scene_name": scene["scene_name"],
+            "output_gs": metrics,
+        }
+        if evaluate_baselines:
+            scene_metrics.update({
+                "gt_low_res_gs": metrics_gt_low_res,
+                "input_gs": metrics_input,
+                "gt_high_res_gs": metrics_gt_high_res,
+            })
+        scene_average_metrics.append(scene_metrics)
         logger.info(
             f"Scene {scene['scene_name']}: "
             + " ".join([f"{key}: {value:.4f}" for key, value in metrics.items()])
         )
+        if evaluate_baselines:
+            logger.info(f"Scene {scene['scene_name']} GT low-res GS: " + " ".join(
+                [f"{key}: {value:.4f}" for key, value in metrics_gt_low_res.items()]
+            ))
+            logger.info(f"Scene {scene['scene_name']} input GS: " + " ".join(
+                [f"{key}: {value:.4f}" for key, value in metrics_input.items()]
+            ))
+            logger.info(f"Scene {scene['scene_name']} GT high-res GS: " + " ".join(
+                [f"{key}: {value:.4f}" for key, value in metrics_gt_high_res.items()]
+            ))
 
     reduced_metrics = {}
     if len(all_metrics) > 0:
@@ -561,21 +620,44 @@ def evaluate_dataset(
             reduced_metrics[key] = float(np.mean([metrics[key] for metrics in all_metrics]))
 
     reduced_metrics_input = {}
-    if compare_with_input and len(all_metrics_input) > 0:
+    if evaluate_baselines and len(all_metrics_input) > 0:
         metric_keys = all_metrics_input[0].keys()
         for key in metric_keys:
             reduced_metrics_input[key] = float(np.mean([metrics[key] for metrics in all_metrics_input]))
+
+    reduced_metrics_gt_low_res = {}
+    if evaluate_baselines and len(all_metrics_gt_low_res) > 0:
+        metric_keys = all_metrics_gt_low_res[0].keys()
+        for key in metric_keys:
+            reduced_metrics_gt_low_res[key] = float(np.mean(
+                [metrics[key] for metrics in all_metrics_gt_low_res]
+            ))
+
+    reduced_metrics_gt_high_res = {}
+    if evaluate_baselines and len(all_metrics_gt_high_res) > 0:
+        metric_keys = all_metrics_gt_high_res[0].keys()
+        for key in metric_keys:
+            reduced_metrics_gt_high_res[key] = float(np.mean(
+                [metrics[key] for metrics in all_metrics_gt_high_res]
+            ))
 
     with open(os.path.join(output_dir, "scene_average_metrics.json"), "w") as f:
         json.dump(scene_average_metrics, f, indent=2)
 
     with open(os.path.join(output_dir, "metrics.json"), "w") as f:
         json.dump(reduced_metrics, f, indent=2)
-    if compare_with_input:
+    if evaluate_baselines:
         with open(os.path.join(output_dir, "metrics_input.json"), "w") as f:
             json.dump(reduced_metrics_input, f, indent=2)
+        with open(os.path.join(output_dir, "metrics_gt_low_res.json"), "w") as f:
+            json.dump(reduced_metrics_gt_low_res, f, indent=2)
+        with open(os.path.join(output_dir, "metrics_gt_high_res.json"), "w") as f:
+            json.dump(reduced_metrics_gt_high_res, f, indent=2)
 
-    return reduced_metrics, reduced_metrics_input
+    return (
+        reduced_metrics, reduced_metrics_input,
+        reduced_metrics_gt_low_res, reduced_metrics_gt_high_res,
+    )
 
 
 def main(argv):
@@ -754,7 +836,7 @@ def main(argv):
 
             if step % eval_interval == 0:
                 eval_dir = os.path.join(FLAGS.output_dir, "eval", f"{step:08d}")
-                metrics, metrics_input = evaluate_dataset(
+                metrics, metrics_input, metrics_gt_low_res, metrics_gt_high_res = evaluate_dataset(
                     model=model,
                     dataset=test_dataset,
                     output_dir=eval_dir,
@@ -763,14 +845,21 @@ def main(argv):
                     save_residuals=FLAGS.save_residuals,
                     output_gt=(step == 0),
                     wandb_step=step,
+                    evaluate_baselines=(step == 0),
                 )
                 metric_str = " ".join([f"{key}: {value:.4f}" for key, value in metrics.items()])
                 logger.info(f"Eval step {step}: {metric_str}")
                 _wandb_log({f"eval/{key}": value for key, value in metrics.items()}, step=step)
-                if FLAGS.compare_with_input:
+                if step == 0:
                     metric_str = " ".join([f"{key}: {value:.4f}" for key, value in metrics_input.items()])
                     logger.info(f"Eval step {step} input: {metric_str}")
                     _wandb_log({f"eval_input/{key}": value for key, value in metrics_input.items()}, step=step)
+                    metric_str = " ".join([f"{key}: {value:.4f}" for key, value in metrics_gt_low_res.items()])
+                    logger.info(f"Eval step {step} GT low-res GS: {metric_str}")
+                    _wandb_log({f"eval_gt_low_res/{key}": value for key, value in metrics_gt_low_res.items()}, step=step)
+                    metric_str = " ".join([f"{key}: {value:.4f}" for key, value in metrics_gt_high_res.items()])
+                    logger.info(f"Eval step {step} GT high-res GS: {metric_str}")
+                    _wandb_log({f"eval_gt_high_res/{key}": value for key, value in metrics_gt_high_res.items()}, step=step)
                 model.train()
 
             if (step + 1) % save_interval == 0:
@@ -783,7 +872,7 @@ def main(argv):
         logger.info(f"Saved model checkpoint to {last_ckpt_path}")
 
     final_eval_dir = os.path.join(FLAGS.output_dir, FLAGS.eval_subdir)
-    metrics, metrics_input = evaluate_dataset(
+    metrics, metrics_input, metrics_gt_low_res, metrics_gt_high_res = evaluate_dataset(
         model=model,
         dataset=test_dataset,
         output_dir=final_eval_dir,
@@ -791,14 +880,20 @@ def main(argv):
         save_viewer=FLAGS.save_viewer,
         save_residuals=FLAGS.save_residuals,
         output_gt=True,
+        evaluate_baselines=True,
     )
     metric_str = " ".join([f"{key}: {value:.4f}" for key, value in metrics.items()])
     logger.info(f"Final eval: {metric_str}")
     _wandb_log({f"final_eval/{key}": value for key, value in metrics.items()})
-    if FLAGS.compare_with_input:
-        metric_str = " ".join([f"{key}: {value:.4f}" for key, value in metrics_input.items()])
-        logger.info(f"Final eval input: {metric_str}")
-        _wandb_log({f"final_eval_input/{key}": value for key, value in metrics_input.items()})
+    metric_str = " ".join([f"{key}: {value:.4f}" for key, value in metrics_input.items()])
+    logger.info(f"Final eval input: {metric_str}")
+    _wandb_log({f"final_eval_input/{key}": value for key, value in metrics_input.items()})
+    metric_str = " ".join([f"{key}: {value:.4f}" for key, value in metrics_gt_low_res.items()])
+    logger.info(f"Final eval GT low-res GS: {metric_str}")
+    _wandb_log({f"final_eval_gt_low_res/{key}": value for key, value in metrics_gt_low_res.items()})
+    metric_str = " ".join([f"{key}: {value:.4f}" for key, value in metrics_gt_high_res.items()])
+    logger.info(f"Final eval GT high-res GS: {metric_str}")
+    _wandb_log({f"final_eval_gt_high_res/{key}": value for key, value in metrics_gt_high_res.items()})
 
     if wandb_run is not None:
         wandb_run.finish()
