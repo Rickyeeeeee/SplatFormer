@@ -192,15 +192,7 @@ def midpoint_interpolate_gs(input_gs, target_count):
     if source_count <= 0:
         raise ValueError("Cannot densify an empty input GS")
     if target_count < source_count:
-        if target_count <= 0:
-            raise ValueError(f"Cannot sample to non-positive target_count={target_count}")
-        keep_idx = torch.randperm(source_count, device=input_gs["means"].device)[:target_count]
-        # print(
-        #     "[midpoint_interpolate_gs] source_count exceeds target_count; "
-        #     f"randomly sampling {target_count}/{source_count} source Gaussians.",
-        #     flush=True,
-        # )
-        return {key: value[keep_idx].clone() for key, value in input_gs.items()}
+        return {key: value.clone() for key, value in input_gs.items()}
 
     new_count = target_count - source_count
     if new_count == 0:
@@ -261,7 +253,7 @@ def midpoint_interpolate_gs(input_gs, target_count):
             low_opacity = torch.full_like(src_value, 0.99)
             midpoint_value = torch.log(low_opacity)
         elif key == "scales":
-            pair_min_scale = torch.minimum(src_value, nbr_value).min(dim=-1, keepdim=True).values
+            pair_min_scale = torch.maximum(src_value, nbr_value).min(dim=-1, keepdim=True).values
             midpoint_value = pair_min_scale.repeat(1, src_value.shape[-1])
         else:
             midpoint_value = (src_value + nbr_value) * 0.5

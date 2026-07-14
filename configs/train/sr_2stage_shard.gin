@@ -1,0 +1,63 @@
+# Shard-mode counterpart of sr_2stage.gin. Use with SplatFactoMultiLevelShardDataset.
+set_seed.seed = 42
+total_steps = 200000
+training.total_steps = %total_steps
+training.pretrain_steps = 0
+training.eval_interval = 2000
+training.save_interval = 2000
+training.log_interval = 20
+training.log_image_interval = 2000
+training.grad_clip_norm = 2.0
+training.resume_from_step = 0
+training.enable_amp = True
+training.lpips_loss_weight = 1.0
+
+train2D/build_optimizer.lr_dict = {
+    "base": 3e-5,
+    "embedding": 3e-5,
+    "backbone": 3e-5,
+    "features_dc": 3e-5,
+    "features_rest": 1.5e-6,
+    "scales": 3e-5,
+    "opacities": 3e-5,
+    "quats": 3e-5,
+    "means": 3e-5
+}
+train2D/build_optimizer.optimizer_type = 'adam'
+train2D/build_optimizer.optimizer_params = {'eps': 1e-15}
+train2D/build_scheduler.total_step = %total_steps
+train2D/build_scheduler.schedule = 'constant'
+
+SplatFactoMultiLevelShardDataset.remove_outlier_ndevs = -1
+SplatFactoMultiLevelShardDataset.image_per_scene = None
+SplatFactoMultiLevelShardDataset.sample_ratio_test = None
+SplatFactoMultiLevelShardDataset.max_gs_num = 1000000
+SplatFactoMultiLevelShardDataset.load_pose_src = 'nerfstudio'
+
+train_dataset/SplatFactoMultiLevelShardDataset.train_or_test = 'train'
+train_dataset/SplatFactoMultiLevelShardDataset.nerfstudio_folder = '/project/ricky/splatformer-data/train-set-512/objaverse/nerfstudio'
+train_dataset/SplatFactoMultiLevelShardDataset.colmap_folder = '/project/ricky/splatformer-data/train-set-512/objaverse/colmap'
+train_dataset/SplatFactoMultiLevelShardDataset.image_per_scene = 16
+train_dataset/SplatFactoMultiLevelShardDataset.cache_steps = 1
+train_dataset/SplatFactoMultiLevelShardDataset.cache_num_scenes = 1
+train_dataset/SplatFactoMultiLevelShardDataset.split_across_gpus = False
+train_dataset/SplatFactoMultiLevelShardDataset.factors = [2, 4]
+train_dataset/SplatFactoMultiLevelShardDataset.local_shard_root = '/tmp/ricky/splatformer/train'
+train_dataset/SplatFactoMultiLevelShardDataset.local_queue_capacity = 500
+train_dataset/SplatFactoMultiLevelShardDataset.local_queue_initial = 500
+
+test_dataset/SplatFactoMultiLevelShardDataset.train_or_test = 'test'
+test_dataset/SplatFactoMultiLevelShardDataset.nerfstudio_folder = '/project/ricky/splatformer-data/test-set-512/objaverse/nerfstudio'
+test_dataset/SplatFactoMultiLevelShardDataset.colmap_folder = '/project/ricky/splatformer-data/test-set-512/objaverse/colmap'
+test_dataset/SplatFactoMultiLevelShardDataset.image_per_scene = None
+test_dataset/SplatFactoMultiLevelShardDataset.cache_steps = 1
+test_dataset/SplatFactoMultiLevelShardDataset.cache_num_scenes = 1
+test_dataset/SplatFactoMultiLevelShardDataset.split_across_gpus = False
+test_dataset/SplatFactoMultiLevelShardDataset.factors = [2, 4]
+test_dataset/SplatFactoMultiLevelShardDataset.local_shard_root = '/tmp/ricky/splatformer/test'
+test_dataset/SplatFactoMultiLevelShardDataset.local_shard_enabled_for_test = True
+
+FeaturePredictor.output_features_type = 'res'
+FeaturePredictor.output_features = ['features_dc', 'features_rest', 'opacities', 'scales', 'quats']
+
+# Override roots and local_shard_root from the launcher for a particular run.
