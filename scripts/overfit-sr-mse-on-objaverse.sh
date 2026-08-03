@@ -54,7 +54,7 @@ fi
 
 scale_name=$(sanitize_name "${means_origin_scale}")
 out_name=${scene_name}_${attribute_init}_if${input_factor}_tf${target_factor}_mse_${loss_name}_${model_output_suffix}
-output_dir=/project/ricky/experiments/objaverse_splatformer_overfit_sr_mse_512/${out_name}
+output_dir=/project/ricky/experiments/0803/overfit_sr_mse_512/${out_name}
 
 CUDA_VISIBLE_DEVICES=$GPU_ID python overfit-sr-mse.py \
     --output_dir=${output_dir} \
