@@ -23,7 +23,7 @@ TRAIN_NS_ROOT=${TRAIN_NS_ROOT:-/project2/ricky/splatformer-data/train-set-512/ob
 TRAIN_COLMAP_ROOT=${TRAIN_COLMAP_ROOT:-/project2/ricky/splatformer-data/train-set-512/objaverse/colmap}
 TEST_NS_ROOT=${TEST_NS_ROOT:-/project/ricky/splatformer-data/test-set-512/objaverse/nerfstudio}
 TEST_COLMAP_ROOT=${TEST_COLMAP_ROOT:-/project/ricky/splatformer-data/test-set-512/objaverse/colmap}
-OUTPUT_DIR=${OUTPUT_DIR:-outputs/objaverse_splatformer_train_sr_2stage_${INPUT_FACTOR}to${TARGET_FACTOR}_${MEANS_SOURCE}}
+OUTPUT_DIR=${OUTPUT_DIR:-outputs/objaverse_train_sr_2stage_${INPUT_FACTOR}to${TARGET_FACTOR}_${MEANS_SOURCE}}
 
 CUDA_VISIBLE_DEVICES=${GPU_ID} python train-sr-2stage.py \
     --output_dir="${OUTPUT_DIR}" \

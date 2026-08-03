@@ -803,6 +803,9 @@ def evaluate_dataset(
 
 def main(argv):
     del argv
+
+    torch.set_num_threads(8)
+
     os.makedirs(FLAGS.output_dir, exist_ok=True)
 
     gin.bind_parameter("training.output_dir", FLAGS.output_dir)
