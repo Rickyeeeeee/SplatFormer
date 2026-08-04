@@ -10,6 +10,7 @@ training.grad_clip_norm = 2.0
 training.resume_from_step = 0
 training.enable_amp = True
 training.lpips_loss_weight = 1.0
+training.image_l1_loss_weight = 1.0
 training.log_image_interval = 2000
 training.eval_interval = 2000
 training.save_interval = 2000
@@ -30,6 +31,7 @@ feature_mse_loss.loss_weights = {
 #     "scales": 1.0,
 #     "quats": 10.0,
 feature_mse_loss.quat_direct_mse = False
+feature_mse_loss.mse_loss_weight = 1.0
 
 pretrain/build_optimizer.lr_dict = {
     "base": 1e-3,

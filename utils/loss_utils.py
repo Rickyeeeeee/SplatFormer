@@ -1,7 +1,39 @@
+import json
+
 import torch
 import torch.nn.functional as F
 
 SUPPORTED_GS_KEYS = ["means", "features_dc", "features_rest", "opacities", "scales", "quats"]
+def load_gs_statistics_normalizers(stats_path, target_factor, loss_features, target_gs, min_std=1e-6):
+    """Load channel-wise GS standard deviations for loss normalization."""
+    with open(stats_path, "r") as stats_file:
+        report = json.load(stats_file)
+    factor_key = f"df-{target_factor}"
+    factors = report.get("factors", {})
+    if factor_key not in factors:
+        raise ValueError(f"GS statistics report does not contain factor '{factor_key}'")
+    parameters = factors[factor_key].get("parameters", {})
+    normalizers = {}
+    selected_statistics = {}
+    for key in loss_features:
+        parameter_stats = parameters.get(key)
+        if parameter_stats is None:
+            raise ValueError(f"GS statistics report {factor_key} is missing parameter '{key}'")
+        expected_shape = tuple(target_gs[key].shape[1:])
+        reported_shape = tuple(parameter_stats.get("channel_shape") or [])
+        if reported_shape != expected_shape:
+            raise ValueError(f"GS statistics shape mismatch for '{key}': report {reported_shape} vs target {expected_shape}")
+        std_values = parameter_stats.get("std")
+        if std_values is None:
+            raise ValueError(f"GS statistics report {factor_key} is missing std for '{key}'")
+        std = torch.as_tensor(std_values, dtype=target_gs[key].dtype, device=target_gs[key].device)
+        if tuple(std.shape) != expected_shape:
+            raise ValueError(f"GS statistics std shape mismatch for '{key}': report {tuple(std.shape)} vs target {expected_shape}")
+        if not torch.isfinite(std).all() or torch.any(std < 0):
+            raise ValueError(f"GS statistics std for '{key}' must be finite and nonnegative")
+        normalizers[key] = std.clamp_min(float(min_std))
+        selected_statistics[key] = parameter_stats
+    return normalizers, selected_statistics
 
 
 def unique_preserve_order(values):
@@ -56,7 +88,22 @@ def feature_loss_value(
     post_activate_loss=False,
     quat_direct_mse=False,
     means_loss_reduction="mean",
+    component_normalizer=None,
 ):
+    if component_normalizer is not None:
+        if post_activate_loss:
+            raise ValueError("Component-normalized loss does not support post_activate_loss")
+        normalized_error = (pred - target) / component_normalizer
+        if key == "means":
+            normalized_error = normalized_error.abs()
+            if means_loss_reduction == "mean":
+                return normalized_error.mean()
+            if means_loss_reduction == "sum":
+                return normalized_error.sum()
+            raise ValueError(
+                f"Unsupported means_loss_reduction={means_loss_reduction}; expected 'mean' or 'sum'"
+            )
+        return normalized_error.square().mean()
     if key == "means":
         # error = (pred - target).square()
         error = (pred - target).abs()
@@ -92,6 +139,7 @@ def feature_mse_loss(
     post_activate_loss=False,
     quat_direct_mse=False,
     means_loss_reduction="mean",
+    component_normalizers=None,
     output_label="model output",
     total_loss_error="No MSE losses were computed",
     grad_error=(
@@ -116,6 +164,14 @@ def feature_mse_loss(
                 f"output {tuple(out_gs[key].shape)} vs target {tuple(target_gs[key].shape)}"
             )
         pred = out_gs[key]
+        component_normalizer = None
+        if component_normalizers is not None and key in component_normalizers:
+            component_normalizer = component_normalizers[key].to(device=pred.device, dtype=pred.dtype)
+            if component_normalizer.shape != pred.shape[1:]:
+                raise ValueError(
+                    f"Normalizer shape mismatch for loss feature '{key}': "
+                    f"normalizer {tuple(component_normalizer.shape)} vs feature {tuple(pred.shape[1:])}"
+                )
         target = target_gs[key].to(device=pred.device, dtype=pred.dtype)
         loss = feature_loss_value(
             key,
@@ -123,6 +179,7 @@ def feature_mse_loss(
             target,
             post_activate_loss=post_activate_loss,
             quat_direct_mse=quat_direct_mse,
+            component_normalizer=component_normalizer,
             means_loss_reduction=means_loss_reduction,
         )
         weighted_loss = float(loss_weights.get(key, 1.0)) * loss

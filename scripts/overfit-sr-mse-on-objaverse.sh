@@ -22,6 +22,7 @@ post_activate_loss=${10:-${POST_ACTIVATE_LOSS:-true}}
 direct_prediction=${11:-${DIRECT_PREDICTION:-false}}
 means_origin_scale=${12:-${MEANS_ORIGIN_SCALE:-1.01}}
 model_features_from_loss=${13:-${MODEL_FEATURE_FROM_LOSS:-true}}
+gs_statistics_path=${14:-${GS_STATISTICS_PATH:-}}
 conda_env=${CONDA_ENV:-3dgs-sr}
 
 to_bit() {
@@ -39,6 +40,10 @@ loss_name="$(sanitize_name "${loss_features}")"
 post_activate_bit="$(to_bit ${post_activate_loss})"
 direct_prediction_bit="$(to_bit ${direct_prediction})"
 model_features_from_loss_bit="$(to_bit ${model_features_from_loss})"
+if [ -n "${gs_statistics_path}" ] && [ "${post_activate_bit}" = "1" ]; then
+    echo "GS_STATISTICS_PATH requires POST_ACTIVATE_LOSS=false" >&2
+    exit 1
+fi
 if [ "${model_features_from_loss_bit}" = "1" ]; then
     model_output_suffix=lossout
 else
@@ -53,10 +58,16 @@ else
 fi
 
 scale_name=$(sanitize_name "${means_origin_scale}")
-out_name=${scene_name}_${attribute_init}_if${input_factor}_tf${target_factor}_mse_${loss_name}_${model_output_suffix}
+stats_suffix=""
+gs_statistics_args=()
+if [ -n "${gs_statistics_path}" ]; then
+    stats_suffix="_gsnorm"
+    gs_statistics_args=(--gs_statistics_path="${gs_statistics_path}")
+fi
+out_name=${scene_name}_${attribute_init}_if${input_factor}_tf${target_factor}_mse_${loss_name}_${model_output_suffix}${stats_suffix}
 output_dir=/project/ricky/experiments/0803/overfit_sr_mse_512/${out_name}
 
-CUDA_VISIBLE_DEVICES=$GPU_ID python overfit-sr-mse.py \
+TORCH_CUDNN_V8_API_DISABLED=1 CUDA_VISIBLE_DEVICES=$GPU_ID python overfit-sr-mse.py \
     --output_dir=${output_dir} \
     --scene_name=${scene_name} \
     --alignment=${alignment} \
@@ -67,6 +78,7 @@ CUDA_VISIBLE_DEVICES=$GPU_ID python overfit-sr-mse.py \
     --model_features_from_loss=${model_features_from_loss} \
     --post_activate_loss=${post_activate_loss} \
     --means_origin_scale=${means_origin_scale} \
+    "${gs_statistics_args[@]}" \
     --gin_file=configs/model/ptv3.gin \
     --gin_file=configs/overfit/sr_mse.gin \
     --gin_param="FeaturePredictor.output_features_type='${output_features_type}'" \

@@ -26,6 +26,9 @@ class MetricComputer:
     def update(self, img1s, img2s, name):
         if name not in self.results_dict:
             self.results_dict[name] = {}
+        # Metrics always operate on float images in the [0, 1] range.
+        img1s = img1s.float()
+        img2s = img2s.float()
         if img1s.max() > 1: #255
             img1s = img1s/255.0
         if img2s.max() > 1:
