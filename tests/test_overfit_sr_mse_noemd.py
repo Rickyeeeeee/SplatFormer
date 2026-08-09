@@ -95,3 +95,58 @@ def test_mocked_matching_step_keeps_identity_correspondence(tmp_path):
     assert fitted["means"].data_ptr() != source["means"].data_ptr()
     assert (tmp_path / "matching_train" / "loss.csv").is_file()
     assert (tmp_path / "matching_train" / "00000000_pred.png").is_file()
+
+
+def test_persistent_matching_cache_reuses_and_refits_compatible_targets(tmp_path):
+    source = _gs(2)
+    config = {
+        "total_steps": 1,
+        "image_per_step": 1,
+        "log_interval": 1,
+        "preview_interval": 1,
+        "grad_clip_norm": 0.0,
+        "image_l1_loss_weight": 1.0,
+        "lpips_loss_weight": 0.0,
+        "enable_amp": False,
+        "empty_cache_fre": -1,
+    }
+    logger = logging.getLogger("test-noemd-cache")
+
+    def fake_fit(source_gs, *_args):
+        return {key: value.detach().clone() + 1 for key, value in source_gs.items()}
+
+    kwargs = dict(
+        source_gs=source,
+        target_images=[],
+        target_cameras={},
+        pre_matching_root=str(tmp_path),
+        scene_name="scene-a",
+        input_factor=4,
+        target_factor=2,
+        logger=logger,
+        config=config,
+    )
+    with mock.patch.object(MODULE, "fit_matching_target", side_effect=fake_fit) as fit:
+        first_target, first_info = MODULE.get_or_fit_matching_target(**kwargs)
+        assert first_info["status"] == "refit"
+        assert fit.call_count == 1
+        assert (tmp_path / "scene-a" / "if4_tf2" / "matching_target.pt").is_file()
+
+        first_target["means"].add_(99)
+        hit_target, hit_info = MODULE.get_or_fit_matching_target(**kwargs)
+        assert hit_info["status"] == "hit"
+        assert fit.call_count == 1
+        assert not torch.equal(hit_target["means"], first_target["means"])
+
+        forced_target, forced_info = MODULE.get_or_fit_matching_target(
+            **kwargs, force_pre_matching=True
+        )
+        assert forced_info["status"] == "refit"
+        assert fit.call_count == 2
+        assert forced_target["means"].shape == source["means"].shape
+
+        incompatible_source = _gs(3)
+        incompatible_kwargs = dict(kwargs, source_gs=incompatible_source)
+        _, incompatible_info = MODULE.get_or_fit_matching_target(**incompatible_kwargs)
+        assert incompatible_info["status"] == "refit"
+        assert fit.call_count == 3

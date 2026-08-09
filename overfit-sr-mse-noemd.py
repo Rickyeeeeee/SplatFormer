@@ -15,7 +15,7 @@ import cv2
 import gin
 import numpy as np
 import torch
-from absl import app
+from absl import app, flags
 from tqdm import tqdm
 
 from models.feature_predictor import FeaturePredictor
@@ -29,7 +29,7 @@ from utils.optimizers import build_optimizer, build_scheduler
 from utils.sr_dataset_utils import build_dataset, find_scene_index
 from utils.sr_matching_utils import (
     build_matching_source as build_shared_matching_source,
-    fit_matching_target as fit_shared_matching_target,
+    get_or_fit_matching_target as get_or_fit_shared_matching_target,
     matching_fit,
     save_matching_artifacts as save_shared_matching_artifacts,
     _write_preview
@@ -49,6 +49,16 @@ def _load_base_module():
 
 BASE = _load_base_module()
 FLAGS = BASE.FLAGS
+flags.DEFINE_string(
+    "pre_matching_root",
+    "/project2/ricky/splatformer-data-to-4x",
+    "Root directory for persistent scene-level pre-matching targets.",
+)
+flags.DEFINE_boolean(
+    "force_pre_matching",
+    False,
+    "Ignore a compatible cached pre-matching target and fit a replacement.",
+)
 
 
 
@@ -72,8 +82,17 @@ def main(argv):
     target_images, target_image_names, target_cameras = dataset.load_factor_views(target_factor_dict)
 
     source_gs = build_shared_matching_source(input_factor_dict, target_factor_dict, device)
-    matching_target_gs = fit_shared_matching_target(
-        source_gs, target_images, target_cameras, FLAGS.output_dir, logger, matching_cfg
+    matching_target_gs, matching_cache = get_or_fit_shared_matching_target(
+        source_gs=source_gs,
+        target_images=target_images,
+        target_cameras=target_cameras,
+        pre_matching_root=FLAGS.pre_matching_root,
+        scene_name=scene["scene_name"],
+        input_factor=FLAGS.input_factor,
+        target_factor=FLAGS.target_factor,
+        logger=logger,
+        config=matching_cfg,
+        force_pre_matching=FLAGS.force_pre_matching,
     )
     eval_chunk_size = dataset.image_per_scene if dataset.image_per_scene is not None else len(target_images)
     if eval_chunk_size <= 0:
@@ -153,6 +172,8 @@ def main(argv):
         f"input_gaussians={input_factor_dict['gs_params']['means'].shape[0]}\n"
         f"matching_target_gaussians={matching_target_gs['means'].shape[0]}\n"
         f"input_factor={FLAGS.input_factor} target_factor={FLAGS.target_factor}\n"
+        f"matching_cache={matching_cache['status']}\n"
+        f"matching_cache_path={matching_cache['checkpoint_path']}\n"
         f"matching_steps={matching_cfg['total_steps']}\n"
         f"matching_images_per_step={matching_cfg['image_per_step']}\n"
         f"loss_features={','.join(loss_features)}\n"

@@ -60,6 +60,8 @@ matching_steps=${MATCHING_STEPS:-3000}
 matching_image_per_step=${MATCHING_IMAGE_PER_STEP:-16}
 matching_l1_weight=${MATCHING_L1_LOSS_WEIGHT:-1.0}
 matching_lpips_weight=${MATCHING_LPIPS_LOSS_WEIGHT:-1.0}
+pre_matching_root=${PRE_MATCHING_ROOT:-/project2/ricky/splatformer-data-to-4x}
+force_pre_matching=${FORCE_PRE_MATCHING:-false}
 out_name=${scene_name}_if${input_factor}_tf${target_factor}_noemd_mse_${loss_name}_${model_output_suffix}
 output_root=${OUTPUT_ROOT:-/project2/ricky/experiments/0809/overfit_sr_mse_noemd_512}
 output_dir=${output_root}/${out_name}
@@ -69,6 +71,8 @@ TORCH_CUDNN_V8_API_DISABLED=1 CUDA_VISIBLE_DEVICES=$GPU_ID python overfit-sr-mse
     --scene_name=${scene_name} \
     --input_factor=${input_factor} \
     --target_factor=${target_factor} \
+    --pre_matching_root="${pre_matching_root}" \
+    --force_pre_matching=${force_pre_matching} \
     --loss_features=${loss_features} \
     --model_features_from_loss=${model_features_from_loss} \
     --post_activate_loss=${post_activate_loss} \

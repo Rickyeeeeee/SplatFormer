@@ -1,8 +1,11 @@
 """Fixed-cardinality gsplat fitting utilities for no-EMD SR workflows."""
 
 import csv
+import fcntl
 import json
 import os
+import tempfile
+from contextlib import contextmanager
 
 import cv2
 import gin
@@ -15,6 +18,9 @@ from utils.gs_utils import make_grid
 from utils.metrics import psnr, render_gs_average_metrics
 from utils.optimizers import build_3DGSoptimizer, build_scheduler
 from utils.sr_densify_utils import convert_gs_to_target_frame
+
+
+MATCHING_CACHE_VERSION = 1
 
 
 @gin.configurable
@@ -74,6 +80,142 @@ def detach_matching_target(trainable_gs, source_gs):
                 f"{tuple(source_value.shape)} -> {tuple(target_gs[key].shape)}"
             )
     return target_gs
+
+
+def matching_cache_dir(pre_matching_root, scene_name, input_factor, target_factor):
+    """Return the factor-specific persistent cache directory for one scene."""
+    scene_name = os.path.basename(os.path.normpath(scene_name))
+    if not scene_name or scene_name in {".", os.pardir}:
+        raise ValueError(f"Invalid scene name for matching cache: {scene_name!r}")
+    return os.path.join(
+        pre_matching_root,
+        scene_name,
+        f"if{int(input_factor)}_tf{int(target_factor)}",
+    )
+
+
+def _source_metadata(source_gs):
+    return {
+        key: {"shape": list(value.shape), "dtype": str(value.dtype)}
+        for key, value in sorted(source_gs.items())
+    }
+
+
+def _cache_metadata(scene_name, input_factor, target_factor, source_gs, matching_config):
+    return {
+        "version": MATCHING_CACHE_VERSION,
+        "scene_name": scene_name,
+        "input_factor": int(input_factor),
+        "target_factor": int(target_factor),
+        "source_attributes": _source_metadata(source_gs),
+        # Recorded for provenance only: matching settings intentionally do not invalidate a cache.
+        "matching_config": dict(matching_config),
+    }
+
+
+def _validate_cached_target(payload, expected_metadata, source_gs):
+    if not isinstance(payload, dict):
+        return None, "payload is not a dictionary"
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, dict):
+        return None, "missing metadata"
+    for key in ("version", "scene_name", "input_factor", "target_factor", "source_attributes"):
+        if metadata.get(key) != expected_metadata[key]:
+            return None, f"metadata mismatch for {key}"
+
+    target_gs = payload.get("target_gs")
+    if not isinstance(target_gs, dict) or set(target_gs) != set(source_gs):
+        return None, "target attributes do not match source attributes"
+    for key, source_value in source_gs.items():
+        target_value = target_gs[key]
+        if not torch.is_tensor(target_value):
+            return None, f"cached target {key} is not a tensor"
+        if target_value.shape != source_value.shape or target_value.dtype != source_value.dtype:
+            return None, f"cached target {key} shape or dtype mismatch"
+    return target_gs, None
+
+
+@contextmanager
+def _matching_cache_lock(cache_dir):
+    os.makedirs(cache_dir, exist_ok=True)
+    lock_path = os.path.join(cache_dir, ".matching.lock")
+    with open(lock_path, "a+") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _save_matching_cache(checkpoint_path, target_gs, metadata):
+    payload = {
+        "metadata": metadata,
+        "target_gs": {key: value.detach().cpu().clone() for key, value in target_gs.items()},
+    }
+    fd, temporary_path = tempfile.mkstemp(
+        prefix=".matching_target_", suffix=".pt", dir=os.path.dirname(checkpoint_path)
+    )
+    os.close(fd)
+    try:
+        torch.save(payload, temporary_path)
+        os.replace(temporary_path, checkpoint_path)
+    finally:
+        if os.path.exists(temporary_path):
+            os.unlink(temporary_path)
+
+
+def get_or_fit_matching_target(
+    source_gs,
+    target_images,
+    target_cameras,
+    pre_matching_root,
+    scene_name,
+    input_factor,
+    target_factor,
+    logger,
+    config,
+    force_pre_matching=False,
+):
+    """Load a compatible persistent matching target or fit and cache one."""
+    cache_dir = matching_cache_dir(pre_matching_root, scene_name, input_factor, target_factor)
+    checkpoint_path = os.path.join(cache_dir, "matching_target.pt")
+    metadata = _cache_metadata(scene_name, input_factor, target_factor, source_gs, config)
+    device = source_gs["means"].device
+
+    with _matching_cache_lock(cache_dir):
+        cache_reason = "forced rematch" if force_pre_matching else "checkpoint not found"
+        if not force_pre_matching and os.path.isfile(checkpoint_path):
+            try:
+                payload = torch.load(checkpoint_path, map_location="cpu")
+                cached_target, cache_reason = _validate_cached_target(payload, metadata, source_gs)
+            except Exception as exc:
+                cached_target = None
+                cache_reason = f"failed to load checkpoint: {exc}"
+            if cached_target is not None:
+                target_gs = {
+                    key: value.detach().clone().to(device=device, dtype=source_gs[key].dtype)
+                    for key, value in cached_target.items()
+                }
+                logger.info("Pre-matching cache hit: %s", checkpoint_path)
+                return target_gs, {
+                    "status": "hit",
+                    "cache_dir": cache_dir,
+                    "checkpoint_path": checkpoint_path,
+                    "reason": "compatible checkpoint",
+                }
+
+        logger.info("Pre-matching cache miss (%s): %s", cache_reason, checkpoint_path)
+        target_gs = fit_matching_target(
+            source_gs, target_images, target_cameras, cache_dir, logger, config
+        )
+        _save_matching_cache(checkpoint_path, target_gs, metadata)
+        logger.info("Pre-matching cache saved: %s", checkpoint_path)
+        return target_gs, {
+            "status": "refit",
+            "cache_dir": cache_dir,
+            "checkpoint_path": checkpoint_path,
+            "reason": cache_reason,
+        }
 
 
 def _compute_matching_render_loss(
