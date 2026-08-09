@@ -315,6 +315,26 @@ def export_ply_forviewer(gs_params, filename):
 
     write_ply_v2(str(filename), map_to_tensors)
 
+def load_ply_forviewer(filename):
+    """Load Gaussian parameters written by export_ply_forviewer."""
+    vertex = PlyData.read(str(filename))["vertex"]
+    names = vertex.data.dtype.names or []
+    rest_names = sorted([name for name in names if name.startswith("f_rest_")], key=lambda name: int(name[7:]))
+    means = np.stack([vertex["x"], vertex["y"], vertex["z"]], axis=-1)
+    features_dc = np.stack([vertex[f"f_dc_{index}"] for index in range(3)], axis=-1)
+    if rest_names:
+        features_rest = np.stack([vertex[name] for name in rest_names], axis=-1)
+        features_rest = features_rest.reshape(means.shape[0], 3, -1).transpose(0, 2, 1)
+    else:
+        features_rest = np.zeros((means.shape[0], 0, 3), dtype=np.float32)
+    return {
+        "means": torch.from_numpy(means.astype(np.float32)),
+        "features_dc": torch.from_numpy(features_dc.astype(np.float32)),
+        "features_rest": torch.from_numpy(features_rest.astype(np.float32)),
+        "opacities": torch.from_numpy(np.asarray(vertex["opacity"], dtype=np.float32).reshape(-1, 1)),
+        "scales": torch.from_numpy(np.stack([vertex[f"scale_{index}"] for index in range(3)], axis=-1).astype(np.float32)),
+        "quats": torch.from_numpy(np.stack([vertex[f"rot_{index}"] for index in range(4)], axis=-1).astype(np.float32)),
+    }
 def write_ply_v2(path, map_to_tensors):
     '''
     from Inria's 3DGS implementation

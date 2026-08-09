@@ -20,8 +20,9 @@ target_factor=${8:-2}
 mse_loss_mode=${9:-${MSE_LOSS_MODE:-post_activate}}
 direct_prediction=${10:-${DIRECT_PREDICTION:-false}}
 means_origin_scale=${11:-${MEANS_ORIGIN_SCALE:-1.01}}
-gs_statistics_path=${12:-${GS_STATISTICS_PATH:-}}
-conda_env=${CONDA_ENV:-3dgs-sr}
+image_l1_loss_weight=${12:-${IMAGE_L1_LOSS_WEIGHT:-1.0}}
+lpips_loss_weight=${13:-${LPIPS_LOSS_WEIGHT:-1.0}}
+gs_statistics_path=${14:-${GS_STATISTICS_PATH:-}}
 
 to_bit() {
     case "$1" in
@@ -57,7 +58,7 @@ case "${mse_loss_mode}" in
         ;;
 esac
 out_name=${scene_name}_${attribute_init}_if${input_factor}_tf${target_factor}_mse_mix_${mse_loss_mode}_${output_features_type}${stats_suffix}
-output_dir=/project/ricky/experiments/0803/overfit_sr_mse_mix_512/${out_name}
+output_dir=/project/ricky/experiments/0805/overfit_sr_mse_mix_512/${out_name}
 
 CUDA_VISIBLE_DEVICES=$GPU_ID python overfit-sr-mse-mix.py \
     --output_dir=${output_dir} \
@@ -77,6 +78,8 @@ CUDA_VISIBLE_DEVICES=$GPU_ID python overfit-sr-mse-mix.py \
     --gin_param="training.save_interval=${save_interval}" \
     --gin_param="training.eval_interval=${eval_interval}" \
     --gin_param="training.log_image_interval=${log_image_interval}" \
+    --gin_param="training.image_l1_loss_weight=${image_l1_loss_weight}" \
+    --gin_param="training.lpips_loss_weight=${lpips_loss_weight}" \
     --gin_param="train_dataset/SplatFactoMultiLevelDataset.nerfstudio_folder='/project/ricky/splatformer-data/test-set-512/objaverse/nerfstudio'" \
     --gin_param="train_dataset/SplatFactoMultiLevelDataset.colmap_folder='/project/ricky/splatformer-data/test-set-512/objaverse/colmap'"
 # done
