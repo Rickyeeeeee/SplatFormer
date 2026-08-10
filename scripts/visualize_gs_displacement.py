@@ -805,7 +805,7 @@ def main():
     _validate_interpolation_endpoints(input_gs, predicted_gs)
     residuals = compute_residuals(input_gs, predicted_gs)
     output_dir = args.output_dir or predicted_path.parent / "displacement_residuals"
-    write_residual_outputs(output_dir, input_path, predicted_path, input_gs, predicted_gs, residuals, args.hist_bins, args.write_per_point_csv)
+    # write_residual_outputs(output_dir, input_path, predicted_path, input_gs, predicted_gs, residuals, args.hist_bins, args.write_per_point_csv)
 
     count = input_gs["means"].shape[0]
     print(f"Compared {count:,} row-aligned Gaussians", flush=True)

@@ -65,7 +65,7 @@ if [ -n "${gs_statistics_path}" ]; then
     gs_statistics_args=(--gs_statistics_path="${gs_statistics_path}")
 fi
 out_name=${scene_name}_${attribute_init}_if${input_factor}_tf${target_factor}_mse_${loss_name}_${model_output_suffix}${stats_suffix}
-output_dir=/project/ricky/experiments/0803/overfit_sr_mse_512/${out_name}
+output_dir=/project2/ricky/experiments/0810-fixed/overfit_sr_mse_512/${out_name}
 
 TORCH_CUDNN_V8_API_DISABLED=1 CUDA_VISIBLE_DEVICES=$GPU_ID python overfit-sr-mse.py \
     --output_dir=${output_dir} \
@@ -87,8 +87,8 @@ TORCH_CUDNN_V8_API_DISABLED=1 CUDA_VISIBLE_DEVICES=$GPU_ID python overfit-sr-mse
     --gin_param="training.save_interval=${save_interval}" \
     --gin_param="training.eval_interval=${eval_interval}" \
     --gin_param="training.log_image_interval=${log_image_interval}" \
-    --gin_param="train_dataset/SplatFactoMultiLevelDataset.nerfstudio_folder='/project/ricky/splatformer-data/test-set-512/objaverse/nerfstudio'" \
-    --gin_param="train_dataset/SplatFactoMultiLevelDataset.colmap_folder='/project/ricky/splatformer-data/test-set-512/objaverse/colmap'"
+    --gin_param="train_dataset/SplatFactoMultiLevelDataset.nerfstudio_folder='/project2/ricky/splatformer-data/test-set-512/objaverse/nerfstudio'" \
+    --gin_param="train_dataset/SplatFactoMultiLevelDataset.colmap_folder='/project2/ricky/splatformer-data/test-set-512/objaverse/colmap'"
 # done
 
 

@@ -63,7 +63,7 @@ matching_lpips_weight=${MATCHING_LPIPS_LOSS_WEIGHT:-1.0}
 pre_matching_root=${PRE_MATCHING_ROOT:-/project2/ricky/splatformer-data-to-4x}
 force_pre_matching=${FORCE_PRE_MATCHING:-false}
 out_name=${scene_name}_if${input_factor}_tf${target_factor}_noemd_mse_${loss_name}_${model_output_suffix}
-output_root=${OUTPUT_ROOT:-/project2/ricky/experiments/0809/overfit_sr_mse_noemd_512}
+output_root=${OUTPUT_ROOT:-/project2/ricky/experiments/0810-fixed/overfit_sr_mse_noemd_512}
 output_dir=${output_root}/${out_name}
 
 TORCH_CUDNN_V8_API_DISABLED=1 CUDA_VISIBLE_DEVICES=$GPU_ID python overfit-sr-mse-noemd.py \
@@ -90,5 +90,5 @@ TORCH_CUDNN_V8_API_DISABLED=1 CUDA_VISIBLE_DEVICES=$GPU_ID python overfit-sr-mse
     --gin_param="matching_fit.image_per_step=${matching_image_per_step}" \
     --gin_param="matching_fit.image_l1_loss_weight=${matching_l1_weight}" \
     --gin_param="matching_fit.lpips_loss_weight=${matching_lpips_weight}" \
-    --gin_param="train_dataset/SplatFactoMultiLevelDataset.nerfstudio_folder='/project/ricky/splatformer-data/test-set-512/objaverse/nerfstudio'" \
-    --gin_param="train_dataset/SplatFactoMultiLevelDataset.colmap_folder='/project/ricky/splatformer-data/test-set-512/objaverse/colmap'"
+    --gin_param="train_dataset/SplatFactoMultiLevelDataset.nerfstudio_folder='/project2/ricky/splatformer-data/test-set-512/objaverse/nerfstudio'" \
+    --gin_param="train_dataset/SplatFactoMultiLevelDataset.colmap_folder='/project2/ricky/splatformer-data/test-set-512/objaverse/colmap'"
