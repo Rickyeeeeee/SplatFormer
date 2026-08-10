@@ -1,3 +1,4 @@
+import json
 import os
 
 import cv2
@@ -9,7 +10,7 @@ from tqdm import tqdm
 
 from models.feature_flow_predictor import GSFlowPredictor
 from models.feature_predictor import FeaturePredictor  # Registers legacy gin keys used by GS_multi.
-from utils import gpu_utils, gs_utils
+from utils import gpu_utils, gs_utils, loss_utils
 from utils.gpu_utils import seed_everything
 from utils.gs_utils import (
     copy_gt_attributes,
@@ -55,6 +56,12 @@ flags.DEFINE_boolean(
 )
 flags.DEFINE_integer("flow_steps", None, "Euler sampling steps; overrides gin flow_matching.flow_steps")
 flags.DEFINE_float("flow_noise_std", None, "Stochastic-interpolant noise scale multiplying sqrt(2t(1-t))")
+flags.DEFINE_enum(
+    "flow_loss_type",
+    None,
+    ["velocity", "x1"],
+    "Flow objective; overrides gin flow_matching.loss_type.",
+)
 flags.DEFINE_string(
     "loss_features",
     "",
@@ -78,7 +85,7 @@ flags.DEFINE_multi_string("gin_param", "", "Newline separated list of Gin parame
 
 FLAGS = flags.FLAGS
 FLOW_KEYS = SUPPORTED_GS_KEYS
-EVAL_FLOW_STEPS = [1, 2, 5]
+EVAL_FLOW_STEPS = [1, 5, 20]
 MEANS_LOSS_REDUCTION = "mean"  # Set to "sum" to match PUFM-style summed point loss.
 EPS = 1e-6
 
@@ -98,6 +105,8 @@ def training(
     save_interval=gin.REQUIRED,
     log_image_interval=gin.REQUIRED,
     grad_clip_norm=gin.REQUIRED,
+    image_l1_loss_weight=1.0,
+    lpips_loss_weight=0.0,
     resume_from_step=0,
     enable_amp=False,
     empty_cache_fre=-1,
@@ -111,6 +120,8 @@ def training(
         "save_interval": save_interval,
         "log_image_interval": log_image_interval,
         "grad_clip_norm": grad_clip_norm,
+        "image_l1_loss_weight": image_l1_loss_weight,
+        "lpips_loss_weight": lpips_loss_weight,
         "resume_from_step": resume_from_step,
         "enable_amp": enable_amp,
         "empty_cache_fre": empty_cache_fre,
@@ -122,12 +133,51 @@ def flow_matching(
     flow_steps=5,
     flow_noise_std=0.0,
     flow_t_eps=1e-4,
+    loss_type="velocity",
+    velocity_variance_floor=1e-8,
 ):
+    if loss_type not in ("velocity", "x1"):
+        raise ValueError(
+            f"Unsupported flow_matching.loss_type={loss_type!r}; expected 'velocity' or 'x1'"
+        )
+    if float(velocity_variance_floor) <= 0.0:
+        raise ValueError(
+            "flow_matching.velocity_variance_floor must be positive, "
+            f"got {velocity_variance_floor}"
+        )
     return {
         "flow_steps": flow_steps,
         "flow_noise_std": flow_noise_std,
         "flow_t_eps": flow_t_eps,
+        "loss_type": loss_type,
+        "velocity_variance_floor": float(velocity_variance_floor),
     }
+
+@gin.configurable
+def loss_mixing(schedule="linear"):
+    valid_schedules = ("linear", "free-range-gs", "fm-only")
+    if schedule not in valid_schedules:
+        raise ValueError(
+            f"Unsupported loss_mixing.schedule={schedule!r}; "
+            f"expected one of {valid_schedules}"
+        )
+    return {"schedule": schedule}
+
+
+def get_loss_mix_weights(t, schedule):
+    """Return FM and render weights for the sampled GSFM flow time."""
+    if schedule == "linear":
+        return 1.0 - t, t
+    if schedule == "free-range-gs":
+        render_weight = 50.0 * torch.clamp(t / 0.9, max=1.0).pow(5)
+        return torch.ones_like(t), render_weight
+    if schedule == "fm-only":
+        return torch.ones_like(t), torch.zeros_like(t)
+    raise ValueError(
+        f"Unsupported loss_mixing.schedule={schedule!r}; "
+        "expected one of ('linear', 'free-range-gs', 'fm-only')"
+    )
+
 
 
 @gin.configurable
@@ -211,6 +261,80 @@ def subtract_stochastic_velocity(pred_vel, flow_noise, gamma_dot):
     }
 
 
+def compute_matching_velocity_variances(
+    source_flow_gs, target_flow_gs, loss_features, variance_floor
+):
+    raw_variances = {}
+    effective_variances = {}
+    for key in loss_features:
+        if key not in source_flow_gs or key not in target_flow_gs:
+            raise ValueError(f"Cannot compute velocity variance for missing feature {key!r}")
+        if source_flow_gs[key].shape != target_flow_gs[key].shape:
+            raise ValueError(
+                f"Velocity variance shape mismatch for {key!r}: "
+                f"source {tuple(source_flow_gs[key].shape)} vs "
+                f"target {tuple(target_flow_gs[key].shape)}"
+            )
+        gt_velocity = (target_flow_gs[key] - source_flow_gs[key]).detach().float()
+        variance = gt_velocity.var(dim=0, unbiased=False)
+        raw_variances[key] = variance
+        effective_variances[key] = variance.clamp_min(float(variance_floor))
+    return raw_variances, effective_variances
+
+
+def format_velocity_variances(raw_variances, effective_variances):
+    report = {
+        key: {
+            "variance": raw_variances[key].detach().cpu().tolist(),
+            "effective_variance": effective_variances[key].detach().cpu().tolist(),
+        }
+        for key in raw_variances
+    }
+    return json.dumps(report, sort_keys=True)
+
+
+def compute_variance_normalized_velocity_loss(
+    pred_vel,
+    source_flow_gs,
+    target_flow_gs,
+    flow_noise,
+    gamma_dot,
+    loss_features,
+    velocity_variances,
+    loss_weights=None,
+):
+    if loss_weights is None:
+        loss_weights = {}
+    losses = {}
+    weighted_losses = {}
+    total_loss = None
+    for key in loss_features:
+        if key not in pred_vel:
+            raise ValueError(f"Selected velocity feature {key!r} missing from model output")
+        pred = pred_vel[key].float()
+        target = (target_flow_gs[key] - source_flow_gs[key]).to(
+            device=pred.device, dtype=pred.dtype
+        )
+        if key in flow_noise:
+            noise = flow_noise[key].to(device=pred.device, dtype=pred.dtype)
+            target = target + gamma_dot.to(device=pred.device, dtype=pred.dtype) * noise
+        variance = velocity_variances[key].to(device=pred.device, dtype=pred.dtype)
+        loss = ((pred - target).square() / variance).mean()
+        weighted_loss = float(loss_weights.get(key, 1.0)) * loss
+        losses[key] = loss
+        weighted_losses[key] = weighted_loss
+        total_loss = weighted_loss if total_loss is None else total_loss + weighted_loss
+
+    if total_loss is None:
+        raise ValueError("No variance-normalized velocity MSE losses were computed")
+    if not total_loss.requires_grad:
+        raise ValueError(
+            "Selected velocity loss features do not receive gradients. "
+            "Make sure GSFlowPredictor.output_features includes a selected feature."
+        )
+    return total_loss, losses, weighted_losses
+
+
 def _apply_model_flow_update(model, feature, value, update, step_scale=1.0):
     if model is not None and hasattr(model, "apply_feature_update"):
         return model.apply_feature_update(feature, value, update, step_scale)
@@ -230,16 +354,28 @@ def apply_flow_velocity(source_flow_gs, pred_vel, model=None):
     }
 
 
-def predict_x1_from_velocity(model, query_flow_gs, pred_vel, flow_noise, gamma, gamma_dot, t):
+def predict_x1_from_velocity(
+    model,
+    source_flow_gs,
+    query_flow_gs,
+    pred_vel,
+    flow_noise,
+    gamma,
+    gamma_dot,
+    t,
+    source_anchored=True,
+):
     one_minus_t = (1.0 - t).view(1, 1)
     x1_pred = {}
     for key, query_value in query_flow_gs.items():
         clean_xt = query_value - gamma * flow_noise.get(key, torch.zeros_like(query_value))
+        base_value = source_flow_gs[key] if source_anchored else clean_xt
+        step_scale = 1.0 if source_anchored else one_minus_t
         if key in pred_vel:
             clean_vel = pred_vel[key] - gamma_dot * flow_noise.get(key, torch.zeros_like(pred_vel[key]))
-            x1_pred[key] = _apply_model_flow_update(model, key, clean_xt, clean_vel, one_minus_t)
+            x1_pred[key] = _apply_model_flow_update(model, key, base_value, clean_vel, step_scale)
         else:
-            x1_pred[key] = clean_xt.clone()
+            x1_pred[key] = base_value.clone()
     return x1_pred
 
 
@@ -421,6 +557,8 @@ def _resolve_flow_cfg():
         cfg["flow_steps"] = FLAGS.flow_steps
     if FLAGS.flow_noise_std is not None:
         cfg["flow_noise_std"] = FLAGS.flow_noise_std
+    if FLAGS.flow_loss_type is not None:
+        cfg["loss_type"] = FLAGS.flow_loss_type
     if not (0.0 < float(cfg["flow_t_eps"]) < 0.5):
         raise ValueError(f"flow_t_eps must be in (0, 0.5), got {cfg['flow_t_eps']}")
     return cfg
@@ -434,6 +572,7 @@ def main(argv):
     train_cfg = training(output_dir=FLAGS.output_dir)
     matching_cfg = matching_fit()
     flow_cfg = _resolve_flow_cfg()
+    mix_cfg = loss_mixing()
     mse_loss_cfg = feature_mse_loss()
     set_seed()
 
@@ -489,6 +628,22 @@ def main(argv):
     loss_target_gs = scale_means_origin(matching_target_gs, means_origin_scale)
     source_flow_gs = _clone_gs(source_gs)
     target_flow_gs = _clone_gs(loss_target_gs)
+    raw_velocity_variances, velocity_variances = compute_matching_velocity_variances(
+        source_flow_gs,
+        target_flow_gs,
+        loss_features,
+        flow_cfg["velocity_variance_floor"],
+    )
+    variance_message = (
+        "GT matching velocity variances: "
+        + format_velocity_variances(raw_velocity_variances, velocity_variances)
+    )
+    print(variance_message)
+    logger.info(variance_message)
+    if flow_cfg["loss_type"] == "velocity":
+        flow_loss_weights = {key: 1.0 for key in loss_features}
+    else:
+        flow_loss_weights = mse_loss_cfg["loss_weights"]
     batch_scene_idx = [scene["idx"]]
 
     with gin.config_scope("train2D"):
@@ -507,8 +662,17 @@ def main(argv):
     resume_from_step = train_cfg["resume_from_step"]
     enable_amp = train_cfg["enable_amp"]
     empty_cache_fre = train_cfg["empty_cache_fre"]
+    image_l1_loss_weight = train_cfg["image_l1_loss_weight"]
+    lpips_loss_weight = train_cfg["lpips_loss_weight"]
+    is_fm_only = mix_cfg["schedule"] == "fm-only"
+    render_view_count = 0
+    if not is_fm_only:
+        render_view_count = min(dataset.image_per_scene or len(target_images), len(target_images))
+        if render_view_count <= 0:
+            raise ValueError("No target views available for render loss")
 
     scaler = torch.cuda.amp.GradScaler(enabled=enable_amp)
+    lpips_loss_func = loss_utils.lpips_loss_fn() if not is_fm_only and lpips_loss_weight > 0 else None
 
     print(
         f"GSFM scene={scene['scene_name']} idx={scene['idx']} "
@@ -526,10 +690,16 @@ def main(argv):
         f"flow_steps={flow_cfg['flow_steps']} "
         f"flow_noise_std={flow_cfg['flow_noise_std']} "
         f"flow_t_eps={flow_cfg['flow_t_eps']} "
+        f"flow_loss_type={flow_cfg['loss_type']} "
+        f"velocity_variance_floor={flow_cfg['velocity_variance_floor']} "
+        f"loss_mix_schedule={mix_cfg['schedule']} "
+        f"image_l1_loss_weight={image_l1_loss_weight} "
+        f"lpips_loss_weight={lpips_loss_weight} "
+        f"render_views_per_step={render_view_count} "
         f"means_origin_scale={requested_means_origin_scale} "
         f"effective_means_origin_scale={means_origin_scale} "
         f"quat_direct_mse={mse_loss_cfg['quat_direct_mse']} "
-        f"loss_weights={mse_loss_cfg['loss_weights']}"
+        f"loss_weights={flow_loss_weights}"
     )
     logger.info(
         f"means_origin_scale={requested_means_origin_scale} "
@@ -552,29 +722,74 @@ def main(argv):
     flow_noise_std = float(flow_cfg["flow_noise_std"])
     for step in pbar:
         t = torch.empty(1, device=device).uniform_(flow_t_eps, 1.0 - flow_t_eps)
+        if not is_fm_only:
+            camera_indices = np.random.permutation(len(target_images))[:render_view_count]
+            train_images, _, train_cameras = dataset.load_factor_views(target_factor_dict, cam_ids=camera_indices)
+            train_images = gpu_utils.move_to_device(train_images, device)
+            train_cameras = gpu_utils.move_to_device(train_cameras, device)
         query_flow_gs, flow_noise, gamma, gamma_dot = sample_stochastic_interpolant(
             source_flow_gs, target_flow_gs, t, flow_noise_std
         )
         with torch.cuda.amp.autocast(enabled=enable_amp):
             pred_vel = model(batch_flow_gs=[query_flow_gs], batch_scene_idx=batch_scene_idx, t=t)[0]
             x1_pred_flow_gs = predict_x1_from_velocity(
-                model, query_flow_gs, pred_vel, flow_noise, gamma, gamma_dot, t
+                model, source_flow_gs, query_flow_gs, pred_vel, flow_noise, gamma, gamma_dot, t
             )
-            x1_pred_raw_gs = x1_pred_flow_gs
-            total_loss, attr_losses, weighted_attr_losses = compute_feature_mse_loss(
-                x1_pred_raw_gs,
-                loss_target_gs,
-                loss_features,
-                loss_weights=mse_loss_cfg["loss_weights"],
-                quat_direct_mse=mse_loss_cfg["quat_direct_mse"],
-                means_loss_reduction=MEANS_LOSS_REDUCTION,
-                output_label="predicted x1",
-                total_loss_error="No x1_pred MSE losses were computed",
-                grad_error=(
-                    "Selected loss features do not receive gradients. "
-                    "Make sure GSFlowPredictor.output_features includes at least one selected loss feature."
-                ),
-            )
+            if flow_cfg["loss_type"] == "velocity":
+                fm_loss, attr_losses, weighted_attr_losses = (
+                    compute_variance_normalized_velocity_loss(
+                        pred_vel,
+                        source_flow_gs,
+                        target_flow_gs,
+                        flow_noise,
+                        gamma_dot,
+                        loss_features,
+                        velocity_variances,
+                        loss_weights=flow_loss_weights,
+                    )
+                )
+            else:
+                fm_loss, attr_losses, weighted_attr_losses = compute_feature_mse_loss(
+                    x1_pred_flow_gs,
+                    loss_target_gs,
+                    loss_features,
+                    loss_weights=flow_loss_weights,
+                    post_activate_loss=True,
+                    quat_direct_mse=mse_loss_cfg["quat_direct_mse"],
+                    means_loss_reduction=MEANS_LOSS_REDUCTION,
+                    output_label="predicted x1",
+                    total_loss_error="No x1_pred MSE losses were computed",
+                    grad_error=(
+                        "Selected loss features do not receive gradients. "
+                        "Make sure GSFlowPredictor.output_features includes at least one selected loss feature."
+                    ),
+                )
+            if is_fm_only:
+                render_l1 = fm_loss.new_zeros(())
+                render_lpips = render_l1
+                weighted_render_l1 = render_l1
+                weighted_render_lpips = render_l1
+                render_loss = render_l1
+            else:
+                render_gs = unscale_means_origin(x1_pred_flow_gs, means_origin_scale)
+                pred_imgs, _ = gs_utils.rasterize_gaussians_to_multiimgs(render_gs, train_cameras)
+                render_l1 = sum(
+                    (pred_img - gt_img[..., :3]).abs().mean()
+                    for pred_img, gt_img in zip(pred_imgs, train_images)
+                ) / len(pred_imgs)
+                render_lpips = 0.0
+                if lpips_loss_func is not None:
+                    render_lpips = sum(
+                        lpips_loss_func(pred_img.unsqueeze(0), gt_img[..., :3].unsqueeze(0)).mean()
+                        for pred_img, gt_img in zip(pred_imgs, train_images)
+                    ) / len(pred_imgs)
+                weighted_render_l1 = image_l1_loss_weight * render_l1
+                weighted_render_lpips = (
+                    lpips_loss_weight * render_lpips if lpips_loss_func is not None else 0.0
+                )
+                render_loss = weighted_render_l1 + weighted_render_lpips
+            fm_mix_weight, render_mix_weight = get_loss_mix_weights(t, mix_cfg["schedule"])
+            total_loss = fm_mix_weight * fm_loss + render_mix_weight * render_loss
 
         if enable_amp:
             scaler.scale(total_loss).backward()
@@ -594,6 +809,8 @@ def main(argv):
 
         postfix = {
             "loss": f"{total_loss.item():.4f}",
+            "fm": f"{fm_loss.item():.4f}",
+            "render": f"{render_loss.item():.4f}",
             "t": f"{t.item():.3f}",
             "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
         }
@@ -608,13 +825,20 @@ def main(argv):
         if step % log_interval == 0:
             attr_str = " ".join(
                 [
-                    f"{key}_mse={attr_losses[key].item():.6f} "
+                    f"{key}_loss={attr_losses[key].item():.6f} "
                     f"{key}_weighted={weighted_attr_losses[key].item():.6f}"
                     for key in attr_losses.keys()
                 ]
             )
             logger.info(
-                f"step={step} total={total_loss.item():.6f} loss_type=x1_pred_mse "
+                f"step={step} total={total_loss.item():.6f} "
+                f"mix_schedule={mix_cfg['schedule']} "
+                f"fm_loss={fm_loss.item():.6f} fm_weight={fm_mix_weight.item():.6f} "
+                f"render_loss={render_loss.item():.6f} render_weight={render_mix_weight.item():.6f} "
+                f"render_l1={render_l1.item():.6f} weighted_render_l1={weighted_render_l1.item():.6f} "
+                f"render_lpips={render_lpips.item() if lpips_loss_func is not None else 0.0:.6f} "
+                f"weighted_render_lpips={weighted_render_lpips.item() if lpips_loss_func is not None else 0.0:.6f} "
+                f"sampled_views={render_view_count} loss_type={flow_cfg['loss_type']} "
                 f"loss_features={','.join(loss_features)} t={t.item():.6f} "
                 f"t_eps={flow_t_eps:.6f} gamma={gamma.item():.8f} gamma_dot={gamma_dot.item():.8f} "
                 f"lr={optimizer.param_groups[0]['lr']:.8f} {attr_str}"

@@ -56,6 +56,7 @@ class GSFlowPredictor(nn.Module):
         grid_resolution,
         resume_ckpt,
         zeroinit,
+        res_feature_activation,
         quat_residual_mode="add",
     ):
         super().__init__()
@@ -72,6 +73,7 @@ class GSFlowPredictor(nn.Module):
         self.input_feat_to_mlp = input_feat_to_mlp
         self.grid_resolution = grid_resolution
         self.resume_ckpt = resume_ckpt
+        self.res_feature_activation = res_feature_activation
         self.quat_residual_mode = quat_residual_mode
         self.backbone_type = "PT_FLOW"
 
@@ -170,6 +172,7 @@ class GSFlowPredictor(nn.Module):
         output = OrderedDict()
         for feature in self.output_features:
             feature_o = self.features_outputhead[feature](y)
+            feature_o = self.res_feature_activation[feature](feature_o)
             if feature == "features_rest":
                 feature_o = feature_o.view(feature_o.shape[0], -1, 3)
             output[feature] = feature_o

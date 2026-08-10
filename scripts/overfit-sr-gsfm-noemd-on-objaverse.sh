@@ -13,10 +13,13 @@ target_factor=${6:-2}
 loss_features=${7:-${LOSS_FEATURES:-means}}
 flow_steps=${8:-${FLOW_STEPS:-1}}
 flow_noise_std=${9:-${FLOW_NOISE_STD:-0.0}}
+image_l1_loss_weight=${10:-${IMAGE_L1_LOSS_WEIGHT:-1.0}}
+lpips_loss_weight=${11:-${LPIPS_LOSS_WEIGHT:-1.0}}
+mix_schedule=${12:-${MIX_SCHEDULE:-free-range-gs}}
 flow_t_eps=${FLOW_T_EPS:-1e-4}
-means_origin_scale=${MEANS_ORIGIN_SCALE:-1.05}
+means_origin_scale=${MEANS_ORIGIN_SCALE:-1.01}
 model_features_from_loss=${MODEL_FEATURES_FROM_LOSS:-false}
-matching_steps=${MATCHING_STEPS:-2000}
+matching_steps=${MATCHING_STEPS:-3000}
 matching_image_per_step=${MATCHING_IMAGE_PER_STEP:-16}
 matching_l1_weight=${MATCHING_L1_LOSS_WEIGHT:-1.0}
 matching_lpips_weight=${MATCHING_LPIPS_LOSS_WEIGHT:-1.0}
@@ -28,8 +31,8 @@ sanitize_name() {
 }
 
 loss_name="$(sanitize_name "${loss_features}")"
-out_name=${scene_name}_if${input_factor}_tf${target_factor}_gsfm_noemd_${loss_name}}
-output_root=${OUTPUT_ROOT:-/project2/ricky/experiments/0810/overfit_sr_gsfm_noemd_512}
+out_name=${scene_name}_if${input_factor}_tf${target_factor}_gsfm_noemd_${loss_name}_${mix_schedule}
+output_root=${OUTPUT_ROOT:-/project2/ricky/experiments/0810-fixed/overfit_sr_gsfm_noemd_512}
 output_dir=${output_root}/${out_name}
 
 CUDA_VISIBLE_DEVICES=$GPU_ID python overfit-sr-gsfm-noemd.py \
@@ -51,9 +54,12 @@ CUDA_VISIBLE_DEVICES=$GPU_ID python overfit-sr-gsfm-noemd.py \
     --gin_param="training.save_interval=${save_interval}" \
     --gin_param="training.eval_interval=${eval_interval}" \
     --gin_param="training.log_image_interval=${log_image_interval}" \
+    --gin_param="training.image_l1_loss_weight=${image_l1_loss_weight}" \
+    --gin_param="training.lpips_loss_weight=${lpips_loss_weight}" \
+    --gin_param="loss_mixing.schedule='${mix_schedule}'" \
     --gin_param="matching_fit.total_steps=${matching_steps}" \
     --gin_param="matching_fit.image_per_step=${matching_image_per_step}" \
     --gin_param="matching_fit.image_l1_loss_weight=${matching_l1_weight}" \
     --gin_param="matching_fit.lpips_loss_weight=${matching_lpips_weight}" \
-    --gin_param="train_dataset/SplatFactoMultiLevelDataset.nerfstudio_folder='/project/ricky/splatformer-data/test-set-512/objaverse/nerfstudio'" \
-    --gin_param="train_dataset/SplatFactoMultiLevelDataset.colmap_folder='/project/ricky/splatformer-data/test-set-512/objaverse/colmap'"
+    --gin_param="train_dataset/SplatFactoMultiLevelDataset.nerfstudio_folder='/project2/ricky/splatformer-data/test-set-512/objaverse/nerfstudio'" \
+    --gin_param="train_dataset/SplatFactoMultiLevelDataset.colmap_folder='/project2/ricky/splatformer-data/test-set-512/objaverse/colmap'"

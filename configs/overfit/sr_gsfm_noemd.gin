@@ -8,6 +8,8 @@ training.save_interval = 2000
 training.log_interval = 20
 training.log_image_interval = 2000
 training.grad_clip_norm = 2.0
+training.image_l1_loss_weight = 1.0
+training.lpips_loss_weight = 1.0
 training.resume_from_step = 0
 training.enable_amp = True
 training.empty_cache_fre = -1
@@ -15,6 +17,10 @@ training.empty_cache_fre = -1
 flow_matching.flow_steps = 5
 flow_matching.flow_noise_std = 0.0
 flow_matching.flow_t_eps = 1e-4
+flow_matching.loss_type = 'velocity'
+flow_matching.velocity_variance_floor = 1e-8
+
+loss_mixing.schedule = 'free-range-gs'
 
 # Fixed-cardinality gsplat fit that establishes the flow target correspondence.
 matching_total_steps = 1000

@@ -99,6 +99,7 @@ class PointTransformerV3FlowModel(nn.Module):
 
         self.backbone = PointTransformerV3(
             in_channels=in_channels,
+            embedding_type=embedding_type,
             order=("z", "z-trans", "hilbert", "hilbert-trans"),
             stride=stride,
             enc_depths=enc_depths,
@@ -123,6 +124,7 @@ class PointTransformerV3FlowModel(nn.Module):
             upcast_softmax=False,
             cls_mode=False,
             pdnorm_bn=pdnorm_bn,
+            turn_off_bn=turn_off_bn,
             pdnorm_ln=pdnorm_ln,
             pdnorm_decouple=True,
             pdnorm_adaptive=False,
