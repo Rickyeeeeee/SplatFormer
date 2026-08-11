@@ -57,8 +57,8 @@
 # GPU_ID=3 bash scripts/overfit-sr-mse-on-objaverse.sh 3000 3000 400 400 emd aligned 4 1 opacities
 # GPU_ID=3 bash scripts/overfit-sr-mse-on-objaverse.sh 3000 3000 400 400 emd aligned 4 1 features_dc
 # GPU_ID=3 bash scripts/overfit-sr-mse-on-objaverse.sh 3000 3000 400 400 emd aligned 4 1 features_rest
-GPU_ID=3 bash scripts/overfit-sr-mse-on-objaverse.sh 3000 3000 400 400 emd aligned 4 1 quats
-GPU_ID=3 bash scripts/overfit-sr-mse-on-objaverse.sh 4000 4000 400 400 emd aligned 4 1 means,opacities,features_dc,features_rest,scales,quats
+# GPU_ID=3 bash scripts/overfit-sr-mse-on-objaverse.sh 3000 3000 400 400 emd aligned 4 1 quats
+# GPU_ID=3 bash scripts/overfit-sr-mse-on-objaverse.sh 4000 4000 400 400 emd aligned 4 1 means,opacities,features_dc,features_rest,scales,quats
 # GPU_ID=0 bash scripts/overfit-sr-mse-on-objaverse.sh 5000 200 200 200 emd aligned 4 1 \
 #     means,opacities,features_dc,features_rest,scales,quats \
 #     False True 1.01 true ./gs_statistics.json
@@ -72,3 +72,5 @@ GPU_ID=3 bash scripts/overfit-sr-mse-on-objaverse.sh 4000 4000 400 400 emd align
 # GPU_ID=4 bash scripts/overfit-sr-mse-mix-on-objaverse.sh 2000 200 200 200 emd aligned 4 1 \
 #     post_activate false 1.01 1.0 1.0
 # GPU_ID=5 bash scripts/overfit-sr-gsfm-mix-on-objaverse.sh 8000 400 400 400 emd aligned 4 1
+
+MIX_SCHEDULE=fm-only GPU_ID=1 bash scripts/overfit-sr-gsfm-noemd-on-objaverse.sh 10000 10000 1000 1000 4 1 means,opacities,features_dc,features_rest,scales,quats

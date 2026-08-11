@@ -392,7 +392,12 @@ def sample_flow_model(model, source_flow_gs, scene_idx, flow_steps, fixed_flow_g
     with torch.no_grad():
         for step in range(flow_steps):
             t_value = torch.full((1,), float(step) / float(flow_steps), device=device)
-            pred_vel = model(batch_flow_gs=[state], batch_scene_idx=[scene_idx], t=t_value)[0]
+            pred_vel = model(
+                batch_flow_gs=[state],
+                batch_scene_idx=[scene_idx],
+                batch_reference_means=[source_flow_gs["means"]],
+                t=t_value,
+            )[0]
             for key in state.keys():
                 if key in pred_vel:
                     state[key] = _apply_model_flow_update(
@@ -731,7 +736,12 @@ def main(argv):
             source_flow_gs, target_flow_gs, t, flow_noise_std
         )
         with torch.cuda.amp.autocast(enabled=enable_amp):
-            pred_vel = model(batch_flow_gs=[query_flow_gs], batch_scene_idx=batch_scene_idx, t=t)[0]
+            pred_vel = model(
+                batch_flow_gs=[query_flow_gs],
+                batch_scene_idx=batch_scene_idx,
+                batch_reference_means=[source_flow_gs["means"]],
+                t=t,
+            )[0]
             x1_pred_flow_gs = predict_x1_from_velocity(
                 model, source_flow_gs, query_flow_gs, pred_vel, flow_noise, gamma, gamma_dot, t
             )

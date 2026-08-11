@@ -25,6 +25,10 @@ matching_l1_weight=${MATCHING_L1_LOSS_WEIGHT:-1.0}
 matching_lpips_weight=${MATCHING_LPIPS_LOSS_WEIGHT:-1.0}
 pre_matching_root=${PRE_MATCHING_ROOT:-/project2/ricky/splatformer-data-to-4x}
 force_pre_matching=${FORCE_PRE_MATCHING:-false}
+ptv3_drop_path=${PTV3_DROP_PATH:-0.3}
+ptv3_shuffle_orders=${PTV3_SHUFFLE_ORDERS:-True}
+ptv3_shuffle_orders_eval=${PTV3_SHUFFLE_ORDERS_EVAL:-True}
+ptv3_turn_off_bn=${PTV3_TURN_OFF_BN:-False}
 
 sanitize_name() {
     echo "$1" | tr ',' '-'
@@ -32,7 +36,7 @@ sanitize_name() {
 
 loss_name="$(sanitize_name "${loss_features}")"
 out_name=${scene_name}_if${input_factor}_tf${target_factor}_gsfm_noemd_${loss_name}_${mix_schedule}
-output_root=${OUTPUT_ROOT:-/project2/ricky/experiments/0810-fixed/overfit_sr_gsfm_noemd_512}
+output_root=${OUTPUT_ROOT:-/project2/ricky/experiments/0811-test-fixes/overfit_sr_gsfm_noemd_512}
 output_dir=${output_root}/${out_name}
 
 CUDA_VISIBLE_DEVICES=$GPU_ID python overfit-sr-gsfm-noemd.py \
@@ -50,7 +54,12 @@ CUDA_VISIBLE_DEVICES=$GPU_ID python overfit-sr-gsfm-noemd.py \
     --gin_param="flow_matching.flow_t_eps=${flow_t_eps}" \
     --gin_file=configs/model/ptv3_flow.gin \
     --gin_file=configs/overfit/sr_gsfm_noemd.gin \
+    --gin_param="PointTransformerV3FlowModel.drop_path=${ptv3_drop_path}" \
+    --gin_param="PointTransformerV3FlowModel.shuffle_orders=${ptv3_shuffle_orders}" \
+    --gin_param="PointTransformerV3FlowModel.shuffle_orders_eval=${ptv3_shuffle_orders_eval}" \
+    --gin_param="PointTransformerV3FlowModel.turn_off_bn=${ptv3_turn_off_bn}" \
     --gin_param="training.total_steps=${total_steps}" \
+    --gin_param="train2D/build_scheduler.total_step=${total_steps}" \
     --gin_param="training.save_interval=${save_interval}" \
     --gin_param="training.eval_interval=${eval_interval}" \
     --gin_param="training.log_image_interval=${log_image_interval}" \

@@ -67,6 +67,9 @@ class PointTransformerV3FlowModel(nn.Module):
         pdnorm_ln=False,
         pretrained_ckpt=None,
         T_dim=-1,
+        drop_path=0.3,
+        shuffle_orders=True,
+        shuffle_orders_eval=None,
     ):
         super(PointTransformerV3FlowModel, self).__init__()
         self.T_dim = T_dim
@@ -115,8 +118,9 @@ class PointTransformerV3FlowModel(nn.Module):
             qk_scale=None,
             attn_drop=0.0,
             proj_drop=0.0,
-            drop_path=0.3,
-            shuffle_orders=True,
+            drop_path=drop_path,
+            shuffle_orders=shuffle_orders,
+            shuffle_orders_eval=shuffle_orders_eval,
             pre_norm=True,
             enable_rpe=False,
             enable_flash=enable_flash,

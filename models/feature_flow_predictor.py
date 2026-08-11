@@ -137,7 +137,14 @@ class GSFlowPredictor(nn.Module):
             return torch.nn.functional.normalize(_quat_multiply(delta_quat, input_quat), dim=-1)
         return value + scale * update
 
-    def forward(self, batch_flow_gs: List[dict], batch_scene_idx: List[int], t=None, **kwargs):
+    def forward(
+        self,
+        batch_flow_gs: List[dict],
+        batch_scene_idx: List[int],
+        t=None,
+        batch_reference_means=None,
+        **kwargs,
+    ):
         del batch_scene_idx, kwargs
         if t is None:
             raise ValueError("GSFlowPredictor.forward requires a time tensor `t`")
@@ -151,7 +158,9 @@ class GSFlowPredictor(nn.Module):
             feat.append(torch.cat(feat_list, dim=1))
         feat = torch.cat(feat, dim=0)
 
-        coord = torch.cat([gs["means"] for gs in batch_flow_gs], dim=0)
+        if batch_reference_means is None:
+            batch_reference_means = [gs["means"] for gs in batch_flow_gs]
+        coord = torch.cat(batch_reference_means, dim=0)
         model_input = {
             "coord": coord,
             "grid_size": torch.ones([3], device=device) * 1.0 / self.grid_resolution,
