@@ -27,7 +27,12 @@
 #   --input_ply /project2/ricky/experiments/0809/overfit_sr_mse_noemd_512/3e288ee8aced4a0797e66d53536112b1_if4_tf1_noemd_mse_means_lossout/matching_init/00_input_low_res_gs.ply \
 #   --output_ply /project2/ricky/experiments/0809/overfit_sr_mse_noemd_512/3e288ee8aced4a0797e66d53536112b1_if4_tf1_noemd_mse_means_lossout/matching_init/01_fitted_target_gs.ply
 
+# python scripts/visualize_gs_displacement.py \
+#   --initial_view_mode gsplat \
+#   --input_ply /project2/ricky/experiments/0809/overfit_sr_mse_noemd_512/3e288ee8aced4a0797e66d53536112b1_if4_tf1_noemd_mse_means_lossout/eval_final/viewer/3e288ee8aced4a0797e66d53536112b1/point_cloud/input.ply \
+#   --output_ply /project2/ricky/experiments/0809/overfit_sr_mse_noemd_512/3e288ee8aced4a0797e66d53536112b1_if4_tf1_noemd_mse_means_lossout/eval_final/viewer/3e288ee8aced4a0797e66d53536112b1/point_cloud/output.ply
+
 python scripts/visualize_gs_displacement.py \
   --initial_view_mode gsplat \
-  --input_ply /project2/ricky/experiments/0809/overfit_sr_mse_noemd_512/3e288ee8aced4a0797e66d53536112b1_if4_tf1_noemd_mse_means_lossout/eval_final/viewer/3e288ee8aced4a0797e66d53536112b1/point_cloud/input.ply \
-  --output_ply /project2/ricky/experiments/0809/overfit_sr_mse_noemd_512/3e288ee8aced4a0797e66d53536112b1_if4_tf1_noemd_mse_means_lossout/eval_final/viewer/3e288ee8aced4a0797e66d53536112b1/point_cloud/output.ply
+  --input_ply /project2/ricky/experiments/0812/overfit_sr_gsfm_noemd_512/3e288ee8aced4a0797e66d53536112b1_if4_tf1_gsfm_noemd_means-opacities-features_dc-features_rest-scales-quats_linear/eval_final/flow_steps_20/viewer/3e288ee8aced4a0797e66d53536112b1/point_cloud/input.ply \
+  --output_ply /project2/ricky/experiments/0812/overfit_sr_gsfm_noemd_512/3e288ee8aced4a0797e66d53536112b1_if4_tf1_gsfm_noemd_means-opacities-features_dc-features_rest-scales-quats_linear/eval_final/flow_steps_20/viewer/3e288ee8aced4a0797e66d53536112b1/point_cloud/output.ply

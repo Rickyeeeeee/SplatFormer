@@ -17,7 +17,7 @@ from utils.metrics import psnr, ssim
 from utils.transform_utils import MinMaxScaler
 
 
-DEFAULT_RESOLUTIONS = (512, 128)
+DEFAULT_RESOLUTIONS = (512, 256, 128)
 EXPECTED_IMAGE_COUNT = 128
 CKPT_RELATIVE_PATH = Path("splatfacto/nerfstudio_models/step-000015001.ckpt")
 CAMERA_METADATA_NAME = "camera_for-3d-denoise.pkl"

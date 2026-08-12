@@ -24,7 +24,7 @@ FACTOR_TO_IMAGE_DIR = {
     2: "images_2",
     4: "images_4",
 }
-CKPT_RELATIVE_PATH = Path("splatfacto/nerfstudio_models/step-000010001.ckpt")
+CKPT_RELATIVE_PATH = Path("splatfacto/nerfstudio_models/step-000015001.ckpt")
 CAMERA_METADATA_NAME = "camera_for-3d-denoise.pkl"
 OUTPUT_COLUMNS = [
     "scene",

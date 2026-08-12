@@ -25,10 +25,10 @@ matching_l1_weight=${MATCHING_L1_LOSS_WEIGHT:-1.0}
 matching_lpips_weight=${MATCHING_LPIPS_LOSS_WEIGHT:-1.0}
 pre_matching_root=${PRE_MATCHING_ROOT:-/project2/ricky/splatformer-data-to-4x}
 force_pre_matching=${FORCE_PRE_MATCHING:-false}
-ptv3_drop_path=${PTV3_DROP_PATH:-0.3}
+ptv3_drop_path=${PTV3_DROP_PATH:-0.0}
 ptv3_shuffle_orders=${PTV3_SHUFFLE_ORDERS:-True}
-ptv3_shuffle_orders_eval=${PTV3_SHUFFLE_ORDERS_EVAL:-True}
-ptv3_turn_off_bn=${PTV3_TURN_OFF_BN:-False}
+ptv3_shuffle_orders_eval=${PTV3_SHUFFLE_ORDERS_EVAL:-False}
+ptv3_turn_off_bn=${PTV3_TURN_OFF_BN:-True}
 
 sanitize_name() {
     echo "$1" | tr ',' '-'
@@ -36,7 +36,7 @@ sanitize_name() {
 
 loss_name="$(sanitize_name "${loss_features}")"
 out_name=${scene_name}_if${input_factor}_tf${target_factor}_gsfm_noemd_${loss_name}_${mix_schedule}
-output_root=${OUTPUT_ROOT:-/project2/ricky/experiments/0811-test-fixes/overfit_sr_gsfm_noemd_512}
+output_root=${OUTPUT_ROOT:-/project2/ricky/experiments/0812/overfit_sr_gsfm_noemd_512}
 output_dir=${output_root}/${out_name}
 
 CUDA_VISIBLE_DEVICES=$GPU_ID python overfit-sr-gsfm-noemd.py \
