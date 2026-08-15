@@ -15,7 +15,7 @@ input_factor=${7:-4}
 target_factor=${8:-1}
 post_activate_loss=${9:-${POST_ACTIVATE_LOSS:-true}}
 direct_prediction=${10:-${DIRECT_PREDICTION:-false}}
-means_origin_scale=${11:-${MEANS_ORIGIN_SCALE:-1.01}}
+means_origin_scale=${11:-${MEANS_ORIGIN_SCALE:-1.0}}
 gs_statistics_path=${12:-${GS_STATISTICS_PATH:-}}
 
 matching_steps=${MATCHING_STEPS:-2000}
@@ -24,7 +24,11 @@ matching_l1_weight=${MATCHING_L1_LOSS_WEIGHT:-1.0}
 matching_lpips_weight=${MATCHING_LPIPS_LOSS_WEIGHT:-1.0}
 alignment_cache_root=${ALIGNMENT_CACHE_ROOT:-/project2/ricky/splatformer-data-to-4x}
 force_alignment_fit=${FORCE_ALIGNMENT_FIT:-false}
-output_root=${OUTPUT_ROOT:-/project2/ricky/experiments/0810-fixed/overfit_sr_mse_512}
+ptv3_drop_path=${PTV3_DROP_PATH:-0.0}
+ptv3_shuffle_orders=${PTV3_SHUFFLE_ORDERS:-True}
+ptv3_shuffle_orders_eval=${PTV3_SHUFFLE_ORDERS_EVAL:-False}
+ptv3_turn_off_bn=${PTV3_TURN_OFF_BN:-True}
+output_root=${OUTPUT_ROOT:-/project2/ricky/experiments/0814-unify-tuned-wo-mean/overfit_sr_mse_512}
 
 to_bit() {
     case "$1" in
@@ -71,7 +75,7 @@ if [ -n "${gs_statistics_path}" ]; then
     gs_statistics_args=(--gs_statistics_path="${gs_statistics_path}")
 fi
 
-out_name=${scene_name}_${alignment}_${attribute_init}_if${input_factor}_tf${target_factor}_allattrs_${output_features_type}_pa${post_activate_bit}${stats_suffix}
+out_name=${scene_name}_${alignment}_${attribute_init}_if${input_factor}_tf${target_factor}_${output_features_type}_pa${post_activate_bit}${stats_suffix}
 output_dir=${output_root}/${out_name}
 
 echo "Using GPU: ${GPU_ID}"
@@ -90,6 +94,10 @@ TORCH_CUDNN_V8_API_DISABLED=1 CUDA_VISIBLE_DEVICES="${GPU_ID}" python overfit-sr
     --means_origin_scale="${means_origin_scale}" \
     --alignment_cache_root="${alignment_cache_root}" \
     --force_alignment_fit="${force_alignment_fit}" \
+    --ptv3_drop_path="${ptv3_drop_path}" \
+    --ptv3_shuffle_orders="${ptv3_shuffle_orders}" \
+    --ptv3_shuffle_orders_eval="${ptv3_shuffle_orders_eval}" \
+    --ptv3_turn_off_bn="${ptv3_turn_off_bn}" \
     "${gs_statistics_args[@]}" \
     --gin_file=configs/model/ptv3.gin \
     --gin_file=configs/overfit/sr_mse.gin \

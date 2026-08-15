@@ -90,7 +90,10 @@ class PointTransformerV3Model(nn.Module):
                 enc_channels=None,
                 pdnorm_bn=False,
                 pdnorm_ln=False,
-                pretrained_ckpt=None
+                pretrained_ckpt=None,
+                drop_path=0.3,
+                shuffle_orders=True,
+                shuffle_orders_eval=None,
                 ):
         super(PointTransformerV3Model, self).__init__()
         if dec_channels is None:
@@ -138,8 +141,9 @@ class PointTransformerV3Model(nn.Module):
             qk_scale=None,
             attn_drop=0.0,
             proj_drop=0.0,
-            drop_path=0.3,
-            shuffle_orders=True,
+            drop_path=drop_path,
+            shuffle_orders=shuffle_orders,
+            shuffle_orders_eval=shuffle_orders_eval,
             pre_norm=True,
             enable_rpe=False,
             enable_flash=enable_flash, #disable flash attention first
@@ -199,6 +203,7 @@ class PointTransformerV3(PointModule):
         drop_path=0.3,
         pre_norm=True,
         shuffle_orders=True,
+        shuffle_orders_eval=None,
         enable_rpe=False,
         enable_flash=True,
         upcast_attention=False,
@@ -217,6 +222,9 @@ class PointTransformerV3(PointModule):
         self.order = [order] if isinstance(order, str) else order
         self.cls_mode = cls_mode
         self.shuffle_orders = shuffle_orders
+        self.shuffle_orders_eval = (
+            shuffle_orders if shuffle_orders_eval is None else shuffle_orders_eval
+        )
 
         assert self.num_stages == len(stride) + 1
         assert self.num_stages == len(enc_depths)
@@ -288,6 +296,7 @@ class PointTransformerV3(PointModule):
                         stride=stride[s - 1],
                         norm_layer=bn_layer,
                         act_layer=act_layer,
+                        shuffle_orders=shuffle_orders,
                     ),
                     name="down",
                 )
@@ -367,9 +376,24 @@ class PointTransformerV3(PointModule):
                     )
                 self.dec.add(module=dec, name=f"dec{s}")
 
+    def train(self, mode=True):
+        super().train(mode)
+        shuffle_orders = (
+            self.shuffle_orders if mode else self.shuffle_orders_eval
+        )
+        for module in self.modules():
+            if isinstance(module, SerializedPooling):
+                module.shuffle_orders = shuffle_orders
+                if hasattr(module, "shuffle_orders_eval"):
+                    module.shuffle_orders_eval = shuffle_orders
+        return self
+
     def forward(self, data_dict):
         point = Point(data_dict)
-        point.serialization(order=self.order, shuffle_orders=self.shuffle_orders)
+        shuffle_orders = (
+            self.shuffle_orders if self.training else self.shuffle_orders_eval
+        )
+        point.serialization(order=self.order, shuffle_orders=shuffle_orders)
         point.sparsify()
         point = self.embedding(point)
         point = self.enc(point)

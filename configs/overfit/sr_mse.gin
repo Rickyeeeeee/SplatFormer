@@ -62,7 +62,7 @@ train2D/build_optimizer.lr_dict = {
 train2D/build_optimizer.optimizer_type = 'adam'
 train2D/build_optimizer.optimizer_params = {'eps': 1e-15}
 train2D/build_scheduler.total_step = %total_steps
-train2D/build_scheduler.schedule = 'constant'
+train2D/build_scheduler.schedule = 'linear'
 
 SplatFactoMultiLevelDataset.remove_outlier_ndevs = -1
 SplatFactoMultiLevelDataset.image_per_scene = None

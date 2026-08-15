@@ -55,6 +55,10 @@ flags.DEFINE_string("gs_statistics_path", None, "Channel-normalized attribute MS
 flags.DEFINE_float("means_origin_scale", 1.01, "Training-only target means scale")
 flags.DEFINE_string("alignment_cache_root", "/project2/ricky/splatformer-data-to-4x", "Cache")
 flags.DEFINE_boolean("force_alignment_fit", False, "Ignore cache")
+flags.DEFINE_float("ptv3_drop_path", 0.0, "PTV3 stochastic-depth rate")
+flags.DEFINE_boolean("ptv3_shuffle_orders", True, "Shuffle PTV3 serialization orders during training")
+flags.DEFINE_boolean("ptv3_shuffle_orders_eval", False, "Shuffle PTV3 serialization orders during evaluation")
+flags.DEFINE_boolean("ptv3_turn_off_bn", True, "Disable PTV3 batch normalization")
 flags.DEFINE_multi_string("gin_file", None, "List of paths to Gin config files")
 flags.DEFINE_multi_string("gin_param", "", "Gin parameter bindings")
 
@@ -379,7 +383,15 @@ def evaluate_single_scene(
 def main(argv):
     del argv
     os.makedirs(FLAGS.output_dir, exist_ok=True)
-    gin.parse_config_files_and_bindings(FLAGS.gin_file, FLAGS.gin_param)
+    ptv3_bindings = [
+        f"PointTransformerV3Model.drop_path={FLAGS.ptv3_drop_path}",
+        f"PointTransformerV3Model.shuffle_orders={FLAGS.ptv3_shuffle_orders}",
+        f"PointTransformerV3Model.shuffle_orders_eval={FLAGS.ptv3_shuffle_orders_eval}",
+        f"PointTransformerV3Model.turn_off_bn={FLAGS.ptv3_turn_off_bn}",
+    ]
+    gin.parse_config_files_and_bindings(
+        FLAGS.gin_file, [*FLAGS.gin_param, *ptv3_bindings]
+    )
     if FLAGS.gs_statistics_path is not None and FLAGS.post_activate_loss:
         raise ValueError("--gs_statistics_path cannot be used with --post_activate_loss")
 
