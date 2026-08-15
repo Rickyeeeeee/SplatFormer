@@ -81,7 +81,18 @@
 # GPU_ID=1 bash scripts/overfit-sr-gsfm-on-objaverse.sh 10000 10000 1000 1000 4 1 means,opacities,features_dc,features_rest,scales,quats
 
 # 0814
-GPU_ID=5 bash scripts/overfit-sr-mse-on-objaverse.sh 3000 3000 400 400 emd aligned 4 1
-GPU_ID=5 bash scripts/overfit-sr-mse-on-objaverse.sh 3000 3000 400 400 random aligned 4 1
-GPU_ID=5 bash scripts/overfit-sr-mse-on-objaverse.sh 3000 3000 400 400 fit_lr_to_hr aligned 4 1
-GPU_ID=5 bash scripts/overfit-sr-mse-on-objaverse.sh 3000 3000 400 400 fit_hr_to_lr aligned 4 1
+# GPU_ID=5 bash scripts/overfit-sr-mse-on-objaverse.sh 3000 3000 400 400 emd aligned 4 1
+# GPU_ID=5 bash scripts/overfit-sr-mse-on-objaverse.sh 3000 3000 400 400 random aligned 4 1
+# GPU_ID=5 bash scripts/overfit-sr-mse-on-objaverse.sh 3000 3000 400 400 fit_lr_to_hr aligned 4 1
+# GPU_ID=5 bash scripts/overfit-sr-mse-on-objaverse.sh 3000 3000 400 400 fit_hr_to_lr aligned 4 1
+
+# # 0815
+GPU_ID=0 bash scripts/overfit-sr-gsfm-on-objaverse.sh 10000 10000 400 400 emd aligned 4 1 fm-only
+GPU_ID=0 bash scripts/overfit-sr-gsfm-on-objaverse.sh 10000 10000 400 400 random aligned 4 1 fm-only
+GPU_ID=0 bash scripts/overfit-sr-gsfm-on-objaverse.sh 10000 10000 400 400 fit_lr_to_hr aligned 4 1 fm-only
+GPU_ID=0 bash scripts/overfit-sr-gsfm-on-objaverse.sh 10000 10000 400 400 fit_hr_to_lr aligned 4 1 fm-only
+GPU_ID=0 bash scripts/overfit-sr-gsfm-on-objaverse.sh 10000 10000 400 400 emd aligned 4 1 linear
+GPU_ID=0 bash scripts/overfit-sr-gsfm-on-objaverse.sh 10000 10000 400 400 random aligned 4 1 linear 
+GPU_ID=0 bash scripts/overfit-sr-gsfm-on-objaverse.sh 10000 10000 400 400 fit_lr_to_hr aligned 4 1 linear
+GPU_ID=0 bash scripts/overfit-sr-gsfm-on-objaverse.sh 10000 10000 400 400 fit_hr_to_lr aligned 4 1 linear 
+# GPU_ID=0 bash scripts/overfit-sr-gsfm-on-objaverse.sh 4000 4000 400 400 fit_lr_to_hr aligned 4 1 fm-only velocity -1 0.001
