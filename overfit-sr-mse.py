@@ -13,7 +13,7 @@ from tqdm import tqdm
 from models.feature_predictor import FeaturePredictor
 from utils import gpu_utils, gs_utils
 from utils.gpu_utils import seed_everything
-from utils.gs_utils import make_grid, scale_means_origin, unscale_means_origin
+from utils.gs_utils import make_grid
 from utils.log_utils import ProcessSafeLogger
 from utils.loss_utils import (
     SUPPORTED_GS_KEYS,
@@ -52,13 +52,8 @@ flags.DEFINE_float("emd_eps", 0.01, "Auction EMD epsilon")
 flags.DEFINE_integer("emd_iters", 100, "Auction EMD iterations")
 flags.DEFINE_boolean("post_activate_loss", True, "Post activation loss")
 flags.DEFINE_string("gs_statistics_path", None, "Channel-normalized attribute MSE.")
-flags.DEFINE_float("means_origin_scale", 1.01, "Training-only target means scale")
 flags.DEFINE_string("alignment_cache_root", "/project2/ricky/splatformer-data-to-4x", "Cache")
 flags.DEFINE_boolean("force_alignment_fit", False, "Ignore cache")
-flags.DEFINE_float("ptv3_drop_path", 0.0, "PTV3 stochastic-depth rate")
-flags.DEFINE_boolean("ptv3_shuffle_orders", True, "Shuffle PTV3 serialization orders during training")
-flags.DEFINE_boolean("ptv3_shuffle_orders_eval", False, "Shuffle PTV3 serialization orders during evaluation")
-flags.DEFINE_boolean("ptv3_turn_off_bn", True, "Disable PTV3 batch normalization")
 flags.DEFINE_multi_string("gin_file", None, "List of paths to Gin config files")
 flags.DEFINE_multi_string("gin_param", "", "Gin parameter bindings")
 
@@ -256,7 +251,6 @@ def evaluate_single_scene(
     compare_with_input=False,
     save_viewer=True,
     output_gt=True,
-    means_origin_scale=1.0,
 ):
     """Render one predicted scene and write image metrics and viewer artifacts."""
     model.eval()
@@ -280,7 +274,6 @@ def evaluate_single_scene(
 
     with torch.no_grad():
         out_gs = model(batch_normalized_gs=[input_gs], batch_scene_idx=[scene_idx])[0]
-        out_gs = unscale_means_origin(out_gs, means_origin_scale)
         pred_preview = []
         gt_preview = []
 
@@ -383,15 +376,7 @@ def evaluate_single_scene(
 def main(argv):
     del argv
     os.makedirs(FLAGS.output_dir, exist_ok=True)
-    ptv3_bindings = [
-        f"PointTransformerV3Model.drop_path={FLAGS.ptv3_drop_path}",
-        f"PointTransformerV3Model.shuffle_orders={FLAGS.ptv3_shuffle_orders}",
-        f"PointTransformerV3Model.shuffle_orders_eval={FLAGS.ptv3_shuffle_orders_eval}",
-        f"PointTransformerV3Model.turn_off_bn={FLAGS.ptv3_turn_off_bn}",
-    ]
-    gin.parse_config_files_and_bindings(
-        FLAGS.gin_file, [*FLAGS.gin_param, *ptv3_bindings]
-    )
+    gin.parse_config_files_and_bindings(FLAGS.gin_file, FLAGS.gin_param)
     if FLAGS.gs_statistics_path is not None and FLAGS.post_activate_loss:
         raise ValueError("--gs_statistics_path cannot be used with --post_activate_loss")
 
@@ -434,13 +419,7 @@ def main(argv):
         model.load_state_dict(torch.load(model.resume_ckpt, map_location="cpu"))
     model.train()
 
-    requested_means_origin_scale = float(FLAGS.means_origin_scale)
-    if requested_means_origin_scale <= 0.0:
-        raise ValueError(
-            f"--means_origin_scale must be > 0, got {requested_means_origin_scale}"
-        )
-    means_origin_scale = requested_means_origin_scale
-    loss_target_gs = scale_means_origin(attribute_target_gs, means_origin_scale)
+    loss_target_gs = attribute_target_gs
     component_normalizers = None
     selected_statistics = None
     effective_loss_weights = mse_loss_cfg["loss_weights"]
@@ -450,9 +429,6 @@ def main(argv):
             FLAGS.target_factor,
             attribute_keys,
             attribute_target_gs,
-        )
-        component_normalizers["means"] = (
-            component_normalizers["means"] * means_origin_scale
         )
         effective_loss_weights = {key: 1.0 for key in attribute_keys}
         statistics_message = (
@@ -482,7 +458,6 @@ def main(argv):
         f"loss_type=attribute_mse_only\n"
         f"post_activate_loss={FLAGS.post_activate_loss}\n"
         f"gs_statistics_path={FLAGS.gs_statistics_path or 'none'}\n"
-        f"means_origin_scale={means_origin_scale}\n"
         f"quat_direct_mse={mse_loss_cfg['quat_direct_mse']}\n"
         f"loss_weights={effective_loss_weights}\n"
         f"alignment_info={alignment_info}\n"
@@ -569,7 +544,6 @@ def main(argv):
                 preview_gs = model(
                     batch_normalized_gs=batch_gs, batch_scene_idx=batch_scene_idx
                 )[0]
-                preview_gs = unscale_means_origin(preview_gs, means_origin_scale)
                 preview_cameras = gpu_utils.move_to_device(target_cameras, device)
                 pred_images, _ = gs_utils.rasterize_gaussians_to_multiimgs(
                     preview_gs, preview_cameras
@@ -598,7 +572,6 @@ def main(argv):
                 compare_with_input=FLAGS.compare_with_input,
                 save_viewer=FLAGS.save_viewer,
                 output_gt=step == 0,
-                means_origin_scale=means_origin_scale,
             )
             logger.info("Eval step %d: %s", step, " ".join(f"{key}: {value:.4f}" for key, value in metrics.items()),)
             if FLAGS.compare_with_input:
@@ -623,7 +596,6 @@ def main(argv):
         compare_with_input=FLAGS.compare_with_input,
         save_viewer=FLAGS.save_viewer,
         output_gt=True,
-        means_origin_scale=means_origin_scale,
     )
     final_message = " ".join(
         f"{key}: {value:.4f}" for key, value in final_metrics.items()
