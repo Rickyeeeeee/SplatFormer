@@ -17,6 +17,10 @@ loss_features=${9:-${LOSS_FEATURES:-means}}
 flow_steps=${10:-${FLOW_STEPS:-1}}
 flow_noise_std=${11:-${FLOW_NOISE_STD:-0.0}}
 flow_t_eps=${FLOW_T_EPS:-1e-4}
+ptv3_drop_path=${PTV3_DROP_PATH:-0.0}
+ptv3_shuffle_orders=${PTV3_SHUFFLE_ORDERS:-True}
+ptv3_shuffle_orders_eval=${PTV3_SHUFFLE_ORDERS_EVAL:-False}
+ptv3_turn_off_bn=${PTV3_TURN_OFF_BN:-True}
 
 sanitize_name() {
     echo "$1" | tr ',' '-'
@@ -37,6 +41,10 @@ CUDA_VISIBLE_DEVICES=$GPU_ID python overfit-sr-gsfm.py \
     --flow_steps=${flow_steps} \
     --flow_noise_std=${flow_noise_std} \
     --gin_param="flow_matching.flow_t_eps=${flow_t_eps}" \
+    --gin_param="PointTransformerV3FlowModel.drop_path=${ptv3_drop_path}" \
+    --gin_param="PointTransformerV3FlowModel.shuffle_orders=${ptv3_shuffle_orders}" \
+    --gin_param="PointTransformerV3FlowModel.shuffle_orders_eval=${ptv3_shuffle_orders_eval}" \
+    --gin_param="PointTransformerV3FlowModel.turn_off_bn=${ptv3_turn_off_bn}" \
     --gin_file=configs/model/ptv3_flow.gin \
     --gin_file=configs/overfit/sr_gsfm.gin \
     --gin_param="training.total_steps=${total_steps}" \

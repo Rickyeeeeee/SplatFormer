@@ -318,9 +318,7 @@ def evaluate_single_scene(
                 cv2.imwrite(os.path.join(pred_single_dir, name), pred_img[:, :, ::-1])
 
             if compare_with_input:
-                input_imgs, _ = gs_utils.rasterize_gaussians_to_multiimgs(
-                    input_gs, chunk_cameras
-                )
+                input_imgs, _ = gs_utils.rasterize_gaussians_to_multiimgs(input_gs, chunk_cameras)
                 input_imgs = torch.stack(input_imgs, dim=0)
                 if masks is not None:
                     input_imgs = input_imgs * masks
@@ -519,12 +517,8 @@ def main(argv):
         scheduler.step()
 
         feature_values = {key: value.item() for key, value in feature_losses.items()}
-        weighted_values = {
-            key: value.item() for key, value in weighted_feature_losses.items()
-        }
-        pbar.set_postfix(
-            loss=f"{total_loss.item():.3e}", lr=f"{optimizer.param_groups[0]['lr']:.2e}"
-        )
+        weighted_values = {key: value.item() for key, value in weighted_feature_losses.items()}
+        pbar.set_postfix(loss=f"{total_loss.item():.3e}", lr=f"{optimizer.param_groups[0]['lr']:.2e}")
         if empty_cache_fre > 0 and (step + 1) % empty_cache_fre == 0:
             torch.cuda.empty_cache()
         if step % log_interval == 0:
@@ -541,17 +535,10 @@ def main(argv):
             )
         if step % log_image_interval == 0:
             with torch.no_grad():
-                preview_gs = model(
-                    batch_normalized_gs=batch_gs, batch_scene_idx=batch_scene_idx
-                )[0]
+                preview_gs = model(batch_normalized_gs=batch_gs, batch_scene_idx=batch_scene_idx)[0]
                 preview_cameras = gpu_utils.move_to_device(target_cameras, device)
-                pred_images, _ = gs_utils.rasterize_gaussians_to_multiimgs(
-                    preview_gs, preview_cameras
-                )
-            pred_images = [
-                (image * 255).detach().cpu().numpy().astype(np.uint8)
-                for image in pred_images
-            ]
+                pred_images, _ = gs_utils.rasterize_gaussians_to_multiimgs(preview_gs, preview_cameras)
+            pred_images = [(image * 255).detach().cpu().numpy().astype(np.uint8) for image in pred_images]
             cv2.imwrite(
                 os.path.join(FLAGS.output_dir, "train", f"{step:08d}_pred.png"),
                 cv2.cvtColor(make_grid(pred_images), cv2.COLOR_RGB2BGR),
