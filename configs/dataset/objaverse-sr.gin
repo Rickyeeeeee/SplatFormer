@@ -1,0 +1,23 @@
+train_dataset_root = '/project/ricky/splatformer-sr-data/train-set/objaverse'
+test_dataset_root = '/project/ricky/splatformer-sr-data/test-set/objaverse'
+train_scene_list = '/project/ricky/splatformer-sr-data/train-set/objaverse/valid_scenes.txt'
+test_scene_list = '/project/ricky/splatformer-sr-data/test-set/objaverse/valid_scenes.txt'
+
+SplatFactoSRDataset.remove_outlier_ndevs = -1
+SplatFactoSRDataset.image_per_scene = None
+SplatFactoSRDataset.max_gs_num = 1000000
+SplatFactoSRDataset.load_pose_src = 'nerfstudio'
+SplatFactoSRDataset.resolutions = [512, 128]
+SplatFactoSRDataset.background_color = [0, 0, 0]
+
+train_dataset/SplatFactoSRDataset.train_or_test = 'train'
+train_dataset/SplatFactoSRDataset.dataset_root = %train_dataset_root
+train_dataset/SplatFactoSRDataset.scene_list = %train_scene_list
+train_dataset/SplatFactoSRDataset.image_per_scene = 16
+train_dataset/SplatFactoSRDataset.split_across_gpus = True
+
+test_dataset/SplatFactoSRDataset.train_or_test = 'test'
+test_dataset/SplatFactoSRDataset.dataset_root = %test_dataset_root
+test_dataset/SplatFactoSRDataset.scene_list = %test_scene_list
+test_dataset/SplatFactoSRDataset.image_per_scene = None
+test_dataset/SplatFactoSRDataset.split_across_gpus = False
