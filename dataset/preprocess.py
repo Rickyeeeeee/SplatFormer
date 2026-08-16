@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Validate, evaluate, select, and optionally pre-fit native-resolution GS scenes."""
+"""Validate, evaluate, select, pre-fit, and analyze native-resolution GS scenes."""
 
 import argparse
 import csv
+import json
 import logging
 import math
 import os
@@ -12,7 +13,7 @@ import sys
 import tempfile
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import gin
 import numpy as np
@@ -73,6 +74,17 @@ PRETRAIN_COLUMNS = [
     "cache_path",
     "reason",
 ]
+STATISTICS_PARAMETERS = (
+    "means",
+    "scales",
+    "opacities",
+    "quats",
+    "features_dc",
+    "features_rest",
+)
+STATISTICS_SPACES = ("checkpoint", "processed")
+STATISTICS_REPRESENTATIONS = ("raw", "post_activation")
+STATISTICS_RECORD_VERSION = 1
 MATCHING_LR_DICT = {
     "base": 1e-3,
     "means": 1.6e-4,
@@ -132,6 +144,18 @@ def cache_root_path(args) -> Path:
     return _path_or_default(args.cache_root, args.dataset_root, "pretrained_gaussians")
 
 
+def statistics_json_path(args) -> Path:
+    return _path_or_default(args.statistics_json, args.dataset_root, "gs_statistics.json")
+
+
+def statistics_records_path(args) -> Path:
+    return _path_or_default(
+        args.statistics_records,
+        args.dataset_root,
+        "gs_statistics_scenes.jsonl",
+    )
+
+
 def atomic_write_scene_list(path: Path, scenes: Iterable[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary_path = tempfile.mkstemp(
@@ -170,6 +194,33 @@ def atomic_write_csv(path: Path, columns: Sequence[str], rows: Iterable[Dict]) -
     finally:
         if os.path.exists(temporary_path):
             os.unlink(temporary_path)
+
+
+def atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_path = tempfile.mkstemp(
+        prefix=".%s." % path.name,
+        suffix=".tmp",
+        dir=str(path.parent),
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if os.path.exists(temporary_path):
+            os.unlink(temporary_path)
+
+
+def append_jsonl(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def append_csv_rows(path: Path, columns: Sequence[str], rows: Sequence[Dict]) -> None:
@@ -884,11 +935,709 @@ def run_pretrain(args) -> None:
     print("Pretraining cache root: %s" % cache_root)
 
 
+def _scaler_tensor(scaler: MinMaxScaler, name: str, value: torch.Tensor) -> torch.Tensor:
+    return torch.as_tensor(
+        getattr(scaler, name),
+        dtype=value.dtype,
+        device=value.device,
+    )
+
+
+def convert_gaussian_frame(
+    gs_params: Mapping[str, torch.Tensor],
+    input_scaler: MinMaxScaler,
+    target_scaler: MinMaxScaler,
+) -> Dict[str, torch.Tensor]:
+    """Convert processed Gaussian tensors between scene normalization frames."""
+    means = gs_params["means"]
+    input_scale = _scaler_tensor(input_scaler, "scale_", means)
+    input_trans = _scaler_tensor(input_scaler, "trans_", means)
+    target_scale = _scaler_tensor(target_scaler, "scale_", means)
+    target_trans = _scaler_tensor(target_scaler, "trans_", means)
+    world_means = (means - input_trans) / input_scale
+
+    converted = {}
+    for key, value in gs_params.items():
+        if key == "means":
+            converted[key] = world_means * target_scale + target_trans
+        elif key == "scales":
+            converted[key] = value - torch.log(input_scale) + torch.log(target_scale)
+        else:
+            converted[key] = value.clone()
+    return converted
+
+
+def gaussian_checkpoint_space(
+    gs_params: Mapping[str, torch.Tensor],
+    scaler: MinMaxScaler,
+) -> Dict[str, torch.Tensor]:
+    """Undo GS_SR coordinate normalization while retaining its selected rows."""
+    means = gs_params["means"]
+    scale = _scaler_tensor(scaler, "scale_", means)
+    trans = _scaler_tensor(scaler, "trans_", means)
+    converted = {}
+    for key, value in gs_params.items():
+        if key == "means":
+            converted[key] = (value - trans) / scale
+        elif key == "scales":
+            converted[key] = value - torch.log(scale)
+        else:
+            converted[key] = value.clone()
+    return converted
+
+
+def activate_gaussian_params(
+    gs_params: Mapping[str, torch.Tensor],
+) -> Dict[str, torch.Tensor]:
+    activated = {}
+    for key in STATISTICS_PARAMETERS:
+        value = gs_params[key]
+        if key == "scales":
+            value = torch.exp(value)
+        elif key == "opacities":
+            value = torch.sigmoid(value)
+        elif key == "quats":
+            value = torch.nn.functional.normalize(value, dim=-1)
+        activated[key] = value
+    return activated
+
+
+def validate_statistics_gaussians(
+    gs_params: Mapping[str, torch.Tensor],
+) -> int:
+    missing = [key for key in STATISTICS_PARAMETERS if key not in gs_params]
+    if missing:
+        raise KeyError("Gaussian parameters are missing %s" % missing)
+
+    gaussian_count = None
+    for key in STATISTICS_PARAMETERS:
+        value = gs_params[key]
+        if not torch.is_tensor(value) or value.ndim < 1:
+            raise ValueError("Gaussian parameter %s is not a row tensor" % key)
+        if not torch.is_floating_point(value):
+            raise ValueError("Gaussian parameter %s is not floating point" % key)
+        if gaussian_count is None:
+            gaussian_count = int(value.shape[0])
+        elif value.shape[0] != gaussian_count:
+            raise ValueError("Gaussian parameter row counts do not match")
+        if not torch.isfinite(value).all().item():
+            raise ValueError("Gaussian parameter %s contains non-finite values" % key)
+    if not gaussian_count:
+        raise ValueError("Gaussian parameters contain zero rows")
+    return gaussian_count
+
+
+def scene_parameter_summary(
+    gs_params: Mapping[str, torch.Tensor],
+) -> Dict[str, Dict[str, Any]]:
+    gaussian_count = validate_statistics_gaussians(gs_params)
+    summary = {}
+    for key in STATISTICS_PARAMETERS:
+        value = gs_params[key].detach().to(device="cpu", dtype=torch.float64)
+        mean = value.mean(dim=0)
+        std = value.std(dim=0, correction=0)
+        summary[key] = {
+            "gaussian_count": gaussian_count,
+            "channel_shape": list(value.shape[1:]),
+            "mean": mean.tolist(),
+            "std": std.tolist(),
+        }
+    return summary
+
+
+def _statistics_group(
+    source_kind: str,
+    coordinate_space: str,
+    representation: str,
+    gs_params: Mapping[str, torch.Tensor],
+    **metadata,
+) -> Dict[str, Any]:
+    return {
+        "source_kind": source_kind,
+        "coordinate_space": coordinate_space,
+        "representation": representation,
+        **metadata,
+        "parameters": scene_parameter_summary(gs_params),
+    }
+
+
+def add_distribution_groups(
+    groups: List[Dict[str, Any]],
+    source_kind: str,
+    spaces: Mapping[str, Mapping[str, torch.Tensor]],
+    **metadata,
+) -> None:
+    for coordinate_space in STATISTICS_SPACES:
+        raw = spaces[coordinate_space]
+        groups.append(
+            _statistics_group(
+                source_kind,
+                coordinate_space,
+                "raw",
+                raw,
+                **metadata,
+            )
+        )
+        groups.append(
+            _statistics_group(
+                source_kind,
+                coordinate_space,
+                "post_activation",
+                activate_gaussian_params(raw),
+                **metadata,
+            )
+        )
+
+
+def add_difference_groups(
+    groups: List[Dict[str, Any]],
+    fitted_spaces: Mapping[str, Mapping[str, torch.Tensor]],
+    baseline_spaces: Mapping[str, Mapping[str, torch.Tensor]],
+    **metadata,
+) -> None:
+    for coordinate_space in STATISTICS_SPACES:
+        fitted_raw = fitted_spaces[coordinate_space]
+        baseline_raw = baseline_spaces[coordinate_space]
+        validate_statistics_gaussians(fitted_raw)
+        validate_statistics_gaussians(baseline_raw)
+        raw_difference = {
+            key: fitted_raw[key] - baseline_raw[key]
+            for key in STATISTICS_PARAMETERS
+        }
+        fitted_activated = activate_gaussian_params(fitted_raw)
+        baseline_activated = activate_gaussian_params(baseline_raw)
+        activated_difference = {
+            key: fitted_activated[key] - baseline_activated[key]
+            for key in STATISTICS_PARAMETERS
+        }
+        groups.append(
+            _statistics_group(
+                "paired_differences",
+                coordinate_space,
+                "raw",
+                raw_difference,
+                **metadata,
+            )
+        )
+        groups.append(
+            _statistics_group(
+                "paired_differences",
+                coordinate_space,
+                "post_activation",
+                activated_difference,
+                **metadata,
+            )
+        )
+
+
+def load_statistics_resolution(
+    dataset_root: Path,
+    scene: str,
+    resolution: int,
+) -> Dict[str, Any]:
+    paths = scene_resolution_paths(dataset_root, scene, resolution)
+    checkpoint_path = latest_checkpoint(paths["nerfstudio_dir"])
+    processed, scaler, gaussian_count = load_gaussian_params(
+        checkpoint_path,
+        torch.device("cpu"),
+    )
+    return {
+        "checkpoint_path": checkpoint_path,
+        "scaler": scaler,
+        "gaussian_count": gaussian_count,
+        "processed": processed,
+        "checkpoint": gaussian_checkpoint_space(processed, scaler),
+    }
+
+
+def statistics_cache_path(
+    cache_root: Path,
+    scene: str,
+    source_resolution: int,
+    target_resolution: int,
+) -> Path:
+    return (
+        cache_root
+        / scene
+        / ("if%d_tf%d" % (source_resolution, target_resolution))
+        / "matching_target.pt"
+    )
+
+
+def _source_attributes(
+    gs_params: Mapping[str, torch.Tensor],
+) -> Dict[str, Dict[str, Any]]:
+    return {
+        key: {"shape": list(value.shape), "dtype": str(value.dtype)}
+        for key, value in sorted(gs_params.items())
+    }
+
+
+def load_compatible_statistics_cache(
+    path: Path,
+    scene: str,
+    source_resolution: int,
+    target_resolution: int,
+    expected_source: Mapping[str, torch.Tensor],
+) -> Dict[str, torch.Tensor]:
+    payload = torch.load(str(path), map_location="cpu")
+    if not isinstance(payload, dict):
+        raise ValueError("Matching cache payload is not a dictionary")
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, dict):
+        raise ValueError("Matching cache is missing metadata")
+
+    expected_metadata = {
+        "version": 1,
+        "scene_name": scene,
+        "input_factor": int(source_resolution),
+        "target_factor": int(target_resolution),
+        "source_attributes": _source_attributes(expected_source),
+    }
+    for key, expected in expected_metadata.items():
+        if metadata.get(key) != expected:
+            raise ValueError("Matching cache metadata mismatch for %s" % key)
+
+    fitted = payload.get("target_gs")
+    if not isinstance(fitted, dict) or set(fitted) != set(expected_source):
+        raise ValueError("Matching cache attributes do not match the source")
+    result = {}
+    for key, source_value in expected_source.items():
+        value = fitted[key]
+        if not torch.is_tensor(value):
+            raise ValueError("Matching cache parameter %s is not a tensor" % key)
+        if value.shape != source_value.shape or value.dtype != source_value.dtype:
+            raise ValueError("Matching cache parameter %s shape or dtype mismatch" % key)
+        result[key] = value.detach().cpu()
+    validate_statistics_gaussians(result)
+    return result
+
+
+def _artifact_fingerprint(path: Path) -> Dict[str, Any]:
+    fingerprint = {"path": str(path)}
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        fingerprint["exists"] = False
+    else:
+        fingerprint.update(
+            {
+                "exists": True,
+                "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+            }
+        )
+    return fingerprint
+
+
+def statistics_input_fingerprint(args, scene: str) -> Dict[str, Any]:
+    checkpoints = {}
+    for resolution in args.resolutions:
+        paths = scene_resolution_paths(args.dataset_root, scene, resolution)
+        try:
+            path = latest_checkpoint(paths["nerfstudio_dir"])
+        except Exception as exc:
+            checkpoints[str(resolution)] = {
+                "error": "%s:%s" % (type(exc).__name__, exc)
+            }
+        else:
+            checkpoints[str(resolution)] = _artifact_fingerprint(path)
+
+    caches = {}
+    if len(set(args.resolutions)) >= 2:
+        for direction in ("lr_to_hr", "hr_to_lr"):
+            source_resolution, target_resolution = _direction_resolutions(
+                direction,
+                args.resolutions,
+            )
+            caches[direction] = _artifact_fingerprint(
+                statistics_cache_path(
+                    cache_root_path(args),
+                    scene,
+                    source_resolution,
+                    target_resolution,
+                )
+            )
+    return {
+        "record_version": STATISTICS_RECORD_VERSION,
+        "resolutions": list(args.resolutions),
+        "checkpoints": checkpoints,
+        "caches": caches,
+    }
+
+
+def _read_latest_statistics_records(path: Path) -> Dict[str, Dict[str, Any]]:
+    latest = {}
+    if not path.is_file():
+        return latest
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    "Invalid JSON in %s line %d: %s" % (path, line_number, exc)
+                ) from exc
+            scene = record.get("scene")
+            if scene:
+                latest[str(scene)] = record
+    return latest
+
+
+def process_statistics_scene(
+    args,
+    scene: str,
+    fingerprint: Mapping[str, Any],
+) -> Dict[str, Any]:
+    groups: List[Dict[str, Any]] = []
+    errors: List[Dict[str, str]] = []
+    missing_caches: List[Dict[str, Any]] = []
+    resolutions = {}
+
+    for resolution in args.resolutions:
+        try:
+            bundle = load_statistics_resolution(
+                args.dataset_root,
+                scene,
+                resolution,
+            )
+            resolutions[resolution] = bundle
+            add_distribution_groups(
+                groups,
+                "nerfstudio",
+                {
+                    "checkpoint": bundle["checkpoint"],
+                    "processed": bundle["processed"],
+                },
+                resolution=resolution,
+            )
+        except Exception as exc:
+            errors.append(
+                {
+                    "source_kind": "nerfstudio",
+                    "resolution": str(resolution),
+                    "reason": "%s:%s" % (type(exc).__name__, exc),
+                }
+            )
+
+    if len(set(args.resolutions)) >= 2:
+        for direction in ("lr_to_hr", "hr_to_lr"):
+            source_resolution, target_resolution = _direction_resolutions(
+                direction,
+                args.resolutions,
+            )
+            cache_path = statistics_cache_path(
+                cache_root_path(args),
+                scene,
+                source_resolution,
+                target_resolution,
+            )
+            if not cache_path.is_file():
+                missing_caches.append(
+                    {
+                        "direction": direction,
+                        "source_resolution": source_resolution,
+                        "target_resolution": target_resolution,
+                        "cache_path": str(cache_path),
+                    }
+                )
+                continue
+            if (
+                source_resolution not in resolutions
+                or target_resolution not in resolutions
+            ):
+                errors.append(
+                    {
+                        "source_kind": "pretrain",
+                        "direction": direction,
+                        "reason": "required_resolution_checkpoint_failed",
+                    }
+                )
+                continue
+
+            try:
+                source_bundle = resolutions[source_resolution]
+                target_bundle = resolutions[target_resolution]
+                expected_source = convert_gaussian_frame(
+                    source_bundle["processed"],
+                    source_bundle["scaler"],
+                    target_bundle["scaler"],
+                )
+                fitted_target = load_compatible_statistics_cache(
+                    cache_path,
+                    scene,
+                    source_resolution,
+                    target_resolution,
+                    expected_source,
+                )
+                fitted_target_spaces = {
+                    "processed": fitted_target,
+                    "checkpoint": gaussian_checkpoint_space(
+                        fitted_target,
+                        target_bundle["scaler"],
+                    ),
+                }
+                add_distribution_groups(
+                    groups,
+                    "pretrain",
+                    fitted_target_spaces,
+                    direction=direction,
+                    source_resolution=source_resolution,
+                    target_resolution=target_resolution,
+                    resolution=target_resolution,
+                )
+
+                fitted_source = convert_gaussian_frame(
+                    fitted_target,
+                    target_bundle["scaler"],
+                    source_bundle["scaler"],
+                )
+                fitted_source_spaces = {
+                    "processed": fitted_source,
+                    "checkpoint": gaussian_checkpoint_space(
+                        fitted_source,
+                        source_bundle["scaler"],
+                    ),
+                }
+                baseline_spaces = {
+                    "processed": source_bundle["processed"],
+                    "checkpoint": source_bundle["checkpoint"],
+                }
+                add_difference_groups(
+                    groups,
+                    fitted_source_spaces,
+                    baseline_spaces,
+                    direction=direction,
+                    source_resolution=source_resolution,
+                    target_resolution=target_resolution,
+                    resolution=source_resolution,
+                )
+            except Exception as exc:
+                errors.append(
+                    {
+                        "source_kind": "pretrain",
+                        "direction": direction,
+                        "reason": "%s:%s" % (type(exc).__name__, exc),
+                    }
+                )
+
+    return {
+        "record_version": STATISTICS_RECORD_VERSION,
+        "scene": scene,
+        "status": "error" if errors else "ok",
+        "input_fingerprint": fingerprint,
+        "groups": groups,
+        "missing_caches": missing_caches,
+        "errors": errors,
+    }
+
+
+def _group_output_key(group: Mapping[str, Any]) -> str:
+    if group["source_kind"] == "nerfstudio":
+        return str(group["resolution"])
+    return str(group["direction"])
+
+
+def aggregate_statistics_records(
+    records: Sequence[Mapping[str, Any]],
+    scene_count: int,
+) -> Dict[str, Any]:
+    accumulators = {}
+    for record in records:
+        for group in record.get("groups", []):
+            identity = (
+                group["coordinate_space"],
+                group["representation"],
+                group["source_kind"],
+                _group_output_key(group),
+            )
+            accumulator = accumulators.setdefault(
+                identity,
+                {
+                    "metadata": {
+                        key: group[key]
+                        for key in (
+                            "resolution",
+                            "direction",
+                            "source_resolution",
+                            "target_resolution",
+                        )
+                        if key in group
+                    },
+                    "scenes": [],
+                    "parameters": defaultdict(
+                        lambda: {
+                            "channel_shape": None,
+                            "means": [],
+                            "stds": [],
+                            "gaussian_count": 0,
+                        }
+                    ),
+                },
+            )
+            accumulator["scenes"].append(record["scene"])
+            for key, parameter in group["parameters"].items():
+                parameter_accumulator = accumulator["parameters"][key]
+                channel_shape = parameter["channel_shape"]
+                if parameter_accumulator["channel_shape"] is None:
+                    parameter_accumulator["channel_shape"] = channel_shape
+                elif parameter_accumulator["channel_shape"] != channel_shape:
+                    raise ValueError(
+                        "Statistics channel shape mismatch for %s" % (identity,)
+                    )
+                parameter_accumulator["means"].append(
+                    torch.as_tensor(parameter["mean"], dtype=torch.float64)
+                )
+                parameter_accumulator["stds"].append(
+                    torch.as_tensor(parameter["std"], dtype=torch.float64)
+                )
+                parameter_accumulator["gaussian_count"] += int(
+                    parameter["gaussian_count"]
+                )
+
+    spaces = {
+        space: {
+            representation: {
+                "nerfstudio": {},
+                "pretrain": {},
+                "paired_differences": {},
+            }
+            for representation in STATISTICS_REPRESENTATIONS
+        }
+        for space in STATISTICS_SPACES
+    }
+    for identity, accumulator in accumulators.items():
+        coordinate_space, representation, source_kind, output_key = identity
+        parameters = {}
+        for key, parameter_accumulator in accumulator["parameters"].items():
+            parameters[key] = {
+                "channel_shape": parameter_accumulator["channel_shape"],
+                "scene_count": len(parameter_accumulator["means"]),
+                "gaussian_count": parameter_accumulator["gaussian_count"],
+                "mean": torch.stack(
+                    parameter_accumulator["means"],
+                    dim=0,
+                ).mean(dim=0).tolist(),
+                "std": torch.stack(
+                    parameter_accumulator["stds"],
+                    dim=0,
+                ).mean(dim=0).tolist(),
+            }
+        spaces[coordinate_space][representation][source_kind][output_key] = {
+            **accumulator["metadata"],
+            "scene_count": len(accumulator["scenes"]),
+            "scenes": accumulator["scenes"],
+            "parameters": parameters,
+        }
+
+    return {
+        "version": STATISTICS_RECORD_VERSION,
+        "aggregation": {
+            "scene_weighting": "equal",
+            "per_scene_mean": "mean over Gaussian rows",
+            "per_scene_std": "population standard deviation (ddof=0)",
+            "cross_scene_mean": "arithmetic mean of per-scene means",
+            "cross_scene_std": "arithmetic mean of per-scene standard deviations",
+            "paired_difference": "fitted minus baseline",
+        },
+        "activation": {
+            "means": "identity",
+            "scales": "exp",
+            "opacities": "sigmoid",
+            "quats": "l2_normalize",
+            "features_dc": "identity",
+            "features_rest": "identity",
+        },
+        "candidate_scene_count": scene_count,
+        "recorded_scene_count": len(records),
+        "successful_scene_count": sum(
+            record.get("status") == "ok" for record in records
+        ),
+        "errors": [
+            {
+                "scene": record["scene"],
+                "errors": record.get("errors", []),
+            }
+            for record in records
+            if record.get("errors")
+        ],
+        "missing_caches": [
+            {
+                "scene": record["scene"],
+                "caches": record.get("missing_caches", []),
+            }
+            for record in records
+            if record.get("missing_caches")
+        ],
+        "spaces": spaces,
+    }
+
+
+def run_statistics(args) -> Dict[str, Any]:
+    scene_list = (
+        getattr(args, "scene_list", None)
+        if getattr(args, "scene_list", None) is not None
+        else valid_scene_list_path(args)
+    )
+    scenes = read_scene_list(scene_list)
+    records_path = statistics_records_path(args)
+    latest_records = _read_latest_statistics_records(records_path)
+    fingerprints = {
+        scene: statistics_input_fingerprint(args, scene)
+        for scene in scenes
+    }
+    attempted = 0
+
+    for scene in tqdm(scenes, desc="statistics"):
+        fingerprint = fingerprints[scene]
+        existing = latest_records.get(scene)
+        same_input = (
+            existing is not None
+            and existing.get("input_fingerprint") == fingerprint
+        )
+        force = getattr(args, "force_statistics", False)
+        retry_errors = getattr(args, "retry_errors", False)
+        if (
+            same_input
+            and not force
+            and (
+                existing.get("status") == "ok"
+                or not retry_errors
+            )
+        ):
+            continue
+        if args.max_scenes is not None and attempted >= args.max_scenes:
+            break
+        attempted += 1
+
+        record = process_statistics_scene(args, scene, fingerprint)
+        append_jsonl(records_path, record)
+        latest_records[scene] = record
+
+    effective_records = [
+        latest_records[scene]
+        for scene in scenes
+        if scene in latest_records
+        and latest_records[scene].get("input_fingerprint") == fingerprints[scene]
+    ]
+    report = aggregate_statistics_records(effective_records, len(scenes))
+    report["scene_list"] = str(scene_list)
+    report["records_path"] = str(records_path)
+    output_path = statistics_json_path(args)
+    atomic_write_json(output_path, report)
+    print("Gaussian statistics records: %s" % records_path)
+    print("Gaussian statistics report: %s" % output_path)
+    return report
+
+
 def run_all(args) -> None:
     run_validate(args)
     run_evaluate(args)
     run_select(args)
     run_pretrain(args)
+    run_statistics(args)
 
 
 def add_layout_arguments(parser: argparse.ArgumentParser) -> None:
@@ -914,6 +1663,8 @@ def add_output_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--valid_scene_list", type=Path, default=None)
     parser.add_argument("--pretrain_status", type=Path, default=None)
     parser.add_argument("--cache_root", type=Path, default=None)
+    parser.add_argument("--statistics_json", type=Path, default=None)
+    parser.add_argument("--statistics_records", type=Path, default=None)
 
 
 def add_evaluation_arguments(parser: argparse.ArgumentParser) -> None:
@@ -1009,11 +1760,20 @@ def build_parser() -> argparse.ArgumentParser:
     pretrain_parser.add_argument("--scene_list", type=Path, default=None)
     pretrain_parser.set_defaults(func=run_pretrain)
 
+    statistics_parser = subparsers.add_parser("statistics")
+    add_layout_arguments(statistics_parser)
+    add_output_arguments(statistics_parser)
+    statistics_parser.add_argument("--retry_errors", action="store_true")
+    statistics_parser.add_argument("--force_statistics", action="store_true")
+    statistics_parser.add_argument("--scene_list", type=Path, default=None)
+    statistics_parser.set_defaults(func=run_statistics)
+
     all_parser = subparsers.add_parser("all")
     add_layout_arguments(all_parser)
     add_output_arguments(all_parser)
     add_evaluation_arguments(all_parser)
     add_selection_arguments(all_parser)
+    all_parser.add_argument("--force_statistics", action="store_true")
     add_pretraining_arguments(all_parser)
     all_parser.add_argument("--candidate_scene_list", type=Path, default=None)
     all_parser.set_defaults(func=run_all)
@@ -1028,7 +1788,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
     validate_arguments(args, parser)
-    args.func(args)
+    args.func(args);
 
 
 if __name__ == "__main__":

@@ -53,7 +53,29 @@ def _output_args(root):
         "valid_scene_list": root / "valid_scenes.txt",
         "pretrain_status": root / "pretrain_status.csv",
         "cache_root": root / "pretrained_gaussians",
+        "statistics_json": root / "gs_statistics.json",
+        "statistics_records": root / "gs_statistics_scenes.jsonl",
+
     }
+
+def _make_gs(means):
+    means = torch.as_tensor(means, dtype=torch.float32)
+    count = means.shape[0]
+    return {
+        "means": means,
+        "scales": torch.zeros((count, 3), dtype=torch.float32),
+        "opacities": torch.zeros((count, 1), dtype=torch.float32),
+        "quats": torch.tensor([[2.0, 0.0, 0.0, 0.0]]).repeat(count, 1),
+        "features_dc": torch.zeros((count, 3), dtype=torch.float32),
+        "features_rest": torch.zeros((count, 15, 3), dtype=torch.float32),
+    }
+
+
+def _scaler(scale, translation):
+    return SimpleNamespace(
+        scale_=torch.tensor(float(scale)),
+        trans_=torch.tensor(translation, dtype=torch.float32),
+    )
 
 
 class PreprocessStructureTests(unittest.TestCase):
@@ -389,6 +411,249 @@ class PreprocessPretrainCliTests(unittest.TestCase):
         preprocess.validate_arguments(args, parser)
         self.assertEqual(args.direction, "none")
         self.assertEqual(args.resolutions, [512, 128])
+
+
+class PreprocessStatisticsTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary_directory.name)
+        self.outputs = _output_args(self.root)
+        preprocess.atomic_write_scene_list(
+            self.outputs["valid_scene_list"], ["selected_scene"]
+        )
+
+    def tearDown(self):
+        self.temporary_directory.cleanup()
+
+    def _statistics_args(self):
+        return SimpleNamespace(
+            dataset_root=self.root,
+            resolutions=[512, 128],
+            expected_images=2,
+            max_scenes=None,
+            scene_list=None,
+            retry_errors=False,
+            force_statistics=False,
+            **self.outputs,
+        )
+
+    def test_activation_and_equal_scene_weighting(self):
+        first = _make_gs([[0.0, 0.0, 0.0], [2.0, 2.0, 2.0]])
+        second = _make_gs([[10.0, 10.0, 10.0]] * 4)
+        first["scales"][0] = torch.log(torch.tensor([1.0, 2.0, 4.0]))
+
+        activated = preprocess.activate_gaussian_params(first)
+        self.assertTrue(
+            torch.allclose(activated["scales"][0], torch.tensor([1.0, 2.0, 4.0]))
+        )
+        self.assertTrue(
+            torch.allclose(activated["opacities"], torch.full((2, 1), 0.5))
+        )
+        self.assertTrue(
+            torch.allclose(
+                activated["quats"],
+                torch.tensor([[1.0, 0.0, 0.0, 0.0]]).repeat(2, 1),
+            )
+        )
+
+        records = []
+        for scene, gs_params in (("a", first), ("b", second)):
+            records.append(
+                {
+                    "scene": scene,
+                    "status": "ok",
+                    "groups": [
+                        preprocess._statistics_group(
+                            "nerfstudio",
+                            "checkpoint",
+                            "raw",
+                            gs_params,
+                            resolution=128,
+                        )
+                    ],
+                }
+            )
+        report = preprocess.aggregate_statistics_records(records, 2)
+        parameter = report["spaces"]["checkpoint"]["raw"]["nerfstudio"]["128"][
+            "parameters"
+        ]["means"]
+        self.assertEqual(parameter["scene_count"], 2)
+        self.assertEqual(parameter["gaussian_count"], 6)
+        self.assertTrue(
+            torch.allclose(torch.tensor(parameter["mean"]), torch.full((3,), 5.5))
+        )
+        self.assertTrue(
+            torch.allclose(torch.tensor(parameter["std"]), torch.full((3,), 0.5))
+        )
+
+    def test_cache_statistics_and_source_frame_paired_differences(self):
+        args = self._statistics_args()
+        source_scaler = _scaler(2.0, [1.0, 1.0, 1.0])
+        target_scaler = _scaler(4.0, [-1.0, -1.0, -1.0])
+        source_processed = _make_gs(
+            [[0.2, 0.3, 0.4], [0.6, 0.7, 0.8]]
+        )
+        target_processed = _make_gs(
+            [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]
+        )
+        bundles = {
+            128: {
+                "processed": source_processed,
+                "checkpoint": preprocess.gaussian_checkpoint_space(
+                    source_processed, source_scaler
+                ),
+                "scaler": source_scaler,
+            },
+            512: {
+                "processed": target_processed,
+                "checkpoint": preprocess.gaussian_checkpoint_space(
+                    target_processed, target_scaler
+                ),
+                "scaler": target_scaler,
+            },
+        }
+        expected_source = preprocess.convert_gaussian_frame(
+            source_processed, source_scaler, target_scaler
+        )
+        fitted_target = {key: value.clone() for key, value in expected_source.items()}
+        fitted_target["means"] += 0.4
+        fitted_target["scales"] += torch.log(torch.tensor(2.0))
+        fitted_target["opacities"] += 1.0
+
+        cache_path = preprocess.statistics_cache_path(
+            self.outputs["cache_root"], "selected_scene", 128, 512
+        )
+        cache_path.parent.mkdir(parents=True)
+        torch.save(
+            {
+                "metadata": {
+                    "version": 1,
+                    "scene_name": "selected_scene",
+                    "input_factor": 128,
+                    "target_factor": 512,
+                    "source_attributes": preprocess._source_attributes(expected_source),
+                },
+                "target_gs": fitted_target,
+            },
+            cache_path,
+        )
+
+        with mock.patch.object(
+            preprocess,
+            "load_statistics_resolution",
+            side_effect=lambda unused_root, unused_scene, resolution: bundles[resolution],
+        ):
+            record = preprocess.process_statistics_scene(
+                args, "selected_scene", {"fingerprint": 1}
+            )
+
+        self.assertEqual(record["status"], "ok")
+        self.assertEqual(len(record["missing_caches"]), 1)
+        groups = {
+            (
+                group["source_kind"],
+                group["coordinate_space"],
+                group["representation"],
+                group.get("direction"),
+            ): group
+            for group in record["groups"]
+        }
+        pretrain = groups[("pretrain", "processed", "raw", "lr_to_hr")]
+        self.assertEqual(pretrain["resolution"], 512)
+        processed_delta = groups[
+            ("paired_differences", "processed", "raw", "lr_to_hr")
+        ]
+        checkpoint_delta = groups[
+            ("paired_differences", "checkpoint", "raw", "lr_to_hr")
+        ]
+        self.assertEqual(processed_delta["resolution"], 128)
+        self.assertTrue(
+            torch.allclose(
+                torch.tensor(processed_delta["parameters"]["means"]["mean"]),
+                torch.full((3,), 0.2),
+            )
+        )
+        self.assertTrue(
+            torch.allclose(
+                torch.tensor(checkpoint_delta["parameters"]["means"]["mean"]),
+                torch.full((3,), 0.1),
+            )
+        )
+        self.assertAlmostEqual(
+            processed_delta["parameters"]["scales"]["mean"][0],
+            torch.log(torch.tensor(2.0)).item(),
+            places=6,
+        )
+        activated_delta = groups[
+            ("paired_differences", "processed", "post_activation", "lr_to_hr")
+        ]
+        self.assertAlmostEqual(
+            activated_delta["parameters"]["opacities"]["mean"][0],
+            torch.sigmoid(torch.tensor(1.0)).item() - 0.5,
+            places=6,
+        )
+
+    def test_statistics_resume_force_and_all_stage_order(self):
+        args = self._statistics_args()
+        calls = []
+
+        def process(unused_args, scene, fingerprint):
+            calls.append(scene)
+            return {
+                "record_version": 1,
+                "scene": scene,
+                "status": "ok",
+                "input_fingerprint": fingerprint,
+                "groups": [],
+                "missing_caches": [],
+                "errors": [],
+            }
+
+        with mock.patch.object(
+            preprocess, "statistics_input_fingerprint", return_value={"same": True}
+        ), mock.patch.object(
+            preprocess, "process_statistics_scene", side_effect=process
+        ):
+            preprocess.run_statistics(args)
+            preprocess.run_statistics(args)
+            self.assertEqual(calls, ["selected_scene"])
+            args.force_statistics = True
+            preprocess.run_statistics(args)
+            self.assertEqual(calls, ["selected_scene", "selected_scene"])
+
+        order = []
+        stages = (
+            "run_validate",
+            "run_evaluate",
+            "run_select",
+            "run_pretrain",
+            "run_statistics",
+        )
+        patchers = [
+            mock.patch.object(
+                preprocess, name, side_effect=lambda *unused, _name=name: order.append(_name)
+            )
+            for name in stages
+        ]
+        for patcher in patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        preprocess.run_all(SimpleNamespace())
+        self.assertEqual(order, list(stages))
+
+    def test_statistics_cli_defaults_and_output_schema(self):
+        parser = preprocess.build_parser()
+        args = parser.parse_args(
+            ["statistics", "--dataset_root", str(self.root)]
+        )
+        preprocess.validate_arguments(args, parser)
+        self.assertFalse(args.force_statistics)
+        self.assertFalse(args.retry_errors)
+        self.assertEqual(args.resolutions, [512, 128])
+        report = preprocess.aggregate_statistics_records([], 0)
+        for space in ("checkpoint", "processed"):
+            for representation in ("raw", "post_activation"):
+                self.assertIn(representation, report["spaces"][space])
 
 
 if __name__ == "__main__":
