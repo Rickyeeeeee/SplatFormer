@@ -354,14 +354,14 @@ class PreprocessPretrainCliTests(unittest.TestCase):
             calls.append(
                 (
                     kwargs["scene_name"],
-                    kwargs["input_factor"],
-                    kwargs["target_factor"],
+                    kwargs["input_resolution"],
+                    kwargs["target_resolution"],
                 )
             )
             cache_path = (
                 Path(kwargs["pre_matching_root"])
                 / kwargs["scene_name"]
-                / ("if%d_tf%d" % (kwargs["input_factor"], kwargs["target_factor"]))
+                / ("ir%d_tr%d" % (kwargs["input_resolution"], kwargs["target_resolution"]))
                 / "matching_target.pt"
             )
             return {}, {"status": "refit", "checkpoint_path": str(cache_path)}
@@ -529,8 +529,8 @@ class PreprocessStatisticsTests(unittest.TestCase):
                 "metadata": {
                     "version": 1,
                     "scene_name": "selected_scene",
-                    "input_factor": 128,
-                    "target_factor": 512,
+                    "input_resolution": 128,
+                    "target_resolution": 512,
                     "source_attributes": preprocess._source_attributes(expected_source),
                 },
                 "target_gs": fitted_target,

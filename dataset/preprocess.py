@@ -896,8 +896,8 @@ def run_pretrain(args) -> None:
                     target_cameras=target_bundle["cameras"],
                     pre_matching_root=str(cache_root),
                     scene_name=scene,
-                    input_factor=source_resolution,
-                    target_factor=target_resolution,
+                    input_resolution=source_resolution,
+                    target_resolution=target_resolution,
                     logger=logger,
                     config=config,
                     force_pre_matching=args.force_refit,
@@ -1159,7 +1159,7 @@ def statistics_cache_path(
     return (
         cache_root
         / scene
-        / ("if%d_tf%d" % (source_resolution, target_resolution))
+        / ("ir%d_tr%d" % (source_resolution, target_resolution))
         / "matching_target.pt"
     )
 
@@ -1190,8 +1190,8 @@ def load_compatible_statistics_cache(
     expected_metadata = {
         "version": 1,
         "scene_name": scene,
-        "input_factor": int(source_resolution),
-        "target_factor": int(target_resolution),
+        "input_resolution": int(source_resolution),
+        "target_resolution": int(target_resolution),
         "source_attributes": _source_attributes(expected_source),
     }
     for key, expected in expected_metadata.items():

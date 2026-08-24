@@ -1,13 +1,13 @@
 import gin
-import numpy as np
 import torch
 
-from dataset.GS_multi import SplatFactoMultiLevelDataset
+from dataset.GS_SR import SplatFactoSRDataset
+from utils import gpu_utils
 
 
-def build_dataset() -> SplatFactoMultiLevelDataset:
-    with gin.config_scope("train_dataset"):
-        return SplatFactoMultiLevelDataset()
+def build_dataset(scope="train_dataset") -> SplatFactoSRDataset:
+    with gin.config_scope(scope):
+        return SplatFactoSRDataset()
 
 
 def scene_name_from_dataset(dataset, idx):
@@ -20,45 +20,68 @@ def find_scene_index(dataset, scene_name):
     for idx in range(len(dataset.folders)):
         if scene_name_from_dataset(dataset, idx) == scene_name:
             return idx
-    return 0
+    raise ValueError(f"Scene {scene_name!r} is absent or was filtered from the dataset")
 
 
-def build_split_payload(dataset, scene_idx, scene_name, factor_entry, split):
-    meta = factor_entry["meta"]
-    imgs_path = factor_entry["imgs_path"]
-    imgs_name = factor_entry["imgs_name"]
+def _scaler_tensor(scaler, name, reference):
+    return torch.as_tensor(
+        getattr(scaler, name), device=reference.device, dtype=reference.dtype
+    )
 
-    if dataset.background_color == "random":
-        background = torch.rand(3)
-    else:
-        background = torch.tensor(dataset.background_color, dtype=torch.float32) / 255.0
 
-    total_num = len(meta["camera_to_worlds"])
-    if split in ["train", "test"]:
-        cam_ids = np.arange(total_num)
-    else:
-        raise ValueError(f"Unsupported split: {split}")
+def _move_source_to_target_frame(source_entry, target_entry, device):
+    source = gpu_utils.move_to_device(source_entry["gs_params"], device)
+    source_scaler = source_entry["scaler"]
+    target_scaler = target_entry["scaler"]
+    source_scale = _scaler_tensor(source_scaler, "scale_", source["means"])
+    source_translation = _scaler_tensor(source_scaler, "trans_", source["means"])
+    target_scale = _scaler_tensor(target_scaler, "scale_", source["means"])
+    target_translation = _scaler_tensor(target_scaler, "trans_", source["means"])
 
-    images = [dataset.read_image(imgs_path[i], background=background) for i in cam_ids]
-    images_name = [imgs_name[i] for i in cam_ids]
-    camera_to_worlds = meta["camera_to_worlds"][cam_ids]
-
-    cameras = {
-        "camera_to_worlds": torch.as_tensor(camera_to_worlds).float(),
-        "fx": torch.as_tensor(meta["fx"]).float(),
-        "fy": torch.as_tensor(meta["fy"]).float(),
-        "cx": torch.as_tensor(meta["cx"]).float(),
-        "cy": torch.as_tensor(meta["cy"]).float(),
-        "width": torch.as_tensor(meta["width"]).float(),
-        "height": torch.as_tensor(meta["height"]).float(),
-        "background_color": background,
+    raw_means = (source["means"] - source_translation) / source_scale
+    converted = {
+        "means": raw_means * target_scale + target_translation,
     }
+    for key, value in source.items():
+        if key == "means":
+            continue
+        if key == "scales":
+            converted[key] = value - torch.log(source_scale) + torch.log(target_scale)
+        else:
+            converted[key] = value.clone()
+    return converted
 
-    return {
-        "gs_params": factor_entry["gs_params"],
-        "images": images,
-        "images_name": images_name,
-        "cameras": cameras,
-        "scene_idx": scene_idx,
-        "scene_name": scene_name,
+
+def build_precomputed_fit_pair(
+    scene,
+    input_resolution_entry,
+    target_resolution_entry,
+    input_resolution,
+    target_resolution,
+    device,
+):
+    source_gs = _move_source_to_target_frame(
+        input_resolution_entry, target_resolution_entry, device
+    )
+    fit_entry = scene["fit_lr_to_hr"]
+    available_pair = (
+        int(fit_entry["source_resolution"]),
+        int(fit_entry["target_resolution"]),
+    )
+    requested_pair = (int(input_resolution), int(target_resolution))
+    if available_pair != requested_pair:
+        raise ValueError(
+            f"Precomputed fit supports {available_pair[0]}->{available_pair[1]}, "
+            f"but {requested_pair[0]}->{requested_pair[1]} was requested"
+        )
+    target_gs = gpu_utils.move_to_device(fit_entry["gs_params"], device)
+    if set(source_gs) != set(target_gs):
+        raise ValueError("Precomputed fit attributes do not match the source")
+    for key, source_value in source_gs.items():
+        if target_gs[key].shape != source_value.shape:
+            raise ValueError(f"Precomputed fit is not identity-paired for {key}")
+    provenance = {
+        "status": "dataset_precomputed",
+        "checkpoint_path": fit_entry["checkpoint_path"],
     }
+    return source_gs, target_gs, provenance

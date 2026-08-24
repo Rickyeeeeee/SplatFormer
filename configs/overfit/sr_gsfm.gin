@@ -76,17 +76,3 @@ train2D/build_optimizer.optimizer_type = 'adam'
 train2D/build_optimizer.optimizer_params = {'eps': 1e-15}
 train2D/build_scheduler.total_step = %total_steps
 train2D/build_scheduler.schedule = 'linear'
-
-SplatFactoMultiLevelDataset.remove_outlier_ndevs = -1
-SplatFactoMultiLevelDataset.image_per_scene = None
-SplatFactoMultiLevelDataset.sample_ratio_test = None
-SplatFactoMultiLevelDataset.max_gs_num = 1000000
-SplatFactoMultiLevelDataset.load_pose_src = 'nerfstudio'
-
-train_dataset/SplatFactoMultiLevelDataset.train_or_test = 'test'
-train_dataset/SplatFactoMultiLevelDataset.nerfstudio_folder = '/project/ricky/splatformer-data/overfit-data-256/nerfstudio'
-train_dataset/SplatFactoMultiLevelDataset.colmap_folder = '/project/ricky/splatformer-data/overfit-data-256/colmap'
-train_dataset/SplatFactoMultiLevelDataset.image_per_scene = 16
-train_dataset/SplatFactoMultiLevelDataset.sample_ratio_test = 0.7
-train_dataset/SplatFactoMultiLevelDataset.split_across_gpus = True
-train_dataset/SplatFactoMultiLevelDataset.factors = [1, 2, 4]

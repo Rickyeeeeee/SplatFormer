@@ -228,6 +228,21 @@ def rasterize_gaussians_to_singleimg(gs_params, camera_to_world, cx, cy, fx, fy,
 def focal2fov(focal, pixels):
     return 2*math.atan(pixels/(2*focal))
 
+
+def _camera_to_homogeneous(c2w_opengl):
+    camera = c2w_opengl.detach().cpu().numpy()
+    if camera.shape == (4, 4):
+        return camera.copy()
+    if camera.shape == (3, 4):
+        homogeneous = np.eye(4, dtype=camera.dtype)
+        homogeneous[:3, :4] = camera
+        return homogeneous
+    raise ValueError(
+        "camera_to_worlds entries must have shape (3, 4) or (4, 4), "
+        f"got {camera.shape}"
+    )
+
+
 def prepare_viewer(cameras, dirname, sh_degree):    #1. cfg_args
     cfg_dict = {}
     cfg_dict['source_path'] = '' # It does not matter
@@ -237,8 +252,7 @@ def prepare_viewer(cameras, dirname, sh_degree):    #1. cfg_args
         f.write(str(Namespace(**cfg_dict)))
     #2. Camera pose
     cameras_towrite= []
-    for i, c2w_opengl in enumerate(cameras['camera_to_worlds'].flip(0)):
-        c2w_opengl  = cameras['camera_to_worlds'][i]
+    for i, c2w_opengl in enumerate(cameras['camera_to_worlds']):
         cam = {'id':i, 'img_name':f'img_{i}.png',
                'width': cameras['width'].item(),
                 'height': cameras['height'].item(),
@@ -248,8 +262,7 @@ def prepare_viewer(cameras, dirname, sh_degree):    #1. cfg_args
                 'position': None, 'rotation': None}
         cam['FovX'] = focal2fov(cam['fx'], cam['width'])
         cam['FovY'] = focal2fov(cam['fy'], cam['height'])
-        c2w_colmap_4x4 = np.eye(4)
-        c2w_colmap_4x4[:3,:4] = c2w_opengl.cpu().numpy()
+        c2w_colmap_4x4 = _camera_to_homogeneous(c2w_opengl)
         c2w_colmap_4x4[:3,1:3]*=-1 #flip y and z
         w2c = np.linalg.inv(c2w_colmap_4x4)
         R = np.transpose(w2c[:3,:3])  # R is stored transposed due to 'glm' in CUDA code

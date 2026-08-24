@@ -4,35 +4,105 @@ import torch
 import torch.nn.functional as F
 
 SUPPORTED_GS_KEYS = ["means", "features_dc", "features_rest", "opacities", "scales", "quats"]
-def load_gs_statistics_normalizers(stats_path, target_factor, loss_features, target_gs, min_std=1e-6):
-    """Load channel-wise GS standard deviations for loss normalization."""
+def load_gs_statistics_normalizers(
+    stats_path,
+    target_resolution,
+    loss_features,
+    target_gs,
+    min_std=1e-6,
+    alignment=None,
+    resolutions=None,
+):
+    """Load channel-wise standard deviations from legacy or gsplat reports."""
     with open(stats_path, "r") as stats_file:
         report = json.load(stats_file)
-    factor_key = f"df-{target_factor}"
-    factors = report.get("factors", {})
-    if factor_key not in factors:
-        raise ValueError(f"GS statistics report does not contain factor '{factor_key}'")
-    parameters = factors[factor_key].get("parameters", {})
+
+    if "factors" in report:
+        factor = int(target_resolution)
+        if resolutions is not None:
+            max_resolution = max(int(resolution) for resolution in resolutions)
+            if max_resolution % int(target_resolution) != 0:
+                raise ValueError(
+                    f"Cannot map resolution {target_resolution} to a legacy factor"
+                )
+            factor = max_resolution // int(target_resolution)
+        report_key = f"df-{factor}"
+        factors = report.get("factors", {})
+        if report_key not in factors:
+            raise ValueError(
+                f"GS statistics report does not contain factor '{report_key}'"
+            )
+        parameters = factors[report_key].get("parameters", {})
+        key_map = {key: key for key in loss_features}
+        schema = "legacy"
+    elif "aggregate" in report:
+        if alignment != "fit_lr_to_hr":
+            raise ValueError(
+                "Aggregate gsplat output statistics require alignment='fit_lr_to_hr'"
+            )
+        report_key = "aggregate.output"
+        parameters = report.get("aggregate", {}).get("output", {})
+        key_map = {
+            "features_dc": "sh0",
+            "features_rest": "shN",
+            **{
+                key: key
+                for key in loss_features
+                if key not in ("features_dc", "features_rest")
+            },
+        }
+        schema = "gsplat"
+    else:
+        raise ValueError("Unrecognized GS statistics report schema")
+
     normalizers = {}
     selected_statistics = {}
     for key in loss_features:
-        parameter_stats = parameters.get(key)
+        report_parameter = key_map[key]
+        parameter_stats = parameters.get(report_parameter)
         if parameter_stats is None:
-            raise ValueError(f"GS statistics report {factor_key} is missing parameter '{key}'")
+            raise ValueError(
+                f"GS statistics report {report_key} is missing parameter "
+                f"'{report_parameter}' for '{key}'"
+            )
         expected_shape = tuple(target_gs[key].shape[1:])
-        reported_shape = tuple(parameter_stats.get("channel_shape") or [])
-        if reported_shape != expected_shape:
-            raise ValueError(f"GS statistics shape mismatch for '{key}': report {reported_shape} vs target {expected_shape}")
         std_values = parameter_stats.get("std")
         if std_values is None:
-            raise ValueError(f"GS statistics report {factor_key} is missing std for '{key}'")
-        std = torch.as_tensor(std_values, dtype=target_gs[key].dtype, device=target_gs[key].device)
+            raise ValueError(
+                f"GS statistics report {report_key} is missing std for '{report_parameter}'"
+            )
+        std = torch.as_tensor(
+            std_values,
+            dtype=target_gs[key].dtype,
+            device=target_gs[key].device,
+        )
+        if schema == "legacy":
+            reported_shape = tuple(parameter_stats.get("channel_shape") or [])
+            if reported_shape != expected_shape:
+                raise ValueError(
+                    f"GS statistics shape mismatch for '{key}': "
+                    f"report {reported_shape} vs target {expected_shape}"
+                )
+        else:
+            if key == "features_dc" and std.ndim == 2 and std.shape[0] == 1:
+                std = std.squeeze(0)
+            if key == "opacities" and std.ndim == 0 and expected_shape == (1,):
+                std = std.unsqueeze(0)
         if tuple(std.shape) != expected_shape:
-            raise ValueError(f"GS statistics std shape mismatch for '{key}': report {tuple(std.shape)} vs target {expected_shape}")
+            raise ValueError(
+                f"GS statistics std shape mismatch for '{key}': "
+                f"report {tuple(std.shape)} vs target {expected_shape}"
+            )
         if not torch.isfinite(std).all() or torch.any(std < 0):
-            raise ValueError(f"GS statistics std for '{key}' must be finite and nonnegative")
+            raise ValueError(
+                f"GS statistics std for '{key}' must be finite and nonnegative"
+            )
         normalizers[key] = std.clamp_min(float(min_std))
-        selected_statistics[key] = parameter_stats
+        selected_statistics[key] = {
+            **parameter_stats,
+            "report_parameter": report_parameter,
+            "report_group": report_key,
+        }
     return normalizers, selected_statistics
 
 

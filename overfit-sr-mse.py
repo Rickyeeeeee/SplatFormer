@@ -22,7 +22,11 @@ from utils.loss_utils import (
 )
 from utils.metrics import MetricComputer, write_densify_stage_render_metrics
 from utils.optimizers import build_optimizer, build_scheduler
-from utils.sr_dataset_utils import build_dataset, find_scene_index
+from utils.sr_dataset_utils import (
+    build_dataset,
+    build_precomputed_fit_pair,
+    find_scene_index,
+)
 from utils.sr_densify_utils import (
     build_densified_input_gs,
     convert_gs_to_target_frame,
@@ -44,16 +48,20 @@ flags.DEFINE_string("eval_subdir", "eval_final", "Eval subdirectory")
 flags.DEFINE_string("scene_name", "", "Scene name to overfit")
 flags.DEFINE_boolean("compare_with_input", False, "Compare with aligned input 3DGS")
 flags.DEFINE_boolean("save_viewer", True, "Save viewer point clouds")
-flags.DEFINE_integer("input_factor", 4, "Low-resolution GS/image factor")
-flags.DEFINE_integer("target_factor", 1, "High-resolution GS/image factor")
+flags.DEFINE_integer("input_resolution", 128, "Low-resolution GS/image resolution")
+flags.DEFINE_integer("target_resolution", 512, "High-resolution GS/image resolution")
 flags.DEFINE_enum("alignment", "emd", mathcing_types, "Matching input/target Gaussian pair.")
 flags.DEFINE_enum("attribute_init", "aligned", init_options, "For emd and random only.")
 flags.DEFINE_float("emd_eps", 0.01, "Auction EMD epsilon")
 flags.DEFINE_integer("emd_iters", 100, "Auction EMD iterations")
 flags.DEFINE_boolean("post_activate_loss", True, "Post activation loss")
 flags.DEFINE_string("gs_statistics_path", None, "Channel-normalized attribute MSE.")
-flags.DEFINE_string("alignment_cache_root", "/project2/ricky/splatformer-data-to-4x", "Cache")
-flags.DEFINE_boolean("force_alignment_fit", False, "Ignore cache")
+flags.DEFINE_string("matching_cache_root", "/project2/ricky/splatformer-data-to-4x", "Reverse-fit cache")
+flags.DEFINE_boolean(
+    "force_matching_fit",
+    False,
+    "Rerun the selected fit without reading or writing its persistent cache",
+)
 flags.DEFINE_multi_string("gin_file", None, "List of paths to Gin config files")
 flags.DEFINE_multi_string("gin_param", "", "Gin parameter bindings")
 
@@ -112,8 +120,8 @@ def feature_mse_loss(loss_weights=None, quat_direct_mse=False):
 def _build_alignment_pair(
     dataset,
     scene,
-    input_factor_dict,
-    target_factor_dict,
+    input_resolution_entry,
+    target_resolution_entry,
     target_images,
     target_cameras,
     target_gs,
@@ -125,8 +133,8 @@ def _build_alignment_pair(
     """Build one same-shape input/target pair for the selected alignment mode."""
     if FLAGS.alignment in {"emd", "random"}:
         aligned_input_gs, stage_gs = build_densified_input_gs(
-            input_factor_dict=input_factor_dict,
-            target_factor_dict=target_factor_dict,
+            input_factor_dict=input_resolution_entry,
+            target_factor_dict=target_resolution_entry,
             alignment="emd" if FLAGS.alignment == "emd" else "none",
             attribute_init=FLAGS.attribute_init,
             emd_eps=FLAGS.emd_eps,
@@ -166,43 +174,56 @@ def _build_alignment_pair(
 
     matching_cfg = matching_fit()
     if FLAGS.alignment == "fit_lr_to_hr":
-        fit_source_gs = build_matching_source(input_factor_dict, target_factor_dict, device)
-        aligned_target_gs, cache = get_or_fit_matching_target(
-            source_gs=fit_source_gs,
-            target_images=target_images,
-            target_cameras=target_cameras,
-            pre_matching_root=FLAGS.alignment_cache_root,
-            scene_name=scene["scene_name"],
-            input_factor=FLAGS.input_factor,
-            target_factor=FLAGS.target_factor,
-            logger=logger,
-            config=matching_cfg,
-            force_pre_matching=FLAGS.force_alignment_fit,
-        )
-        aligned_input_gs = fit_source_gs
+        if FLAGS.force_matching_fit:
+            fit_source_gs = build_matching_source(
+                input_resolution_entry, target_resolution_entry, device
+            )
+            aligned_target_gs, cache = get_or_fit_matching_target(
+                source_gs=fit_source_gs,
+                target_images=target_images,
+                target_cameras=target_cameras,
+                pre_matching_root=FLAGS.matching_cache_root,
+                scene_name=scene["scene_name"],
+                input_resolution=FLAGS.input_resolution,
+                target_resolution=FLAGS.target_resolution,
+                logger=logger,
+                config=matching_cfg,
+                force_pre_matching=True,
+            )
+            aligned_input_gs = fit_source_gs
+        else:
+            aligned_input_gs, aligned_target_gs, cache = build_precomputed_fit_pair(
+                scene=scene,
+                input_resolution_entry=input_resolution_entry,
+                target_resolution_entry=target_resolution_entry,
+                input_resolution=FLAGS.input_resolution,
+                target_resolution=FLAGS.target_resolution,
+                device=device,
+            )
+            fit_source_gs = aligned_input_gs
         artifact_images = target_images
         artifact_cameras = target_cameras
     elif FLAGS.alignment == "fit_hr_to_lr":
-        input_images, _, input_cameras = dataset.load_factor_views(input_factor_dict)
+        input_images, _, input_cameras = dataset.load_resolution_views(input_resolution_entry)
         high_res_in_low_res_frame = build_matching_source(
-            target_factor_dict, input_factor_dict, device
+            target_resolution_entry, input_resolution_entry, device
         )
         fitted_high_res_in_low_res_frame, cache = get_or_fit_matching_target(
             source_gs=high_res_in_low_res_frame,
             target_images=input_images,
             target_cameras=input_cameras,
-            pre_matching_root=FLAGS.alignment_cache_root,
+            pre_matching_root=FLAGS.matching_cache_root,
             scene_name=scene["scene_name"],
-            input_factor=FLAGS.target_factor,
-            target_factor=FLAGS.input_factor,
+            input_resolution=FLAGS.target_resolution,
+            target_resolution=FLAGS.input_resolution,
             logger=logger,
             config=matching_cfg,
-            force_pre_matching=FLAGS.force_alignment_fit,
+            force_pre_matching=FLAGS.force_matching_fit,
         )
         aligned_input_gs = convert_gs_to_target_frame(
             fitted_high_res_in_low_res_frame,
-            input_factor_dict["scaler"],
-            target_factor_dict["scaler"],
+            input_resolution_entry["scaler"],
+            target_resolution_entry["scaler"],
         )
         aligned_target_gs = target_gs
         fit_source_gs = high_res_in_low_res_frame
@@ -232,8 +253,8 @@ def _build_alignment_pair(
     return aligned_input_gs, aligned_target_gs, {
         "cache_status": cache["status"],
         "cache_path": cache["checkpoint_path"],
-        "matching_steps": matching_cfg["total_steps"],
-        "matching_images_per_step": matching_cfg["image_per_step"],
+        "matching_steps": 0 if cache["status"] == "dataset_precomputed" else matching_cfg["total_steps"],
+        "matching_images_per_step": 0 if cache["status"] == "dataset_precomputed" else matching_cfg["image_per_step"],
     }
 
 
@@ -384,23 +405,23 @@ def main(argv):
     logger = ProcessSafeLogger(os.path.join(FLAGS.output_dir, "overfit.log")).get_logger()
     device = torch.device("cuda")
 
-    # Load one input/target-factor scene and its high-resolution evaluation views.
-    dataset = build_dataset()
+    # Load one input/target-resolution scene and its high-resolution evaluation views.
+    dataset = build_dataset("test_dataset")
     scene_idx = find_scene_index(dataset, FLAGS.scene_name)
     scene = dataset.load_scene(scene_idx)
-    input_factor_dict = scene["factor_data"][FLAGS.input_factor]
-    target_factor_dict = scene["factor_data"][FLAGS.target_factor]
-    target_images, target_image_names, target_cameras = dataset.load_factor_views(
-        target_factor_dict
+    input_resolution_entry = scene["resolution_data"][FLAGS.input_resolution]
+    target_resolution_entry = scene["resolution_data"][FLAGS.target_resolution]
+    target_images, target_image_names, target_cameras = dataset.load_resolution_views(
+        target_resolution_entry
     )
-    target_gs = gpu_utils.move_to_device(target_factor_dict["gs_params"], device)
+    target_gs = gpu_utils.move_to_device(target_resolution_entry["gs_params"], device)
     eval_chunk_size = dataset.image_per_scene or len(target_images)
 
     aligned_input_gs, attribute_target_gs, alignment_info = _build_alignment_pair(
         dataset=dataset,
         scene=scene,
-        input_factor_dict=input_factor_dict,
-        target_factor_dict=target_factor_dict,
+        input_resolution_entry=input_resolution_entry,
+        target_resolution_entry=target_resolution_entry,
         target_images=target_images,
         target_cameras=target_cameras,
         target_gs=target_gs,
@@ -424,13 +445,15 @@ def main(argv):
     if FLAGS.gs_statistics_path is not None:
         component_normalizers, selected_statistics = load_gs_statistics_normalizers(
             FLAGS.gs_statistics_path,
-            FLAGS.target_factor,
+            FLAGS.target_resolution,
             attribute_keys,
             attribute_target_gs,
+            alignment=FLAGS.alignment,
+            resolutions=dataset.resolutions,
         )
         effective_loss_weights = {key: 1.0 for key in attribute_keys}
         statistics_message = (
-            f"GS statistics df-{FLAGS.target_factor}:\n"
+            f"GS statistics resolution={FLAGS.target_resolution}:\n"
             f"{json.dumps(selected_statistics, indent=2)}"
         )
         print(statistics_message)
@@ -448,8 +471,8 @@ def main(argv):
         f"Unified SR-MSE scene={scene['scene_name']} idx={scene['idx']}\n"
         f"alignment={FLAGS.alignment}\n"
         f"attribute_init={FLAGS.attribute_init if FLAGS.alignment not in {'fit_lr_to_hr', 'fit_hr_to_lr'} else 'inactive'}\n"
-        f"input_factor={FLAGS.input_factor} target_factor={FLAGS.target_factor}\n"
-        f"original_input_gaussians={input_factor_dict['gs_params']['means'].shape[0]}\n"
+        f"input_resolution={FLAGS.input_resolution} target_resolution={FLAGS.target_resolution}\n"
+        f"original_input_gaussians={input_resolution_entry['gs_params']['means'].shape[0]}\n"
         f"aligned_input_gaussians={aligned_input_gs['means'].shape[0]}\n"
         f"attribute_target_gaussians={attribute_target_gs['means'].shape[0]}\n"
         f"attribute_keys={','.join(attribute_keys)}\n"
@@ -501,20 +524,24 @@ def main(argv):
                 means_loss_reduction=MEANS_LOSS_REDUCTION,
             )
 
+        optimizer_stepped = True
         if enable_amp:
+            previous_scale = scaler.get_scale()
             scaler.scale(total_loss).backward()
             if grad_clip_norm > 0:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
             scaler.step(optimizer)
             scaler.update()
+            optimizer_stepped = scaler.get_scale() >= previous_scale
         else:
             total_loss.backward()
             if grad_clip_norm > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
             optimizer.step()
         optimizer.zero_grad(set_to_none=True)
-        scheduler.step()
+        if optimizer_stepped:
+            scheduler.step()
 
         feature_values = {key: value.item() for key, value in feature_losses.items()}
         weighted_values = {key: value.item() for key, value in weighted_feature_losses.items()}

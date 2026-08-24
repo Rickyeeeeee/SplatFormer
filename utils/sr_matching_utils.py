@@ -48,13 +48,13 @@ def matching_fit(
     }
 
 
-def build_matching_source(input_factor_dict, target_factor_dict, device):
+def build_matching_source(input_resolution_dict, target_resolution_dict, device):
     """Move input GS into the target frame without changing its count or order."""
-    input_gs = gpu_utils.move_to_device(input_factor_dict["gs_params"], device)
+    input_gs = gpu_utils.move_to_device(input_resolution_dict["gs_params"], device)
     source_gs = convert_gs_to_target_frame(
         input_gs,
-        input_factor_dict["scaler"],
-        target_factor_dict["scaler"],
+        input_resolution_dict["scaler"],
+        target_resolution_dict["scaler"],
     )
     if source_gs["means"].shape[0] != input_gs["means"].shape[0]:
         raise RuntimeError("Matching source construction changed the Gaussian count")
@@ -82,15 +82,15 @@ def detach_matching_target(trainable_gs, source_gs):
     return target_gs
 
 
-def matching_cache_dir(pre_matching_root, scene_name, input_factor, target_factor):
-    """Return the factor-specific persistent cache directory for one scene."""
+def matching_cache_dir(pre_matching_root, scene_name, input_resolution, target_resolution):
+    """Return the resolution-specific persistent cache directory for one scene."""
     scene_name = os.path.basename(os.path.normpath(scene_name))
     if not scene_name or scene_name in {".", os.pardir}:
         raise ValueError(f"Invalid scene name for matching cache: {scene_name!r}")
     return os.path.join(
         pre_matching_root,
         scene_name,
-        f"if{int(input_factor)}_tf{int(target_factor)}",
+        f"ir{int(input_resolution)}_tr{int(target_resolution)}",
     )
 
 
@@ -101,12 +101,12 @@ def _source_metadata(source_gs):
     }
 
 
-def _cache_metadata(scene_name, input_factor, target_factor, source_gs, matching_config):
+def _cache_metadata(scene_name, input_resolution, target_resolution, source_gs, matching_config):
     return {
         "version": MATCHING_CACHE_VERSION,
         "scene_name": scene_name,
-        "input_factor": int(input_factor),
-        "target_factor": int(target_factor),
+        "input_resolution": int(input_resolution),
+        "target_resolution": int(target_resolution),
         "source_attributes": _source_metadata(source_gs),
         # Recorded for provenance only: matching settings intentionally do not invalidate a cache.
         "matching_config": dict(matching_config),
@@ -119,7 +119,7 @@ def _validate_cached_target(payload, expected_metadata, source_gs):
     metadata = payload.get("metadata")
     if not isinstance(metadata, dict):
         return None, "missing metadata"
-    for key in ("version", "scene_name", "input_factor", "target_factor", "source_attributes"):
+    for key in ("version", "scene_name", "input_resolution", "target_resolution", "source_attributes"):
         if metadata.get(key) != expected_metadata[key]:
             return None, f"metadata mismatch for {key}"
 
@@ -170,21 +170,37 @@ def get_or_fit_matching_target(
     target_cameras,
     pre_matching_root,
     scene_name,
-    input_factor,
-    target_factor,
+    input_resolution,
+    target_resolution,
     logger,
     config,
     force_pre_matching=False,
 ):
-    """Load a compatible persistent matching target or fit and cache one."""
-    cache_dir = matching_cache_dir(pre_matching_root, scene_name, input_factor, target_factor)
+    """Load a compatible target, or fit one without touching the cache when forced."""
+    cache_dir = matching_cache_dir(pre_matching_root, scene_name, input_resolution, target_resolution)
     checkpoint_path = os.path.join(cache_dir, "matching_target.pt")
-    metadata = _cache_metadata(scene_name, input_factor, target_factor, source_gs, config)
+    metadata = _cache_metadata(scene_name, input_resolution, target_resolution, source_gs, config)
     device = source_gs["means"].device
 
+    if force_pre_matching:
+        logger.info(
+            "Pre-matching forced rematch (persistent cache left unchanged): %s",
+            checkpoint_path,
+        )
+        with tempfile.TemporaryDirectory(prefix="splatformer_matching_fit_") as fit_output_dir:
+            target_gs = fit_matching_target(
+                source_gs, target_images, target_cameras, fit_output_dir, logger, config
+            )
+        return target_gs, {
+            "status": "refit_uncached",
+            "cache_dir": cache_dir,
+            "checkpoint_path": checkpoint_path,
+            "reason": "forced rematch; persistent cache unchanged",
+        }
+
     with _matching_cache_lock(cache_dir):
-        cache_reason = "forced rematch" if force_pre_matching else "checkpoint not found"
-        if not force_pre_matching and os.path.isfile(checkpoint_path):
+        cache_reason = "checkpoint not found"
+        if os.path.isfile(checkpoint_path):
             try:
                 payload = torch.load(checkpoint_path, map_location="cpu")
                 cached_target, cache_reason = _validate_cached_target(payload, metadata, source_gs)

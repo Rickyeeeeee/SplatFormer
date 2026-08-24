@@ -11,20 +11,19 @@ eval_interval=${3:-200}
 log_image_interval=${4:-200}
 alignment=${5:-emd}
 attribute_init=${6:-3dgs}
-input_factor=${7:-4}
-target_factor=${8:-1}
+input_resolution=${7:-128}
+target_resolution=${8:-512}
 post_activate_loss=${9:-${POST_ACTIVATE_LOSS:-true}}
 direct_prediction=${10:-${DIRECT_PREDICTION:-false}}
 gs_statistics_path=${11:-${GS_STATISTICS_PATH:-}}
 
 matching_steps=${MATCHING_STEPS:-2000}
-matching_image_per_step=${MATCHING_IMAGE_PER_STEP:-32}
+matching_image_per_step=${MATCHING_IMAGE_PER_STEP:-16}
 matching_l1_weight=${MATCHING_L1_LOSS_WEIGHT:-1.0}
 matching_lpips_weight=${MATCHING_LPIPS_LOSS_WEIGHT:-1.0}
-alignment_cache_root=${ALIGNMENT_CACHE_ROOT:-/project2/ricky/splatformer-data-to-4x}
-force_alignment_fit=${FORCE_ALIGNMENT_FIT:-false}
-output_root=${OUTPUT_ROOT:-/project2/ricky/experiments/0814-unify-tuned-wo-mean/overfit_sr_mse_512}
-
+matching_cache_root=${MATCHING_CACHE_ROOT:-/project2/ricky/splatformer-data-to-4x}
+force_matching_fit=${FORCE_MATCHING_FIT:-false}
+output_root=${OUTPUT_ROOT:-/project2/ricky/experiments/0824-old}
 to_bit() {
     case "$1" in
         true|True|TRUE|1|yes|Yes|YES) echo 1 ;;
@@ -70,7 +69,7 @@ if [ -n "${gs_statistics_path}" ]; then
     gs_statistics_args=(--gs_statistics_path="${gs_statistics_path}")
 fi
 
-out_name=${scene_name}_${alignment}_${attribute_init}_if${input_factor}_tf${target_factor}_${output_features_type}_pa${post_activate_bit}${stats_suffix}
+out_name=${scene_name}_${alignment}_${attribute_init}_ir${input_resolution}_tr${target_resolution}_${output_features_type}_pa${post_activate_bit}${stats_suffix}
 output_dir=${output_root}/${out_name}
 
 echo "Using GPU: ${GPU_ID}"
@@ -83,14 +82,15 @@ TORCH_CUDNN_V8_API_DISABLED=1 CUDA_VISIBLE_DEVICES="${GPU_ID}" python overfit-sr
     --scene_name="${scene_name}" \
     --alignment="${alignment}" \
     --attribute_init="${attribute_init}" \
-    --input_factor="${input_factor}" \
-    --target_factor="${target_factor}" \
+    --input_resolution="${input_resolution}" \
+    --target_resolution="${target_resolution}" \
     --post_activate_loss="${post_activate_loss}" \
-    --alignment_cache_root="${alignment_cache_root}" \
-    --force_alignment_fit="${force_alignment_fit}" \
+    --matching_cache_root="${matching_cache_root}" \
+    --force_matching_fit="${force_matching_fit}" \
     "${gs_statistics_args[@]}" \
     --gin_file=configs/model/ptv3.gin \
     --gin_file=configs/overfit/sr_mse.gin \
+    --gin_file=configs/dataset/objaverse-sr.gin \
     --gin_param="FeaturePredictor.output_features_type='${output_features_type}'" \
     --gin_param="FeaturePredictor.max_scale_normalized=${max_scale_normalized}" \
     --gin_param="total_steps=${total_steps}" \
@@ -100,6 +100,4 @@ TORCH_CUDNN_V8_API_DISABLED=1 CUDA_VISIBLE_DEVICES="${GPU_ID}" python overfit-sr
     --gin_param="matching_total_steps=${matching_steps}" \
     --gin_param="matching_fit.image_per_step=${matching_image_per_step}" \
     --gin_param="matching_fit.image_l1_loss_weight=${matching_l1_weight}" \
-    --gin_param="matching_fit.lpips_loss_weight=${matching_lpips_weight}" \
-    --gin_param="train_dataset/SplatFactoMultiLevelDataset.nerfstudio_folder='/project2/ricky/splatformer-data/test-set-512/objaverse/nerfstudio'" \
-    --gin_param="train_dataset/SplatFactoMultiLevelDataset.colmap_folder='/project2/ricky/splatformer-data/test-set-512/objaverse/colmap'"
+    --gin_param="matching_fit.lpips_loss_weight=${matching_lpips_weight}"
