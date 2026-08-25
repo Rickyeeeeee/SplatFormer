@@ -8,36 +8,18 @@ import torch
 from absl import app, flags
 from tqdm import tqdm
 
+from dataset.GS_SR import SplatFactoSRDataset
 from models.feature_flow_predictor import GSFlowPredictor
-from models.feature_predictor import FeaturePredictor  # Registers legacy gin keys used by GS_multi.
+from models.feature_predictor import FeaturePredictor  # Registers legacy Gin keys.
+from sr import flow
+from sr.alignment import prepare_alignment
 from utils import gpu_utils, gs_utils, loss_utils
 from utils.gpu_utils import seed_everything
-from utils.gs_utils import (
-    make_grid,
-)
+from utils.gs_utils import make_grid
 from utils.log_utils import ProcessSafeLogger
-from utils.loss_utils import (
-    SUPPORTED_GS_KEYS,
-    feature_mse_loss as compute_feature_mse_loss,
-)
-from utils.metrics import MetricComputer, write_densify_stage_render_metrics
-from utils.optimizers import build_optimizer, build_scheduler
-from utils.sr_dataset_utils import (
-    build_dataset,
-    build_precomputed_fit_pair,
-    find_scene_index,
-)
-from utils.sr_densify_utils import (
-    build_densified_input_gs,
-    convert_gs_to_target_frame,
-    save_densify_stage_plys,
-)
-from utils.sr_matching_utils import (
-    build_matching_source,
-    get_or_fit_matching_target,
-    matching_fit,
-    save_matching_artifacts,
-)
+from utils.loss_utils import SUPPORTED_GS_KEYS
+from utils.metrics import MetricComputer
+from utils.optimizers import build_3DGSoptimizer, build_optimizer, build_scheduler
 
 
 flags.DEFINE_string("output_dir", "output_overfit_gsfm_noemd", "Output directory")
@@ -61,10 +43,8 @@ flags.DEFINE_multi_string("gin_file", None, "List of paths to the config files."
 flags.DEFINE_multi_string("gin_param", "", "Newline separated list of Gin parameter bindings.")
 
 FLAGS = flags.FLAGS
-FLOW_KEYS = SUPPORTED_GS_KEYS
 EVAL_FLOW_STEPS = [1, 5, 20]
 MEANS_LOSS_REDUCTION = "mean"  # Set to "sum" to match PUFM-style summed point loss.
-EPS = 1e-6
 
 
 @gin.configurable
@@ -141,211 +121,114 @@ def loss_mixing(schedule="linear"):
     return {"schedule": schedule}
 
 
-def get_loss_mix_weights(t, schedule):
-    """Return FM and render weights for the sampled GSFM flow time."""
-    if schedule == "linear":
-        return 1.0 - t, t
-    if schedule == "free-range-gs":
-        render_weight = 50.0 * torch.clamp(t / 0.9, max=1.0).pow(5)
-        return torch.ones_like(t), render_weight
-    if schedule == "fm-only":
-        return torch.ones_like(t), torch.zeros_like(t)
-    raise ValueError(
-        f"Unsupported loss_mixing.schedule={schedule!r}; "
-        "expected one of ('linear', 'free-range-gs', 'fm-only')"
-    )
+@gin.configurable
+def matching_fit(
+    total_steps=1000,
+    image_per_step=16,
+    log_interval=20,
+    preview_interval=200,
+    grad_clip_norm=0.0,
+    image_l1_loss_weight=1.0,
+    lpips_loss_weight=1.0,
+    enable_amp=True,
+    empty_cache_fre=-1,
+):
+    return {
+        "total_steps": total_steps,
+        "image_per_step": image_per_step,
+        "log_interval": log_interval,
+        "preview_interval": preview_interval,
+        "grad_clip_norm": grad_clip_norm,
+        "image_l1_loss_weight": image_l1_loss_weight,
+        "lpips_loss_weight": lpips_loss_weight,
+        "enable_amp": enable_amp,
+        "empty_cache_fre": empty_cache_fre,
+    }
 
+
+def build_matching_optimization(gaussians):
+    with gin.config_scope("matching_fit"):
+        optimizer = build_3DGSoptimizer(gaussians)
+        scheduler = build_scheduler(optimizer)
+    return optimizer, scheduler
 
 
 @gin.configurable
 def feature_mse_loss(loss_weights=None, quat_direct_mse=False):
-    default_weights = {key: 1.0 for key in FLOW_KEYS}
+    default_weights = {key: 1.0 for key in SUPPORTED_GS_KEYS}
     if loss_weights is None:
         loss_weights = {}
-    unknown_keys = sorted(set(loss_weights) - set(FLOW_KEYS))
+    unknown_keys = sorted(set(loss_weights) - set(SUPPORTED_GS_KEYS))
     if unknown_keys:
         raise ValueError(
             f"Unsupported feature_mse_loss.loss_weights keys: {unknown_keys}. "
-            f"Supported keys are: {FLOW_KEYS}"
+            f"Supported keys are: {SUPPORTED_GS_KEYS}"
         )
-    default_weights.update({key: float(value) for key, value in loss_weights.items()})
-    return {"loss_weights": default_weights, "quat_direct_mse": quat_direct_mse}
-
-
-def _clone_gs(gs):
-    return {key: value.clone() for key, value in gs.items()}
-
-
-
-def sample_stochastic_interpolant(source_flow_gs, target_flow_gs, t, noise_scale):
-    alpha = t.view(1, 1)
-    gamma_base = torch.sqrt(torch.clamp(2.0 * t * (1.0 - t), min=EPS))
-    gamma = (float(noise_scale) * gamma_base).view(1, 1)
-    gamma_dot = (float(noise_scale) * (1.0 - 2.0 * t) / gamma_base).view(1, 1)
-
-    query_flow_gs = {}
-    flow_noise = {}
-    for key, source_value in source_flow_gs.items():
-        if key not in target_flow_gs:
-            continue
-        target_value = target_flow_gs[key]
-        if float(noise_scale) > 0.0:
-            z = torch.randn_like(source_value)
-        else:
-            z = torch.zeros_like(source_value)
-        flow_noise[key] = z
-        query_flow_gs[key] = (1.0 - alpha) * source_value + alpha * target_value + gamma * z
-
-    return query_flow_gs, flow_noise, gamma, gamma_dot
-
-
-def subtract_stochastic_velocity(pred_vel, flow_noise, gamma_dot):
+    default_weights.update(
+        {key: float(value) for key, value in loss_weights.items()}
+    )
     return {
-        key: value - gamma_dot * flow_noise[key] if key in flow_noise else value
-        for key, value in pred_vel.items()
+        "loss_weights": default_weights,
+        "quat_direct_mse": quat_direct_mse,
     }
 
 
-def compute_matching_velocity_variances(
-    source_flow_gs, target_flow_gs, attribute_keys, variance_floor
+def compute_all_feature_mse_loss(
+    out_gs,
+    target_gs,
+    loss_weights,
+    quat_direct_mse,
 ):
-    raw_variances = {}
-    effective_variances = {}
-    for key in attribute_keys:
-        if key not in source_flow_gs or key not in target_flow_gs:
-            raise ValueError(f"Cannot compute velocity variance for missing feature {key!r}")
-        if source_flow_gs[key].shape != target_flow_gs[key].shape:
-            raise ValueError(
-                f"Velocity variance shape mismatch for {key!r}: "
-                f"source {tuple(source_flow_gs[key].shape)} vs "
-                f"target {tuple(target_flow_gs[key].shape)}"
-            )
-        gt_velocity = (target_flow_gs[key] - source_flow_gs[key]).detach().float()
-        variance = gt_velocity.var(dim=0, unbiased=False)
-        raw_variances[key] = variance
-        effective_variances[key] = variance.clamp_min(float(variance_floor))
-    return raw_variances, effective_variances
+    missing_output = [
+        key for key in SUPPORTED_GS_KEYS if key not in out_gs
+    ]
+    missing_target = [
+        key for key in SUPPORTED_GS_KEYS if key not in target_gs
+    ]
+    if missing_output:
+        raise ValueError(
+            f"GSFlowPredictor must output every Gaussian attribute; "
+            f"missing {missing_output}"
+        )
+    if missing_target:
+        raise ValueError(
+            f"All-attribute flow target is missing {missing_target}"
+        )
 
-
-def format_velocity_variances(raw_variances, effective_variances):
-    report = {
-        key: {
-            "variance": raw_variances[key].detach().cpu().tolist(),
-            "effective_variance": effective_variances[key].detach().cpu().tolist(),
-        }
-        for key in raw_variances
-    }
-    return json.dumps(report, sort_keys=True)
-
-
-def compute_variance_normalized_velocity_loss(
-    pred_vel,
-    source_flow_gs,
-    target_flow_gs,
-    flow_noise,
-    gamma_dot,
-    attribute_keys,
-    velocity_variances,
-    loss_weights=None,
-):
-    if loss_weights is None:
-        loss_weights = {}
     losses = {}
     weighted_losses = {}
     total_loss = None
-    for key in attribute_keys:
-        if key not in pred_vel:
-            raise ValueError(f"Selected velocity feature {key!r} missing from model output")
-        pred = pred_vel[key].float()
-        target = (target_flow_gs[key] - source_flow_gs[key]).to(
+    for key in SUPPORTED_GS_KEYS:
+        pred = out_gs[key]
+        target = target_gs[key].to(
             device=pred.device, dtype=pred.dtype
         )
-        if key in flow_noise:
-            noise = flow_noise[key].to(device=pred.device, dtype=pred.dtype)
-            target = target + gamma_dot.to(device=pred.device, dtype=pred.dtype) * noise
-        variance = velocity_variances[key].to(device=pred.device, dtype=pred.dtype)
-        loss = ((pred - target).square() / variance).mean()
-        weighted_loss = float(loss_weights.get(key, 1.0)) * loss
+        if pred.shape != target.shape:
+            raise ValueError(
+                f"Shape mismatch for Gaussian attribute {key!r}: "
+                f"output {tuple(pred.shape)} vs target {tuple(target.shape)}"
+            )
+        loss = loss_utils.feature_loss_value(
+            key,
+            pred,
+            target,
+            post_activate_loss=True,
+            quat_direct_mse=quat_direct_mse,
+            means_loss_reduction=MEANS_LOSS_REDUCTION,
+        )
+        weighted_loss = float(loss_weights[key]) * loss
         losses[key] = loss
         weighted_losses[key] = weighted_loss
-        total_loss = weighted_loss if total_loss is None else total_loss + weighted_loss
+        total_loss = (
+            weighted_loss if total_loss is None else total_loss + weighted_loss
+        )
 
-    if total_loss is None:
-        raise ValueError("No variance-normalized velocity MSE losses were computed")
     if not total_loss.requires_grad:
         raise ValueError(
-            "Selected velocity loss features do not receive gradients. "
-            "Make sure GSFlowPredictor.output_features includes a selected feature."
+            "GSFlowPredictor outputs do not receive gradients for the "
+            "all-attribute x1 loss"
         )
     return total_loss, losses, weighted_losses
-
-
-def _apply_model_flow_update(model, feature, value, update, step_scale=1.0):
-    if model is not None and hasattr(model, "apply_feature_update"):
-        return model.apply_feature_update(feature, value, update, step_scale)
-    if torch.is_tensor(step_scale):
-        step_scale = step_scale.to(device=update.device, dtype=update.dtype)
-    else:
-        step_scale = float(step_scale)
-    return value + step_scale * update
-
-
-def apply_flow_velocity(source_flow_gs, pred_vel, model=None):
-    return {
-        key: _apply_model_flow_update(model, key, source_value, pred_vel[key])
-        if key in pred_vel
-        else source_value.clone()
-        for key, source_value in source_flow_gs.items()
-    }
-
-
-def predict_x1_from_velocity(
-    model,
-    source_flow_gs,
-    query_flow_gs,
-    pred_vel,
-    flow_noise,
-    gamma,
-    gamma_dot,
-    t,
-    source_anchored=True,
-):
-    one_minus_t = (1.0 - t).view(1, 1)
-    x1_pred = {}
-    for key, query_value in query_flow_gs.items():
-        clean_xt = query_value - gamma * flow_noise.get(key, torch.zeros_like(query_value))
-        base_value = source_flow_gs[key] if source_anchored else clean_xt
-        step_scale = 1.0 if source_anchored else one_minus_t
-        if key in pred_vel:
-            clean_vel = pred_vel[key] - gamma_dot * flow_noise.get(key, torch.zeros_like(pred_vel[key]))
-            x1_pred[key] = _apply_model_flow_update(model, key, base_value, clean_vel, step_scale)
-        else:
-            x1_pred[key] = base_value.clone()
-    return x1_pred
-
-
-
-def sample_flow_model(model, source_flow_gs, scene_idx, flow_steps):
-    if flow_steps <= 0:
-        raise ValueError("flow_steps must be positive")
-    model.eval()
-    state = _clone_gs(source_flow_gs)
-    device = state["means"].device
-    with torch.no_grad():
-        for step in range(flow_steps):
-            t_value = torch.full((1,), float(step) / float(flow_steps), device=device)
-            pred_vel = model(
-                batch_flow_gs=[state],
-                batch_scene_idx=[scene_idx],
-                batch_reference_means=[source_flow_gs["means"]],
-                t=t_value,
-            )[0]
-            for key in state.keys():
-                if key in pred_vel:
-                    state[key] = _apply_model_flow_update(
-                        model, key, state[key], pred_vel[key], 1.0 / float(flow_steps)
-                    )
-    return _clone_gs(state)
 
 
 def evaluate_single_scene(
@@ -387,7 +270,7 @@ def evaluate_single_scene(
         os.makedirs(compare_dir, exist_ok=True)
 
     with torch.no_grad():
-        out_gs = sample_flow_model(model, source_flow_gs, scene_idx, flow_steps)
+        out_gs = flow.sample_flow_model(model, source_flow_gs, scene_idx, flow_steps)
         pred_preview = []
         gt_preview = []
 
@@ -477,147 +360,6 @@ def evaluate_single_scene(
     return metrics, metrics_input
 
 
-def _build_alignment_pair(
-    dataset,
-    scene,
-    input_resolution_entry,
-    target_resolution_entry,
-    target_images,
-    target_cameras,
-    target_gs,
-    output_dir,
-    logger,
-    device,
-    eval_chunk_size,
-):
-    """Build one same-shape input/target pair for the selected alignment mode."""
-    if FLAGS.alignment in {"emd", "random"}:
-        aligned_input_gs, stage_gs = build_densified_input_gs(
-            input_factor_dict=input_resolution_entry,
-            target_factor_dict=target_resolution_entry,
-            alignment="emd" if FLAGS.alignment == "emd" else "none",
-            attribute_init=FLAGS.attribute_init,
-            emd_eps=FLAGS.emd_eps,
-            emd_iters=FLAGS.emd_iters,
-            device=device,
-            return_stages=True,
-        )
-        if FLAGS.alignment == "random":
-            permutation = torch.randperm(aligned_input_gs["means"].shape[0], device=device)
-            aligned_input_gs = {
-                key: value[permutation].clone() for key, value in aligned_input_gs.items()
-            }
-
-        stage_gs["03_input_high_res_gs.ply"] = aligned_input_gs
-        save_densify_stage_plys(
-            output_dir=output_dir,
-            low_res_gs=stage_gs["00_low_res_gs.ply"],
-            interpolated_gs=stage_gs["01_interpolated_high_res_gs.ply"],
-            gt_high_res_gs=stage_gs["02_gt_high_res_gs.ply"],
-            input_high_res_gs=stage_gs["03_input_high_res_gs.ply"],
-        )
-        stage_metrics = write_densify_stage_render_metrics(
-            output_dir=output_dir,
-            stage_gs=stage_gs,
-            images=target_images,
-            cameras=target_cameras,
-            chunk_size=eval_chunk_size,
-            device=device,
-        )
-        for ply_name, metrics in stage_metrics.items():
-            logger.info(
-                "Alignment init %s: %s",
-                ply_name,
-                " ".join(f"{key}: {value:.4f}" for key, value in metrics.items()),
-            )
-        return aligned_input_gs, target_gs, {"cache_status": "not_applicable"}
-
-    matching_cfg = matching_fit()
-    if FLAGS.alignment == "fit_lr_to_hr":
-        if FLAGS.force_matching_fit:
-            fit_source_gs = build_matching_source(
-                input_resolution_entry, target_resolution_entry, device
-            )
-            aligned_target_gs, cache = get_or_fit_matching_target(
-                source_gs=fit_source_gs,
-                target_images=target_images,
-                target_cameras=target_cameras,
-                pre_matching_root=FLAGS.matching_cache_root,
-                scene_name=scene["scene_name"],
-                input_resolution=FLAGS.input_resolution,
-                target_resolution=FLAGS.target_resolution,
-                logger=logger,
-                config=matching_cfg,
-                force_pre_matching=True,
-            )
-            aligned_input_gs = fit_source_gs
-        else:
-            aligned_input_gs, aligned_target_gs, cache = build_precomputed_fit_pair(
-                scene=scene,
-                input_resolution_entry=input_resolution_entry,
-                target_resolution_entry=target_resolution_entry,
-                input_resolution=FLAGS.input_resolution,
-                target_resolution=FLAGS.target_resolution,
-                device=device,
-            )
-            fit_source_gs = aligned_input_gs
-        artifact_images = target_images
-        artifact_cameras = target_cameras
-    elif FLAGS.alignment == "fit_hr_to_lr":
-        input_images, _, input_cameras = dataset.load_resolution_views(input_resolution_entry)
-        high_res_in_low_res_frame = build_matching_source(
-            target_resolution_entry, input_resolution_entry, device
-        )
-        fitted_high_res_in_low_res_frame, cache = get_or_fit_matching_target(
-            source_gs=high_res_in_low_res_frame,
-            target_images=input_images,
-            target_cameras=input_cameras,
-            pre_matching_root=FLAGS.matching_cache_root,
-            scene_name=scene["scene_name"],
-            input_resolution=FLAGS.target_resolution,
-            target_resolution=FLAGS.input_resolution,
-            logger=logger,
-            config=matching_cfg,
-            force_pre_matching=FLAGS.force_matching_fit,
-        )
-        aligned_input_gs = convert_gs_to_target_frame(
-            fitted_high_res_in_low_res_frame,
-            input_resolution_entry["scaler"],
-            target_resolution_entry["scaler"],
-        )
-        aligned_target_gs = target_gs
-        fit_source_gs = high_res_in_low_res_frame
-        artifact_images = input_images
-        artifact_cameras = input_cameras
-    else:
-        raise ValueError(f"Unsupported alignment mode: {FLAGS.alignment}")
-
-    artifact_chunk_size = dataset.image_per_scene or len(artifact_images)
-    artifact_metrics = save_matching_artifacts(
-        output_dir,
-        fit_source_gs,
-        aligned_target_gs
-        if FLAGS.alignment == "fit_lr_to_hr"
-        else fitted_high_res_in_low_res_frame,
-        artifact_images,
-        artifact_cameras,
-        artifact_chunk_size,
-        device,
-    )
-    for ply_name, metrics in artifact_metrics.items():
-        logger.info(
-            "Fitted alignment %s: %s",
-            ply_name,
-            " ".join(f"{key}: {value:.4f}" for key, value in metrics.items()),
-        )
-    return aligned_input_gs, aligned_target_gs, {
-        "cache_status": cache["status"],
-        "cache_path": cache["checkpoint_path"],
-        "matching_steps": 0 if cache["status"] == "dataset_precomputed" else matching_cfg["total_steps"],
-        "matching_images_per_step": 0 if cache["status"] == "dataset_precomputed" else matching_cfg["image_per_step"],
-    }
-
-
 def main(argv):
     del argv
     os.makedirs(FLAGS.output_dir, exist_ok=True)
@@ -634,8 +376,8 @@ def main(argv):
     logger = ProcessSafeLogger(os.path.join(FLAGS.output_dir, "overfit.log")).get_logger()
     device = torch.device("cuda")
 
-    dataset = build_dataset("test_dataset")
-    scene_idx = find_scene_index(dataset, FLAGS.scene_name)
+    dataset = SplatFactoSRDataset.from_gin_scope("test_dataset")
+    scene_idx = dataset.scene_index(FLAGS.scene_name)
     scene = dataset.load_scene(scene_idx)
     input_resolution_entry = scene["resolution_data"][FLAGS.input_resolution]
     target_resolution_entry = scene["resolution_data"][FLAGS.target_resolution]
@@ -647,7 +389,7 @@ def main(argv):
     if eval_chunk_size <= 0:
         eval_chunk_size = len(target_images)
 
-    source_gs, matching_target_gs, alignment_info = _build_alignment_pair(
+    source_gs, matching_target_gs, alignment_info = prepare_alignment(
         dataset=dataset,
         scene=scene,
         input_resolution_entry=input_resolution_entry,
@@ -659,31 +401,54 @@ def main(argv):
         logger=logger,
         device=device,
         eval_chunk_size=eval_chunk_size,
+        alignment=FLAGS.alignment,
+        attribute_init=FLAGS.attribute_init,
+        emd_eps=FLAGS.emd_eps,
+        emd_iters=FLAGS.emd_iters,
+        input_resolution=FLAGS.input_resolution,
+        target_resolution=FLAGS.target_resolution,
+        matching_cache_root=FLAGS.matching_cache_root,
+        force_matching_fit=FLAGS.force_matching_fit,
+        matching_config=matching_fit(),
+        matching_optimizer_factory=build_matching_optimization,
     )
 
-    attribute_keys = list(SUPPORTED_GS_KEYS)
     model = GSFlowPredictor().to(device)
+    missing_outputs = sorted(set(SUPPORTED_GS_KEYS) - set(model.output_features))
+    if missing_outputs:
+        raise ValueError(
+            f"GSFlowPredictor.output_features must include all Gaussian "
+            f"attributes; missing {missing_outputs}"
+        )
     if model.resume_ckpt is not None:
         model.load_state_dict(torch.load(model.resume_ckpt, map_location="cpu"))
     model.train()
 
     loss_target_gs = matching_target_gs
-    source_flow_gs = _clone_gs(source_gs)
-    target_flow_gs = _clone_gs(loss_target_gs)
-    raw_velocity_variances, velocity_variances = compute_matching_velocity_variances(
-        source_flow_gs,
-        target_flow_gs,
-        attribute_keys,
-        flow_cfg["velocity_variance_floor"],
+    source_flow_gs = gs_utils.clone_gaussians(source_gs)
+    target_flow_gs = gs_utils.clone_gaussians(loss_target_gs)
+    raw_velocity_variances, velocity_variances = (
+        flow.compute_matching_velocity_variances(
+            source_flow_gs,
+            target_flow_gs,
+            flow_cfg["velocity_variance_floor"],
+        )
     )
+    variance_report = {
+        key: {
+            "variance": raw_velocity_variances[key].detach().cpu().tolist(),
+            "effective_variance": velocity_variances[key].detach().cpu().tolist(),
+        }
+        for key in SUPPORTED_GS_KEYS
+    }
     variance_message = (
         "GT matching velocity variances: "
-        + format_velocity_variances(raw_velocity_variances, velocity_variances)
+        + json.dumps(variance_report, sort_keys=True)
     )
     print(variance_message)
     logger.info(variance_message)
     if flow_cfg["loss_type"] == "velocity":
-        flow_loss_weights = {key: 1.0 for key in attribute_keys}
+        flow_loss_weights = {key: 1.0 for key in SUPPORTED_GS_KEYS}
     else:
         flow_loss_weights = mse_loss_cfg["loss_weights"]
     batch_scene_idx = [scene["idx"]]
@@ -725,7 +490,7 @@ def main(argv):
         f"alignment={FLAGS.alignment} "
         f"attribute_init={FLAGS.attribute_init if FLAGS.alignment in {'emd', 'random'} else 'inactive'} "
         f"alignment_info={alignment_info} "
-        f"attribute_keys={','.join(attribute_keys)} "
+        f"attribute_keys={','.join(SUPPORTED_GS_KEYS)} "
         f"flow_steps={flow_cfg['flow_steps']} "
         f"flow_noise_std={flow_cfg['flow_noise_std']} "
         f"flow_t_eps={flow_cfg['flow_t_eps']} "
@@ -760,7 +525,7 @@ def main(argv):
             train_images, _, train_cameras = dataset.load_resolution_views(target_resolution_entry, camera_ids=camera_indices)
             train_images = gpu_utils.move_to_device(train_images, device)
             train_cameras = gpu_utils.move_to_device(train_cameras, device)
-        query_flow_gs, flow_noise, gamma, gamma_dot = sample_stochastic_interpolant(
+        query_flow_gs, flow_noise, gamma, gamma_dot = flow.sample_stochastic_interpolant(
             source_flow_gs, target_flow_gs, t, flow_noise_std
         )
         with torch.cuda.amp.autocast(enabled=enable_amp):
@@ -770,37 +535,29 @@ def main(argv):
                 batch_reference_means=[source_flow_gs["means"]],
                 t=t,
             )[0]
-            x1_pred_flow_gs = predict_x1_from_velocity(
+            x1_pred_flow_gs = flow.predict_x1_from_velocity(
                 model, source_flow_gs, query_flow_gs, pred_vel, flow_noise, gamma, gamma_dot, t
             )
             if flow_cfg["loss_type"] == "velocity":
                 fm_loss, attr_losses, weighted_attr_losses = (
-                    compute_variance_normalized_velocity_loss(
-                        pred_vel,
-                        source_flow_gs,
-                        target_flow_gs,
-                        flow_noise,
-                        gamma_dot,
-                        attribute_keys,
-                        velocity_variances,
+                    flow.compute_variance_normalized_velocity_loss(
+                        pred_vel=pred_vel,
+                        source_flow_gs=source_flow_gs,
+                        target_flow_gs=target_flow_gs,
+                        flow_noise=flow_noise,
+                        gamma_dot=gamma_dot,
+                        velocity_variances=velocity_variances,
                         loss_weights=flow_loss_weights,
                     )
                 )
             else:
-                fm_loss, attr_losses, weighted_attr_losses = compute_feature_mse_loss(
-                    x1_pred_flow_gs,
-                    loss_target_gs,
-                    attribute_keys,
-                    loss_weights=flow_loss_weights,
-                    post_activate_loss=True,
-                    quat_direct_mse=mse_loss_cfg["quat_direct_mse"],
-                    means_loss_reduction=MEANS_LOSS_REDUCTION,
-                    output_label="predicted x1",
-                    total_loss_error="No x1_pred MSE losses were computed",
-                    grad_error=(
-                        "Selected loss features do not receive gradients. "
-                        "Make sure GSFlowPredictor.output_features includes at least one selected loss feature."
-                    ),
+                fm_loss, attr_losses, weighted_attr_losses = (
+                    compute_all_feature_mse_loss(
+                        out_gs=x1_pred_flow_gs,
+                        target_gs=loss_target_gs,
+                        loss_weights=flow_loss_weights,
+                        quat_direct_mse=mse_loss_cfg["quat_direct_mse"],
+                    )
                 )
             if is_fm_only:
                 render_l1 = fm_loss.new_zeros(())
@@ -826,7 +583,7 @@ def main(argv):
                     lpips_loss_weight * render_lpips if lpips_loss_func is not None else 0.0
                 )
                 render_loss = weighted_render_l1 + weighted_render_lpips
-            fm_mix_weight, render_mix_weight = get_loss_mix_weights(t, mix_cfg["schedule"])
+            fm_mix_weight, render_mix_weight = flow.loss_mix_weights(t, mix_cfg["schedule"])
             total_loss = fm_mix_weight * fm_loss + render_mix_weight * render_loss
 
         optimizer_stepped = True
@@ -881,14 +638,14 @@ def main(argv):
                 f"render_lpips={render_lpips.item() if lpips_loss_func is not None else 0.0:.6f} "
                 f"weighted_render_lpips={weighted_render_lpips.item() if lpips_loss_func is not None else 0.0:.6f} "
                 f"sampled_views={render_view_count} loss_type={flow_cfg['loss_type']} "
-                f"attribute_keys={','.join(attribute_keys)} t={t.item():.6f} "
+                f"attribute_keys={','.join(SUPPORTED_GS_KEYS)} t={t.item():.6f} "
                 f"t_eps={flow_t_eps:.6f} gamma={gamma.item():.8f} gamma_dot={gamma_dot.item():.8f} "
                 f"lr={optimizer.param_groups[0]['lr']:.8f} {attr_str}"
             )
 
         if step % log_image_interval == 0:
             with torch.no_grad():
-                train_out_gs = sample_flow_model(
+                train_out_gs = flow.sample_flow_model(
                     model, source_flow_gs, scene["idx"], int(flow_cfg["flow_steps"])
                 )
                 pred_imgs, _ = gs_utils.rasterize_gaussians_to_multiimgs(train_out_gs, train_cameras_device)

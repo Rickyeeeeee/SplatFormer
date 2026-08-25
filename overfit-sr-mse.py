@@ -10,34 +10,20 @@ import torch
 from absl import app, flags
 from tqdm import tqdm
 
+from dataset.GS_SR import SplatFactoSRDataset
 from models.feature_predictor import FeaturePredictor
+from sr.alignment import prepare_alignment
 from utils import gpu_utils, gs_utils
 from utils.gpu_utils import seed_everything
 from utils.gs_utils import make_grid
 from utils.log_utils import ProcessSafeLogger
 from utils.loss_utils import (
     SUPPORTED_GS_KEYS,
-    feature_mse_loss as compute_feature_mse_loss,
+    feature_loss_value,
     load_gs_statistics_normalizers,
 )
-from utils.metrics import MetricComputer, write_densify_stage_render_metrics
-from utils.optimizers import build_optimizer, build_scheduler
-from utils.sr_dataset_utils import (
-    build_dataset,
-    build_precomputed_fit_pair,
-    find_scene_index,
-)
-from utils.sr_densify_utils import (
-    build_densified_input_gs,
-    convert_gs_to_target_frame,
-    save_densify_stage_plys,
-)
-from utils.sr_matching_utils import (
-    build_matching_source,
-    get_or_fit_matching_target,
-    matching_fit,
-    save_matching_artifacts,
-)
+from utils.metrics import MetricComputer
+from utils.optimizers import build_3DGSoptimizer, build_optimizer, build_scheduler
 
 mathcing_types = ["emd", "random", "fit_lr_to_hr", "fit_hr_to_lr"]
 init_options = ["aligned", "3dgs"]
@@ -103,6 +89,38 @@ def training(
 
 
 @gin.configurable
+def matching_fit(
+    total_steps=1000,
+    image_per_step=16,
+    log_interval=20,
+    preview_interval=200,
+    grad_clip_norm=0.0,
+    image_l1_loss_weight=1.0,
+    lpips_loss_weight=1.0,
+    enable_amp=True,
+    empty_cache_fre=-1,
+):
+    return {
+        "total_steps": total_steps,
+        "image_per_step": image_per_step,
+        "log_interval": log_interval,
+        "preview_interval": preview_interval,
+        "grad_clip_norm": grad_clip_norm,
+        "image_l1_loss_weight": image_l1_loss_weight,
+        "lpips_loss_weight": lpips_loss_weight,
+        "enable_amp": enable_amp,
+        "empty_cache_fre": empty_cache_fre,
+    }
+
+
+def build_matching_optimization(gaussians):
+    with gin.config_scope("matching_fit"):
+        optimizer = build_3DGSoptimizer(gaussians)
+        scheduler = build_scheduler(optimizer)
+    return optimizer, scheduler
+
+
+@gin.configurable
 def feature_mse_loss(loss_weights=None, quat_direct_mse=False):
     default_weights = {key: 1.0 for key in SUPPORTED_GS_KEYS}
     if loss_weights is None:
@@ -113,149 +131,85 @@ def feature_mse_loss(loss_weights=None, quat_direct_mse=False):
             f"Unsupported feature_mse_loss.loss_weights keys: {unknown_keys}. "
             f"Supported keys are: {SUPPORTED_GS_KEYS}"
         )
-    default_weights.update({key: float(value) for key, value in loss_weights.items()})
-    return {"loss_weights": default_weights, "quat_direct_mse": quat_direct_mse}
-
-
-def _build_alignment_pair(
-    dataset,
-    scene,
-    input_resolution_entry,
-    target_resolution_entry,
-    target_images,
-    target_cameras,
-    target_gs,
-    output_dir,
-    logger,
-    device,
-    eval_chunk_size,
-):
-    """Build one same-shape input/target pair for the selected alignment mode."""
-    if FLAGS.alignment in {"emd", "random"}:
-        aligned_input_gs, stage_gs = build_densified_input_gs(
-            input_factor_dict=input_resolution_entry,
-            target_factor_dict=target_resolution_entry,
-            alignment="emd" if FLAGS.alignment == "emd" else "none",
-            attribute_init=FLAGS.attribute_init,
-            emd_eps=FLAGS.emd_eps,
-            emd_iters=FLAGS.emd_iters,
-            device=device,
-            return_stages=True,
-        )
-        if FLAGS.alignment == "random":
-            permutation = torch.randperm(aligned_input_gs["means"].shape[0], device=device)
-            aligned_input_gs = {
-                key: value[permutation].clone() for key, value in aligned_input_gs.items()
-            }
-
-        stage_gs["03_input_high_res_gs.ply"] = aligned_input_gs
-        save_densify_stage_plys(
-            output_dir=output_dir,
-            low_res_gs=stage_gs["00_low_res_gs.ply"],
-            interpolated_gs=stage_gs["01_interpolated_high_res_gs.ply"],
-            gt_high_res_gs=stage_gs["02_gt_high_res_gs.ply"],
-            input_high_res_gs=stage_gs["03_input_high_res_gs.ply"],
-        )
-        stage_metrics = write_densify_stage_render_metrics(
-            output_dir=output_dir,
-            stage_gs=stage_gs,
-            images=target_images,
-            cameras=target_cameras,
-            chunk_size=eval_chunk_size,
-            device=device,
-        )
-        for ply_name, metrics in stage_metrics.items():
-            logger.info(
-                "Alignment init %s: %s",
-                ply_name,
-                " ".join(f"{key}: {value:.4f}" for key, value in metrics.items()),
-            )
-        return aligned_input_gs, target_gs, {"cache_status": "not_applicable"}
-
-    matching_cfg = matching_fit()
-    if FLAGS.alignment == "fit_lr_to_hr":
-        if FLAGS.force_matching_fit:
-            fit_source_gs = build_matching_source(
-                input_resolution_entry, target_resolution_entry, device
-            )
-            aligned_target_gs, cache = get_or_fit_matching_target(
-                source_gs=fit_source_gs,
-                target_images=target_images,
-                target_cameras=target_cameras,
-                pre_matching_root=FLAGS.matching_cache_root,
-                scene_name=scene["scene_name"],
-                input_resolution=FLAGS.input_resolution,
-                target_resolution=FLAGS.target_resolution,
-                logger=logger,
-                config=matching_cfg,
-                force_pre_matching=True,
-            )
-            aligned_input_gs = fit_source_gs
-        else:
-            aligned_input_gs, aligned_target_gs, cache = build_precomputed_fit_pair(
-                scene=scene,
-                input_resolution_entry=input_resolution_entry,
-                target_resolution_entry=target_resolution_entry,
-                input_resolution=FLAGS.input_resolution,
-                target_resolution=FLAGS.target_resolution,
-                device=device,
-            )
-            fit_source_gs = aligned_input_gs
-        artifact_images = target_images
-        artifact_cameras = target_cameras
-    elif FLAGS.alignment == "fit_hr_to_lr":
-        input_images, _, input_cameras = dataset.load_resolution_views(input_resolution_entry)
-        high_res_in_low_res_frame = build_matching_source(
-            target_resolution_entry, input_resolution_entry, device
-        )
-        fitted_high_res_in_low_res_frame, cache = get_or_fit_matching_target(
-            source_gs=high_res_in_low_res_frame,
-            target_images=input_images,
-            target_cameras=input_cameras,
-            pre_matching_root=FLAGS.matching_cache_root,
-            scene_name=scene["scene_name"],
-            input_resolution=FLAGS.target_resolution,
-            target_resolution=FLAGS.input_resolution,
-            logger=logger,
-            config=matching_cfg,
-            force_pre_matching=FLAGS.force_matching_fit,
-        )
-        aligned_input_gs = convert_gs_to_target_frame(
-            fitted_high_res_in_low_res_frame,
-            input_resolution_entry["scaler"],
-            target_resolution_entry["scaler"],
-        )
-        aligned_target_gs = target_gs
-        fit_source_gs = high_res_in_low_res_frame
-        artifact_images = input_images
-        artifact_cameras = input_cameras
-    else:
-        raise ValueError(f"Unsupported alignment mode: {FLAGS.alignment}")
-
-    artifact_chunk_size = dataset.image_per_scene or len(artifact_images)
-    artifact_metrics = save_matching_artifacts(
-        output_dir,
-        fit_source_gs,
-        aligned_target_gs
-        if FLAGS.alignment == "fit_lr_to_hr"
-        else fitted_high_res_in_low_res_frame,
-        artifact_images,
-        artifact_cameras,
-        artifact_chunk_size,
-        device,
+    default_weights.update(
+        {key: float(value) for key, value in loss_weights.items()}
     )
-    for ply_name, metrics in artifact_metrics.items():
-        logger.info(
-            "Fitted alignment %s: %s",
-            ply_name,
-            " ".join(f"{key}: {value:.4f}" for key, value in metrics.items()),
-        )
-    return aligned_input_gs, aligned_target_gs, {
-        "cache_status": cache["status"],
-        "cache_path": cache["checkpoint_path"],
-        "matching_steps": 0 if cache["status"] == "dataset_precomputed" else matching_cfg["total_steps"],
-        "matching_images_per_step": 0 if cache["status"] == "dataset_precomputed" else matching_cfg["image_per_step"],
+    return {
+        "loss_weights": default_weights,
+        "quat_direct_mse": quat_direct_mse,
     }
+
+
+def compute_all_feature_mse_loss(
+    out_gs,
+    target_gs,
+    loss_weights,
+    post_activate_loss,
+    quat_direct_mse,
+    component_normalizers=None,
+):
+    missing_output = [
+        key for key in SUPPORTED_GS_KEYS if key not in out_gs
+    ]
+    missing_target = [
+        key for key in SUPPORTED_GS_KEYS if key not in target_gs
+    ]
+    if missing_output:
+        raise ValueError(
+            f"FeaturePredictor must output every Gaussian attribute; "
+            f"missing {missing_output}"
+        )
+    if missing_target:
+        raise ValueError(
+            f"All-attribute loss target is missing {missing_target}"
+        )
+
+    losses = {}
+    weighted_losses = {}
+    total_loss = None
+    for key in SUPPORTED_GS_KEYS:
+        pred = out_gs[key]
+        target = target_gs[key].to(
+            device=pred.device, dtype=pred.dtype
+        )
+        if pred.shape != target.shape:
+            raise ValueError(
+                f"Shape mismatch for Gaussian attribute {key!r}: "
+                f"output {tuple(pred.shape)} vs target {tuple(target.shape)}"
+            )
+        normalizer = None
+        if component_normalizers is not None:
+            normalizer = component_normalizers[key].to(
+                device=pred.device, dtype=pred.dtype
+            )
+            if normalizer.shape != pred.shape[1:]:
+                raise ValueError(
+                    f"Normalizer shape mismatch for Gaussian attribute {key!r}: "
+                    f"normalizer {tuple(normalizer.shape)} vs "
+                    f"feature {tuple(pred.shape[1:])}"
+                )
+        loss = feature_loss_value(
+            key,
+            pred,
+            target,
+            post_activate_loss=post_activate_loss,
+            quat_direct_mse=quat_direct_mse,
+            means_loss_reduction=MEANS_LOSS_REDUCTION,
+            component_normalizer=normalizer,
+        )
+        weighted_loss = float(loss_weights[key]) * loss
+        losses[key] = loss
+        weighted_losses[key] = weighted_loss
+        total_loss = (
+            weighted_loss if total_loss is None else total_loss + weighted_loss
+        )
+
+    if not total_loss.requires_grad:
+        raise ValueError(
+            "FeaturePredictor outputs do not receive gradients for the "
+            "all-attribute loss"
+        )
+    return total_loss, losses, weighted_losses
 
 
 def evaluate_single_scene(
@@ -406,8 +360,8 @@ def main(argv):
     device = torch.device("cuda")
 
     # Load one input/target-resolution scene and its high-resolution evaluation views.
-    dataset = build_dataset("test_dataset")
-    scene_idx = find_scene_index(dataset, FLAGS.scene_name)
+    dataset = SplatFactoSRDataset.from_gin_scope("test_dataset")
+    scene_idx = dataset.scene_index(FLAGS.scene_name)
     scene = dataset.load_scene(scene_idx)
     input_resolution_entry = scene["resolution_data"][FLAGS.input_resolution]
     target_resolution_entry = scene["resolution_data"][FLAGS.target_resolution]
@@ -417,7 +371,7 @@ def main(argv):
     target_gs = gpu_utils.move_to_device(target_resolution_entry["gs_params"], device)
     eval_chunk_size = dataset.image_per_scene or len(target_images)
 
-    aligned_input_gs, attribute_target_gs, alignment_info = _build_alignment_pair(
+    aligned_input_gs, attribute_target_gs, alignment_info = prepare_alignment(
         dataset=dataset,
         scene=scene,
         input_resolution_entry=input_resolution_entry,
@@ -429,11 +383,26 @@ def main(argv):
         logger=logger,
         device=device,
         eval_chunk_size=eval_chunk_size,
+        alignment=FLAGS.alignment,
+        attribute_init=FLAGS.attribute_init,
+        emd_eps=FLAGS.emd_eps,
+        emd_iters=FLAGS.emd_iters,
+        input_resolution=FLAGS.input_resolution,
+        target_resolution=FLAGS.target_resolution,
+        matching_cache_root=FLAGS.matching_cache_root,
+        force_matching_fit=FLAGS.force_matching_fit,
+        matching_config=matching_fit(),
+        matching_optimizer_factory=build_matching_optimization,
     )
 
     # Unified training consumes, predicts, and supervises every Gaussian attribute.
-    attribute_keys = list(SUPPORTED_GS_KEYS)
     model = FeaturePredictor().to(device)
+    missing_outputs = sorted(set(SUPPORTED_GS_KEYS) - set(model.output_features))
+    if missing_outputs:
+        raise ValueError(
+            f"FeaturePredictor.output_features must include all Gaussian "
+            f"attributes; missing {missing_outputs}"
+        )
     if model.resume_ckpt is not None:
         model.load_state_dict(torch.load(model.resume_ckpt, map_location="cpu"))
     model.train()
@@ -446,12 +415,12 @@ def main(argv):
         component_normalizers, selected_statistics = load_gs_statistics_normalizers(
             FLAGS.gs_statistics_path,
             FLAGS.target_resolution,
-            attribute_keys,
+            SUPPORTED_GS_KEYS,
             attribute_target_gs,
             alignment=FLAGS.alignment,
             resolutions=dataset.resolutions,
         )
-        effective_loss_weights = {key: 1.0 for key in attribute_keys}
+        effective_loss_weights = {key: 1.0 for key in SUPPORTED_GS_KEYS}
         statistics_message = (
             f"GS statistics resolution={FLAGS.target_resolution}:\n"
             f"{json.dumps(selected_statistics, indent=2)}"
@@ -475,7 +444,7 @@ def main(argv):
         f"original_input_gaussians={input_resolution_entry['gs_params']['means'].shape[0]}\n"
         f"aligned_input_gaussians={aligned_input_gs['means'].shape[0]}\n"
         f"attribute_target_gaussians={attribute_target_gs['means'].shape[0]}\n"
-        f"attribute_keys={','.join(attribute_keys)}\n"
+        f"attribute_keys={','.join(SUPPORTED_GS_KEYS)}\n"
         f"loss_type=attribute_mse_only\n"
         f"post_activate_loss={FLAGS.post_activate_loss}\n"
         f"gs_statistics_path={FLAGS.gs_statistics_path or 'none'}\n"
@@ -513,15 +482,15 @@ def main(argv):
     for step in pbar:
         with torch.cuda.amp.autocast(enabled=enable_amp):
             out_gs = model(batch_normalized_gs=batch_gs, batch_scene_idx=batch_scene_idx)[0]
-            total_loss, feature_losses, weighted_feature_losses = compute_feature_mse_loss(
-                out_gs,
-                loss_target_gs,
-                attribute_keys,
-                post_activate_loss=FLAGS.post_activate_loss,
-                loss_weights=effective_loss_weights,
-                quat_direct_mse=mse_loss_cfg["quat_direct_mse"],
-                component_normalizers=component_normalizers,
-                means_loss_reduction=MEANS_LOSS_REDUCTION,
+            total_loss, feature_losses, weighted_feature_losses = (
+                compute_all_feature_mse_loss(
+                    out_gs=out_gs,
+                    target_gs=loss_target_gs,
+                    loss_weights=effective_loss_weights,
+                    post_activate_loss=FLAGS.post_activate_loss,
+                    quat_direct_mse=mse_loss_cfg["quat_direct_mse"],
+                    component_normalizers=component_normalizers,
+                )
             )
 
         optimizer_stepped = True

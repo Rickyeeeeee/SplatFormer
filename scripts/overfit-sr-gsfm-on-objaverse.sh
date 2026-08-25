@@ -24,14 +24,15 @@ matching_image_per_step=${MATCHING_IMAGE_PER_STEP:-16}
 matching_l1_weight=${MATCHING_L1_LOSS_WEIGHT:-1.0}
 matching_lpips_weight=${MATCHING_LPIPS_LOSS_WEIGHT:-1.0}
 matching_cache_root=${MATCHING_CACHE_ROOT:-/project2/ricky/splatformer-data-to-4x}
-force_matching_fit=${FORCE_MATCHING_FIT:-true}
+force_matching_fit=${FORCE_MATCHING_FIT:-false}
 ptv3_drop_path=${PTV3_DROP_PATH:-0.0}
 ptv3_shuffle_orders=${PTV3_SHUFFLE_ORDERS:-True}
 ptv3_shuffle_orders_eval=${PTV3_SHUFFLE_ORDERS_EVAL:-False}
 ptv3_turn_off_bn=${PTV3_TURN_OFF_BN:-True}
+grid_resolution=${GRID_RESOLUTION:-384}
 
-out_name=${scene_name}_${alignment}_${attribute_init}_ir${input_resolution}_tr${target_resolution}_gsfm_all_${mix_schedule}
-output_root=${OUTPUT_ROOT:-/project2/ricky/experiments/0820/overfit_sr_gsfm_512}
+out_name=${scene_name}_${alignment}_${attribute_init}_ir${input_resolution}_tr${target_resolution}_gsfm_all_${mix_schedule}_grid${grid_resolution}
+output_root=${OUTPUT_ROOT:-/project2/ricky/experiments/0825/overfit_sr_gsfm_512}
 output_dir=${OUTPUT_DIR:-${output_root}/${out_name}}
 
 CUDA_VISIBLE_DEVICES=${GPU_ID} python overfit-sr-gsfm.py \
@@ -54,6 +55,7 @@ CUDA_VISIBLE_DEVICES=${GPU_ID} python overfit-sr-gsfm.py \
     --gin_param="PointTransformerV3FlowModel.shuffle_orders=${ptv3_shuffle_orders}" \
     --gin_param="PointTransformerV3FlowModel.shuffle_orders_eval=${ptv3_shuffle_orders_eval}" \
     --gin_param="PointTransformerV3FlowModel.turn_off_bn=${ptv3_turn_off_bn}" \
+    --gin_param="GSFlowPredictor.grid_resolution=${grid_resolution}" \
     --gin_param="training.total_steps=${total_steps}" \
     --gin_param="train2D/build_scheduler.total_step=${total_steps}" \
     --gin_param="training.save_interval=${save_interval}" \

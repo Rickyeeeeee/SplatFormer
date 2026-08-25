@@ -404,3 +404,34 @@ def write_ply_v2(path, map_to_tensors):
     elements[:] = list(map(tuple, attributes))
     el = PlyElement.describe(elements, 'vertex')
     PlyData([el]).write(path)
+
+
+def clone_gaussians(gs):
+    return {key: value.clone() for key, value in gs.items()}
+
+
+def convert_gaussian_frame(gs, source_scaler, target_scaler):
+    means = gs["means"]
+    source_scale = torch.as_tensor(
+        source_scaler.scale_, device=means.device, dtype=means.dtype
+    )
+    source_translation = torch.as_tensor(
+        source_scaler.trans_, device=means.device, dtype=means.dtype
+    )
+    target_scale = torch.as_tensor(
+        target_scaler.scale_, device=means.device, dtype=means.dtype
+    )
+    target_translation = torch.as_tensor(
+        target_scaler.trans_, device=means.device, dtype=means.dtype
+    )
+
+    raw_means = (means - source_translation) / source_scale
+    converted = {"means": raw_means * target_scale + target_translation}
+    for key, value in gs.items():
+        if key == "means":
+            continue
+        if key == "scales":
+            converted[key] = value - torch.log(source_scale) + torch.log(target_scale)
+        else:
+            converted[key] = value.clone()
+    return converted

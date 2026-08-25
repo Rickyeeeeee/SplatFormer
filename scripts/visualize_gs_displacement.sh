@@ -42,12 +42,12 @@
 #   --input_ply /project2/ricky/experiments/0814-unify-tuned/overfit_sr_mse_512/3e288ee8aced4a0797e66d53536112b1_emd_aligned_if4_tf1_res_pa1/densify_init/03_input_high_res_gs.ply \
 #   --output_ply /project2/ricky/experiments/0814-unify-tuned/overfit_sr_mse_512/3e288ee8aced4a0797e66d53536112b1_emd_aligned_if4_tf1_res_pa1/densify_init/02_gt_high_res_gs.ply
 
-python scripts/visualize_gs_displacement.py \
-  --initial_view_mode gsplat \
-  --input_ply /project2/ricky/experiments/0815-unified/overfit_sr_gsfm_512/3e288ee8aced4a0797e66d53536112b1_fit_hr_to_lr_aligned_if4_tf1_gsfm_all_fm-only/matching_init/00_input_low_res_gs.ply \
-  --output_ply /project2/ricky/experiments/0815-unified/overfit_sr_gsfm_512/3e288ee8aced4a0797e66d53536112b1_fit_hr_to_lr_aligned_if4_tf1_gsfm_all_fm-only/matching_init/01_fitted_target_gs.ply
-
 # python scripts/visualize_gs_displacement.py \
 #   --initial_view_mode gsplat \
-#   --input_ply /project2/ricky/experiments/0820/overfit_sr_gsfm_512/3e288ee8aced4a0797e66d53536112b1_fit_lr_to_hr_aligned_ir128_tr512_gsfm_all_fm-only/matching_init/00_input_low_res_gs.ply \
-#   --output_ply /project2/ricky/experiments/0820/overfit_sr_gsfm_512/3e288ee8aced4a0797e66d53536112b1_fit_lr_to_hr_aligned_ir128_tr512_gsfm_all_fm-only/matching_init/01_fitted_target_gs.ply
+#   --input_ply /project2/ricky/experiments/0815-unified/overfit_sr_gsfm_512/3e288ee8aced4a0797e66d53536112b1_fit_lr_to_hr_aligned_if4_tf1_gsfm_all_fm-only/matching_init/00_input_low_res_gs.ply \
+#   --output_ply /project2/ricky/experiments/0815-unified/overfit_sr_gsfm_512/3e288ee8aced4a0797e66d53536112b1_fit_lr_to_hr_aligned_if4_tf1_gsfm_all_fm-only/matching_init/01_fitted_target_gs.ply
+
+python scripts/visualize_gs_displacement.py \
+  --initial_view_mode gsplat \
+  --input_ply /project2/ricky/experiments/0820/overfit_sr_gsfm_512/3e288ee8aced4a0797e66d53536112b1_fit_lr_to_hr_aligned_ir128_tr512_gsfm_all_fm-only/matching_init/00_input_low_res_gs.ply \
+  --output_ply /project2/ricky/experiments/0820/overfit_sr_gsfm_512/3e288ee8aced4a0797e66d53536112b1_fit_lr_to_hr_aligned_ir128_tr512_gsfm_all_fm-only/matching_init/01_fitted_target_gs.ply
