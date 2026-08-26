@@ -1,6 +1,6 @@
-dataset_root = '/project/ricky/splatformer-sr-data-new'
-train_scene_list = '/project/ricky/splatformer-sr-data-new/psnr_filtered_scenes.csv'
-test_scene_list = '/project/ricky/splatformer-sr-data-new/test_valid_scenes.csv'
+dataset_root = '/project/ricky/splatformer-sr-data'
+train_scene_list = '/project/ricky/splatformer-sr-data/psnr_filtered_scenes.csv'
+test_scene_list = '/project/ricky/splatformer-sr-data/test_valid_scenes.csv'
 
 SplatFactoSRDataset.dataset_root = %dataset_root
 SplatFactoSRDataset.dataset_name = 'objaverse'
@@ -14,7 +14,7 @@ SplatFactoSRDataset.background_color = [0, 0, 0]
 
 train_dataset/SplatFactoSRDataset.train_or_test = 'train'
 train_dataset/SplatFactoSRDataset.scene_list = %train_scene_list
-train_dataset/SplatFactoSRDataset.image_per_scene = 16
+train_dataset/SplatFactoSRDataset.image_per_scene = 8
 train_dataset/SplatFactoSRDataset.split_across_gpus = True
 
 test_dataset/SplatFactoSRDataset.train_or_test = 'test'

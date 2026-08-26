@@ -16,33 +16,27 @@ try:
 except ImportError:
     wandb = None
 
-from dataset.GS_multi import SplatFactoMultiLevelDataset
+from dataset.GS_SR import SplatFactoSRDataset
 from models.feature_predictor import FeaturePredictor
 from utils import gpu_utils, gs_utils, loss_utils
 from utils.gpu_utils import seed_everything
 from utils.log_utils import ProcessSafeLogger
 from utils.metrics import MetricComputer, psnr
 from utils.optimizers import build_optimizer, build_scheduler
-from utils.sr_densify_utils import convert_gs_to_target_frame
 
 
 flags.DEFINE_string("output_dir", "output_sr", "Output directory")
 flags.DEFINE_string("eval_subdir", "eval_final", "Eval subdirectory")
 flags.DEFINE_boolean("only_eval", False, "Only run evaluation")
 flags.DEFINE_boolean("compare_with_input", True, "Compare predictions with input 3DGS")
-flags.DEFINE_boolean("save_viewer", False, "Save viewer point clouds")
+flags.DEFINE_boolean("save_viewer", True, "Save viewer point clouds")
 flags.DEFINE_boolean("save_residuals", False, "Save residual tensors and stats")
 flags.DEFINE_boolean("use_wandb", True, "Log training and evaluation metrics to Weights & Biases")
 flags.DEFINE_string("wandb_project", "3dgs-super-resolution", "Weights & Biases project")
 flags.DEFINE_string("wandb_dir", None, "Weights & Biases output directory")
 flags.DEFINE_string("wandb_name", None, "Weights & Biases run name")
-flags.DEFINE_integer("input_factor", 4, "Low-resolution GS factor used as model input")
-flags.DEFINE_integer("target_factor", 1, "High-resolution GS/image factor used as training target")
-flags.DEFINE_integer(
-    "min_train_splats_per_factor",
-    10000,
-    "Deprecated no-op kept for launcher compatibility; filtering is dataset-owned.",
-)
+flags.DEFINE_integer("input_resolution", 128, "Low-resolution GS/image resolution used as model input")
+flags.DEFINE_integer("target_resolution", 512, "High-resolution GS/image resolution used as training target")
 flags.DEFINE_multi_string("gin_file", None, "List of paths to the config files.")
 flags.DEFINE_multi_string("gin_param", "", "Newline separated list of Gin parameter bindings.")
 
@@ -56,7 +50,7 @@ def set_seed(seed, rank=0):
     seed_everything(seed + rank)
 
 
-def _reduce_mean(value):
+def reduce_mean(value):
     reduced = value.detach().clone()
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(reduced, op=dist.ReduceOp.SUM)
@@ -97,19 +91,19 @@ def training(
     }
 
 
-def _to_cpu(data):
+def to_cpu(data):
     if torch.is_tensor(data):
         return data.detach().cpu()
     if isinstance(data, dict):
-        return {key: _to_cpu(value) for key, value in data.items()}
+        return {key: to_cpu(value) for key, value in data.items()}
     if isinstance(data, list):
-        return [_to_cpu(value) for value in data]
+        return [to_cpu(value) for value in data]
     if isinstance(data, tuple):
-        return tuple(_to_cpu(value) for value in data)
+        return tuple(to_cpu(value) for value in data)
     return data
 
 
-def _init_wandb(output_dir):
+def init_wandb(output_dir):
     rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
     if not FLAGS.use_wandb or rank != 0:
         return None
@@ -129,55 +123,62 @@ def _init_wandb(output_dir):
             "compare_with_input": FLAGS.compare_with_input,
             "save_viewer": FLAGS.save_viewer,
             "save_residuals": FLAGS.save_residuals,
-            "input_factor": FLAGS.input_factor,
-            "target_factor": FLAGS.target_factor,
-            "min_train_splats_per_factor": FLAGS.min_train_splats_per_factor,
+            "input_resolution": FLAGS.input_resolution,
+            "target_resolution": FLAGS.target_resolution,
             "gin_config": gin.operative_config_str(),
         },
     )
 
-def _build_dataset(scope):
-    with gin.config_scope(scope):
-        dataset = SplatFactoMultiLevelDataset()
-    required_factors = {FLAGS.input_factor, FLAGS.target_factor}
-    missing = sorted(required_factors - set(dataset.factors))
+def build_dataset(scope):
+    dataset = SplatFactoSRDataset.from_gin_scope(scope)
+    required_resolutions = {FLAGS.input_resolution, FLAGS.target_resolution}
+    missing = sorted(required_resolutions - set(dataset.resolutions))
     if missing:
         raise ValueError(
-            f"{scope} dataset factors {sorted(dataset.factors)} do not include required factors {missing}"
+            f"{scope} dataset resolutions {sorted(dataset.resolutions)} do not include required resolutions {missing}"
+        )
+    configured_pair = (
+        dataset.fit_source_resolution, dataset.fit_target_resolution
+    )
+    requested_pair = (FLAGS.input_resolution, FLAGS.target_resolution)
+    if configured_pair != requested_pair:
+        raise ValueError(
+            f"{scope} dataset fitted pair {configured_pair[0]}->{configured_pair[1]} "
+            f"does not match requested pair {requested_pair[0]}->{requested_pair[1]}"
         )
     return dataset
 
 
-def _normalize_skipped_scene(split, skipped_scene):
-    skip_reason = skipped_scene.get("skip_reason", skipped_scene.get("reason"))
-    exception_reason = skipped_scene.get("exception_reason")
+def normalize_filtered_scene(split, filtered_scene):
+    reason = filtered_scene.get("reason")
+    exception_reason = filtered_scene.get("exception_reason")
     return {
         "split": split,
-        "scene_idx": skipped_scene.get("scene_idx"),
-        "scene_name": skipped_scene.get("scene_name"),
-        "skip_reason": skip_reason,
+        "scene_idx": filtered_scene.get("scene_idx"),
+        "scene_name": filtered_scene.get("scene_name"),
+        "reason": reason,
         "exception_reason": exception_reason,
-        "exception_type": skipped_scene.get("exception_type"),
-        "nerfstudio_dir": skipped_scene.get("nerfstudio_dir"),
-        "colmap_dir": skipped_scene.get("colmap_dir"),
+        "exception_type": filtered_scene.get("exception_type"),
+        "gsplat_dir": filtered_scene.get("gsplat_dir"),
+        "colmap_dir": filtered_scene.get("colmap_dir"),
     }
 
 
-def _write_skipped_scenes(output_dir, datasets_by_split, extra_skipped_scenes=None):
-    skipped_scenes = []
+def write_filtered_scenes(output_dir, datasets_by_split, extra_filtered_scenes=None):
+    filtered_scenes = []
     for split, dataset in datasets_by_split.items():
-        for skipped_scene in getattr(dataset, "skipped_scenes", []):
-            skipped_scenes.append(_normalize_skipped_scene(split, skipped_scene))
+        for filtered_scene in getattr(dataset, "filtered_scenes", []):
+            filtered_scenes.append(normalize_filtered_scene(split, filtered_scene))
 
-    if extra_skipped_scenes is not None:
-        skipped_scenes.extend(extra_skipped_scenes)
+    if extra_filtered_scenes is not None:
+        filtered_scenes.extend(extra_filtered_scenes)
 
-    with open(os.path.join(output_dir, "skipped_scenes.json"), "w") as f:
-        json.dump(skipped_scenes, f, indent=2)
-    return skipped_scenes
+    with open(os.path.join(output_dir, "filtered_scenes.json"), "w") as f:
+        json.dump(filtered_scenes, f, indent=2)
+    return filtered_scenes
 
 
-def _compute_render_loss(pred_imgs, batch_images, lpips_loss_func, image_l1_loss_weight, lpips_loss_weight):
+def compute_render_loss(pred_imgs, batch_images, lpips_loss_func, image_l1_loss_weight, lpips_loss_weight):
     image_l1 = 0
     lpips_loss = 0
     train_psnr = 0
@@ -201,7 +202,7 @@ def _compute_render_loss(pred_imgs, batch_images, lpips_loss_func, image_l1_loss
     return total_loss, image_l1, lpips_loss, train_psnr
 
 
-def _image_png_name(image_names, image_id):
+def image_png_name(image_names, image_id):
     if image_id < len(image_names):
         image_name = os.path.basename(str(image_names[image_id]))
         stem, ext = os.path.splitext(image_name)
@@ -212,7 +213,7 @@ def _image_png_name(image_names, image_id):
     return f"{image_id:04d}.png"
 
 
-def _append_image_metric_records(records, metric_computer, previous_counts, start, image_names):
+def append_image_metric_records(records, metric_computer, previous_counts, start, image_names):
     metric_values = {}
     for metric, values in metric_computer.results.items():
         new_values = values[previous_counts[metric]:]
@@ -224,7 +225,7 @@ def _append_image_metric_records(records, metric_computer, previous_counts, star
         records.append(
             {
                 "image_id": image_id,
-                "image_name": _image_png_name(image_names, image_id),
+                "image_name": image_png_name(image_names, image_id),
                 "psnr": float(metric_values["psnr"][offset]),
                 "ssim": float(metric_values["ssim"][offset]),
                 "lpips": float(metric_values["lpips"][offset]),
@@ -336,7 +337,7 @@ def evaluate_single_scene(
                 metric: len(values) for metric, values in metric_computer.results.items()
             }
             metric_computer.update(pred_imgs, gt_imgs, name=chunk_name)
-            _append_image_metric_records(image_metrics, metric_computer, metric_counts, start, image_names)
+            append_image_metric_records(image_metrics, metric_computer, metric_counts, start, image_names)
 
             if evaluate_baselines:
                 input_imgs, _ = gs_utils.rasterize_gaussians_to_multiimgs(input_gs_device, chunk_cameras)
@@ -357,7 +358,7 @@ def evaluate_single_scene(
                     metric: len(values) for metric, values in metric_computer_input.results.items()
                 }
                 metric_computer_input.update(input_imgs, gt_imgs, name=chunk_name)
-                _append_image_metric_records(
+                append_image_metric_records(
                     image_metrics_input, metric_computer_input, input_counts, start, image_names
                 )
                 low_res_counts = {
@@ -365,7 +366,7 @@ def evaluate_single_scene(
                     for metric, values in metric_computer_gt_low_res.results.items()
                 }
                 metric_computer_gt_low_res.update(low_res_imgs, gt_imgs, name=chunk_name)
-                _append_image_metric_records(
+                append_image_metric_records(
                     image_metrics_gt_low_res, metric_computer_gt_low_res,
                     low_res_counts, start, image_names
                 )
@@ -374,7 +375,7 @@ def evaluate_single_scene(
                     for metric, values in metric_computer_gt_high_res.results.items()
                 }
                 metric_computer_gt_high_res.update(gt_high_res_imgs, gt_imgs, name=chunk_name)
-                _append_image_metric_records(
+                append_image_metric_records(
                     image_metrics_gt_high_res, metric_computer_gt_high_res,
                     high_res_counts, start, image_names
                 )
@@ -382,7 +383,7 @@ def evaluate_single_scene(
             for global_idx, pred_img in enumerate(pred_imgs, start=start):
                 pred_img = pred_img.cpu().numpy().astype(np.uint8)
                 cv2.imwrite(
-                    os.path.join(pred_single_dir, _image_png_name(image_names, global_idx)),
+                    os.path.join(pred_single_dir, image_png_name(image_names, global_idx)),
                     pred_img[:, :, ::-1],
                 )
 
@@ -397,7 +398,7 @@ def evaluate_single_scene(
                     if len(compare_preview) < 9:
                         compare_preview.append(cmp_img)
                     cv2.imwrite(
-                        os.path.join(compare_dir, _image_png_name(image_names, global_idx)),
+                        os.path.join(compare_dir, image_png_name(image_names, global_idx)),
                         cmp_img[:, :, ::-1],
                     )
 
@@ -473,10 +474,10 @@ def evaluate_single_scene(
                 "scene_name": scene_name,
                 "residual_type": residual_type,
                 "residual_keys": residual_keys,
-                "residuals": _to_cpu(residuals),
-                "input_gs": _to_cpu(input_gs_device),
-                "output_gs": _to_cpu(out_gs),
-                "cameras": _to_cpu(eval_cameras),
+                "residuals": to_cpu(residuals),
+                "input_gs": to_cpu(input_gs_device),
+                "output_gs": to_cpu(out_gs),
+                "cameras": to_cpu(eval_cameras),
             }
             torch.save(pt_payload, os.path.join(residual_dir, f"{scene_stem}.pt"))
 
@@ -532,7 +533,7 @@ def evaluate_dataset(
     all_metrics_gt_low_res = []
     all_metrics_gt_high_res = []
     scene_average_metrics = []
-    eval_skipped_scenes = []
+    eval_filtered_scenes = []
     logger_name = "eval.log" if rank == 0 else f"eval.rank{rank}.log"
     logger = ProcessSafeLogger(os.path.join(output_dir, logger_name)).get_logger()
 
@@ -542,20 +543,20 @@ def evaluate_dataset(
         scene_name = scene_info["scene_name"]
         try:
             scene = dataset.load_scene(scene_idx)
-            input_factor_entry = scene["factor_data"][FLAGS.input_factor]
-            target_factor_entry = scene["factor_data"][FLAGS.target_factor]
-            eval_images, image_names, eval_cameras = dataset.load_factor_views(target_factor_entry)
-            input_gs = convert_gs_to_target_frame(
-                input_factor_entry["gs_params"],
-                input_factor_entry["scaler"],
-                target_factor_entry["scaler"],
+            input_resolution_entry = scene["resolution_data"][FLAGS.input_resolution]
+            target_resolution_entry = scene["resolution_data"][FLAGS.target_resolution]
+            eval_images, image_names, eval_cameras = dataset.load_resolution_views(target_resolution_entry)
+            input_gs = gs_utils.convert_gaussian_frame(
+                input_resolution_entry["gs_params"],
+                input_resolution_entry["scaler"],
+                target_resolution_entry["scaler"],
             )
 
             scene_output_dir = os.path.join(output_dir, scene["scene_name"])
             metrics, metrics_input, metrics_gt_low_res, metrics_gt_high_res = evaluate_single_scene(
                 model=model,
                 input_gs=input_gs,
-                gt_gs=target_factor_entry["gs_params"],
+                gt_gs=target_resolution_entry["gs_params"],
                 low_res_gt_gs=input_gs,
                 evaluate_baselines=evaluate_baselines,
                 scene_idx=scene["idx"],
@@ -573,22 +574,24 @@ def evaluate_dataset(
             )
         except Exception as exc:
             model.train()
-            skipped_scene = _normalize_skipped_scene(
+            filtered_scene = normalize_filtered_scene(
                 "test",
                 {
                     "scene_idx": scene_idx,
                     "scene_name": scene_name,
-                    "skip_reason": "eval_exception",
+                    "reason": "eval_exception",
                     "exception_reason": str(exc),
                     "exception_type": type(exc).__name__,
-                    "nerfstudio_dir": scene_info.get("factor_paths", {})
-                    .get(FLAGS.target_factor, {})
-                    .get("nerfstudio_dir"),
-                    "colmap_dir": scene_info.get("colmap_dir"),
+                    "gsplat_dir": scene_info.get("resolution_paths", {})
+                    .get(FLAGS.target_resolution, {})
+                    .get("gsplat_dir"),
+                    "colmap_dir": scene_info.get("resolution_paths", {})
+                    .get(FLAGS.target_resolution, {})
+                    .get("colmap_dir"),
                 },
             )
-            eval_skipped_scenes.append(skipped_scene)
-            logger.exception(f"Skipping eval scene {scene_name} after exception")
+            eval_filtered_scenes.append(filtered_scene)
+            logger.exception(f"Filtering eval scene {scene_name} after exception")
             continue
 
         all_metrics.append(metrics)
@@ -629,15 +632,15 @@ def evaluate_dataset(
             gathered,
             {
                 "scene_metrics": scene_average_metrics,
-                "skipped_scenes": eval_skipped_scenes,
+                "filtered_scenes": eval_filtered_scenes,
             },
         )
         scene_average_metrics = sorted(
             [item for payload in gathered for item in payload["scene_metrics"]],
             key=lambda item: item["scene_idx"],
         )
-        eval_skipped_scenes = [
-            item for payload in gathered for item in payload["skipped_scenes"]
+        eval_filtered_scenes = [
+            item for payload in gathered for item in payload["filtered_scenes"]
         ]
 
     all_metrics = [item["output_gs"] for item in scene_average_metrics]
@@ -675,7 +678,7 @@ def evaluate_dataset(
             ))
 
     if rank == 0:
-        _write_skipped_scenes(output_dir, {"test": dataset}, eval_skipped_scenes)
+        write_filtered_scenes(output_dir, {"test": dataset}, eval_filtered_scenes)
         with open(os.path.join(output_dir, "scene_average_metrics.json"), "w") as f:
             json.dump(scene_average_metrics, f, indent=2)
 
@@ -718,18 +721,18 @@ def main(argv):
         if rank == 0
         else None
     )
-    wandb_run = _init_wandb(FLAGS.output_dir)
+    wandb_run = init_wandb(FLAGS.output_dir)
 
-    train_dataset = _build_dataset("train_dataset")
-    test_dataset = _build_dataset("test_dataset")
-    skipped_scenes = []
+    train_dataset = build_dataset("train_dataset")
+    test_dataset = build_dataset("test_dataset")
+    filtered_scenes = []
     if rank == 0:
-        skipped_scenes = _write_skipped_scenes(
+        filtered_scenes = write_filtered_scenes(
             FLAGS.output_dir,
             {"train": train_dataset, "test": test_dataset},
         )
-    if skipped_scenes and rank == 0:
-        logger.info(f"Saved {len(skipped_scenes)} skipped scenes to skipped_scenes.json")
+    if filtered_scenes and rank == 0:
+        logger.info(f"Saved {len(filtered_scenes)} filtered scenes to filtered_scenes.json")
 
     model = FeaturePredictor()
     model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
@@ -761,7 +764,7 @@ def main(argv):
             f.writelines(gin.operative_config_str())
 
     training_brief = (
-        f"Train SR input_factor={FLAGS.input_factor} target_factor={FLAGS.target_factor}\n"
+        f"Train SR input_resolution={FLAGS.input_resolution} target_resolution={FLAGS.target_resolution}\n"
         f"train_scenes={len(train_dataset.folders)} test_scenes={len(test_dataset.folders)}\n"
         f"world_size={world_size}\n"
         f"model_input_features={','.join(model_module.input_features)}\n"
@@ -807,23 +810,23 @@ def main(argv):
             except StopIteration:
                 train_iter = iter(train_dataset)
                 batch = next(train_iter)
-            input_factor_entry = batch["multilevel"][FLAGS.input_factor]
-            target_factor_entry = batch["multilevel"][FLAGS.target_factor]
+            input_resolution_entry = batch["multiresolution"][FLAGS.input_resolution]
+            target_resolution_entry = batch["multiresolution"][FLAGS.target_resolution]
 
-            input_gs = gpu_utils.move_to_device(input_factor_entry["gs_params"], device)
-            input_gs = convert_gs_to_target_frame(
+            input_gs = gpu_utils.move_to_device(input_resolution_entry["gs_params"], device)
+            input_gs = gs_utils.convert_gaussian_frame(
                 input_gs,
-                input_factor_entry["scaler"],
-                target_factor_entry["scaler"],
+                input_resolution_entry["scaler"],
+                target_resolution_entry["scaler"],
             )
             batch_scene_idx = [batch["scene_idx"]]
-            batch_cameras = gpu_utils.move_to_device(target_factor_entry["cameras"], device)
-            batch_images = gpu_utils.move_to_device(target_factor_entry["images"], device)
+            batch_cameras = gpu_utils.move_to_device(target_resolution_entry["cameras"], device)
+            batch_images = gpu_utils.move_to_device(target_resolution_entry["images"], device)
 
             with torch.cuda.amp.autocast(enabled=enable_amp):
                 out_gs = model(batch_normalized_gs=[input_gs], batch_scene_idx=batch_scene_idx)[0]
                 pred_imgs, _ = gs_utils.rasterize_gaussians_to_multiimgs(out_gs, batch_cameras)
-                total_loss, image_l1, lpips_loss, train_psnr = _compute_render_loss(
+                total_loss, image_l1, lpips_loss, train_psnr = compute_render_loss(
                     pred_imgs,
                     batch_images,
                     lpips_loss_func,
@@ -866,17 +869,17 @@ def main(argv):
             if step % log_interval == 0:
                 lpips_tensor = lpips_loss if torch.is_tensor(lpips_loss) else total_loss.new_tensor(0.0)
                 reduced_values = {
-                    "total_loss": _reduce_mean(total_loss),
-                    "image_l1": _reduce_mean(image_l1),
-                    "lpips": _reduce_mean(lpips_tensor),
-                    "psnr": _reduce_mean(train_psnr),
-                    "input_gaussians": _reduce_mean(
-                        total_loss.new_tensor(input_factor_entry["gs_params"]["means"].shape[0])
+                    "total_loss": reduce_mean(total_loss),
+                    "image_l1": reduce_mean(image_l1),
+                    "lpips": reduce_mean(lpips_tensor),
+                    "psnr": reduce_mean(train_psnr),
+                    "input_gaussians": reduce_mean(
+                        total_loss.new_tensor(input_resolution_entry["gs_params"]["means"].shape[0])
                     ),
-                    "target_gaussians": _reduce_mean(
-                        total_loss.new_tensor(target_factor_entry["gs_params"]["means"].shape[0])
+                    "target_gaussians": reduce_mean(
+                        total_loss.new_tensor(target_resolution_entry["gs_params"]["means"].shape[0])
                     ),
-                    "views": _reduce_mean(total_loss.new_tensor(len(batch_images))),
+                    "views": reduce_mean(total_loss.new_tensor(len(batch_images))),
                 }
                 if rank == 0:
                     train_log = {

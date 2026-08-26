@@ -1,22 +1,20 @@
 #!/bin/bash
 set -euo pipefail
 
-NGPUS=${NGPUS:-8}
+NGPUS=${NGPUS:-1}
 GPU_IDS=${GPU_IDS:-}
 MASTER_PORT=${MASTER_PORT:-29518}
-total_steps=${1:-20000}
-save_interval=${2:-1000}
-eval_interval=${3:-1000}
-log_image_interval=${4:-1000}
-input_factor=${5:-${INPUT_FACTOR:-4}}
-target_factor=${6:-${TARGET_FACTOR:-2}}
-OUTPUT_DIR=${OUTPUT_DIR:-/project/ricky/outputs/objaverse_splatformer_sr_${input_factor}to${target_factor}_no20k_anchor}
-MIN_TRAIN_SPLATS=${MIN_TRAIN_SPLATS:-20000}
+TOTAL_STEPS=${1:-20000}
+SAVE_INTERVAL=${2:-1000}
+EVAL_INTERVAL=${3:-1000}
+LOG_IMAGE_INTERVAL=${4:-1000}
+INPUT_RESOLUTION=${5:-${INPUT_RESOLUTION:-128}}
+TARGET_RESOLUTION=${6:-${TARGET_RESOLUTION:-512}}
+OUTPUT_DIR=${OUTPUT_DIR:-/project2/ricky/outputs/objaverse_splatformer_sr_${INPUT_RESOLUTION}to${TARGET_RESOLUTION}}
 
-TRAIN_NS_ROOT=${TRAIN_NS_ROOT:-/project2/ricky/splatformer-data/train-set-512/objaverse/nerfstudio}
-TRAIN_COLMAP_ROOT=${TRAIN_COLMAP_ROOT:-/project2/ricky/splatformer-data/train-set-512/objaverse/colmap}
-TEST_NS_ROOT=${TEST_NS_ROOT:-/project/ricky/splatformer-data/test-set-512/objaverse/nerfstudio}
-TEST_COLMAP_ROOT=${TEST_COLMAP_ROOT:-/project/ricky/splatformer-data/test-set-512/objaverse/colmap}
+DATASET_ROOT=${DATASET_ROOT:-/project/ricky/splatformer-sr-data}
+TRAIN_SCENE_LIST=${TRAIN_SCENE_LIST:-${DATASET_ROOT}/psnr_filtered_scenes.csv}
+TEST_SCENE_LIST=${TEST_SCENE_LIST:-${DATASET_ROOT}/test_valid_scenes.csv}
 
 if [[ -n "${GPU_IDS}" ]]; then
     export CUDA_VISIBLE_DEVICES="${GPU_IDS}"
@@ -25,18 +23,18 @@ fi
 torchrun --nnodes=1 --nproc_per_node="${NGPUS}" --rdzv-endpoint="localhost:${MASTER_PORT}" \
     train-sr.py \
     --output_dir="${OUTPUT_DIR}" \
-    --min_train_splats_per_factor="${MIN_TRAIN_SPLATS}" \
-    --input_factor="${input_factor}" \
-    --target_factor="${target_factor}" \
+    --input_resolution="${INPUT_RESOLUTION}" \
+    --target_resolution="${TARGET_RESOLUTION}" \
     --gin_file=configs/model/ptv3.gin \
+    --gin_file=configs/dataset/objaverse-sr.gin \
     --gin_file=configs/train/sr.gin \
-    --gin_param="training.total_steps=${total_steps}" \
-    --gin_param="training.save_interval=${save_interval}" \
-    --gin_param="training.eval_interval=${eval_interval}" \
-    --gin_param="training.log_image_interval=${log_image_interval}" \
-    --gin_param="train_dataset/SplatFactoMultiLevelDataset.nerfstudio_folder='${TRAIN_NS_ROOT}'" \
-    --gin_param="train_dataset/SplatFactoMultiLevelDataset.colmap_folder='${TRAIN_COLMAP_ROOT}'" \
-    --gin_param="test_dataset/SplatFactoMultiLevelDataset.nerfstudio_folder='${TEST_NS_ROOT}'" \
-    --gin_param="test_dataset/SplatFactoMultiLevelDataset.colmap_folder='${TEST_COLMAP_ROOT}'" \
-    --gin_param="train_dataset/SplatFactoMultiLevelDataset.factors=[${target_factor}, ${input_factor}]" \
-    --gin_param="test_dataset/SplatFactoMultiLevelDataset.factors=[${target_factor}, ${input_factor}]"
+    --gin_param="dataset_root=\"${DATASET_ROOT}\"" \
+    --gin_param="train_scene_list=\"${TRAIN_SCENE_LIST}\"" \
+    --gin_param="test_scene_list=\"${TEST_SCENE_LIST}\"" \
+    --gin_param="SplatFactoSRDataset.resolutions=[${INPUT_RESOLUTION}, ${TARGET_RESOLUTION}]" \
+    --gin_param="SplatFactoSRDataset.fit_source_resolution=${INPUT_RESOLUTION}" \
+    --gin_param="SplatFactoSRDataset.fit_target_resolution=${TARGET_RESOLUTION}" \
+    --gin_param="total_steps=${TOTAL_STEPS}" \
+    --gin_param="training.save_interval=${SAVE_INTERVAL}" \
+    --gin_param="training.eval_interval=${EVAL_INTERVAL}" \
+    --gin_param="training.log_image_interval=${LOG_IMAGE_INTERVAL}"

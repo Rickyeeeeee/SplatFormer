@@ -323,3 +323,91 @@ def test_prepare_alignment_fit_hr_to_lr_uses_reverse_fit(monkeypatch):
         "matching_steps": 10,
         "matching_images_per_step": 1,
     }
+
+
+def test_prepare_alignment_can_skip_densification_artifacts(monkeypatch):
+    kwargs = prepare_kwargs()
+    base = {
+        key: value.clone()
+        for key, value in kwargs["input_resolution_entry"]["gs_params"].items()
+    }
+    calls = []
+
+    def build_densified_input(**arguments):
+        calls.append(arguments)
+        return {key: value.clone() for key, value in base.items()}
+
+    monkeypatch.setattr(
+        alignment.densification,
+        "build_densified_input",
+        build_densified_input,
+    )
+    monkeypatch.setattr(
+        alignment.densification,
+        "save_densification_stages",
+        lambda **arguments: pytest.fail("artifacts should be disabled"),
+    )
+    monkeypatch.setattr(
+        alignment,
+        "write_densify_stage_render_metrics",
+        lambda **arguments: pytest.fail("metrics should be disabled"),
+    )
+
+    source, target, info = alignment.prepare_alignment(
+        alignment="emd", write_artifacts=False, **kwargs
+    )
+
+    assert calls[0]["return_stages"] is False
+    assert target is kwargs["target_gs"]
+    assert info == {"cache_status": "not_applicable"}
+    torch.testing.assert_close(source["means"], base["means"])
+
+
+def test_prepare_alignment_uses_supplied_reverse_fit_views(monkeypatch):
+    kwargs = prepare_kwargs()
+    supplied_images = [torch.ones((2, 2, 3))]
+    supplied_cameras = {"camera_to_worlds": torch.ones((1, 3, 4))}
+    high_res_in_low_frame = {
+        key: value + 2.0 for key, value in kwargs["target_gs"].items()
+    }
+    fitted = {
+        key: value + 1.0 for key, value in high_res_in_low_frame.items()
+    }
+    matching_calls = []
+
+    monkeypatch.setattr(
+        kwargs["dataset"],
+        "load_resolution_views",
+        lambda entry: pytest.fail("dataset views should not be reloaded"),
+    )
+    monkeypatch.setattr(
+        alignment.matching,
+        "build_matching_source",
+        lambda *args: high_res_in_low_frame,
+    )
+
+    def get_or_fit_matching_target(**arguments):
+        matching_calls.append(arguments)
+        return fitted, {
+            "status": "hit",
+            "checkpoint_path": "/cache/matching_target.pt",
+        }
+
+    monkeypatch.setattr(
+        alignment.matching,
+        "get_or_fit_matching_target",
+        get_or_fit_matching_target,
+    )
+
+    _, target, info = alignment.prepare_alignment(
+        alignment="fit_hr_to_lr",
+        input_images=supplied_images,
+        input_cameras=supplied_cameras,
+        write_artifacts=False,
+        **kwargs,
+    )
+
+    assert matching_calls[0]["target_images"] is supplied_images
+    assert matching_calls[0]["target_cameras"] is supplied_cameras
+    assert target is kwargs["target_gs"]
+    assert info["cache_status"] == "hit"

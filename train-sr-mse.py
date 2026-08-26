@@ -14,42 +14,36 @@ try:
 except ImportError:
     wandb = None
 
-from dataset.GS_multi import SplatFactoMultiLevelDataset
+from dataset.GS_SR import SplatFactoSRDataset
 from models.feature_predictor import FeaturePredictor
+from sr.alignment import prepare_alignment
 from utils import gpu_utils, gs_utils
 from utils.gpu_utils import seed_everything
-from utils.gs_utils import copy_gt_attributes, scale_means_origin, unscale_means_origin
+from utils.gs_utils import scale_means_origin, unscale_means_origin
 from utils.log_utils import ProcessSafeLogger
-from utils.loss_utils import (
-    SUPPORTED_GS_KEYS,
-    feature_mse_loss as compute_feature_mse_loss,
-    fixed_attribute_keys as select_fixed_attribute_keys,
-    parse_loss_features,
-)
+from utils.loss_utils import SUPPORTED_GS_KEYS, feature_loss_value
 from utils.metrics import MetricComputer
-from utils.optimizers import build_optimizer, build_scheduler
-from utils.sr_densify_utils import build_densified_input_gs
+from utils.optimizers import build_3DGSoptimizer, build_optimizer, build_scheduler
 
 
 flags.DEFINE_string("output_dir", "output_sr_mse", "Output directory")
 flags.DEFINE_string("eval_subdir", "eval_final", "Eval subdirectory")
 flags.DEFINE_boolean("only_eval", False, "Only run evaluation")
 flags.DEFINE_boolean("compare_with_input", True, "Compare predictions with input 3DGS")
-flags.DEFINE_boolean("save_viewer", False, "Save viewer point clouds")
+flags.DEFINE_boolean("save_viewer", True, "Save viewer point clouds")
 flags.DEFINE_boolean("save_residuals", False, "Save residual tensors and stats")
 flags.DEFINE_boolean("use_wandb", True, "Log training and evaluation metrics to Weights & Biases")
 flags.DEFINE_string("wandb_project", "3dgs-super-resolution", "Weights & Biases project")
 flags.DEFINE_string("wandb_dir", None, "Weights & Biases output directory")
 flags.DEFINE_string("wandb_name", None, "Weights & Biases run name")
-flags.DEFINE_integer(
-    "min_train_splats_per_factor",
-    0,
-    "Accepted for launcher compatibility; ignored by train-sr-mse.py. "
-    "Use SplatFactoMultiLevelDataset configuration for dataset filtering.",
+flags.DEFINE_integer("input_resolution", 128, "Low-resolution GS/image resolution used as alignment source")
+flags.DEFINE_integer("target_resolution", 512, "High-resolution GS/image resolution used as training target")
+flags.DEFINE_enum(
+    "alignment",
+    "emd",
+    ["emd", "random", "fit_lr_to_hr", "fit_hr_to_lr"],
+    "Input/target Gaussian alignment method",
 )
-flags.DEFINE_integer("input_factor", 4, "Low-resolution GS factor used as densification source")
-flags.DEFINE_integer("target_factor", 2, "High-resolution GS/image factor used as training target")
-flags.DEFINE_enum("alignment", "emd", ["emd", "nearest", "none"], "Interpolated-to-target alignment method")
 flags.DEFINE_enum(
     "attribute_init",
     "aligned",
@@ -59,10 +53,9 @@ flags.DEFINE_enum(
 flags.DEFINE_float("emd_eps", 0.01, "Auction EMD epsilon")
 flags.DEFINE_integer("emd_iters", 100, "Auction EMD iterations")
 flags.DEFINE_string(
-    "loss_features",
-    "",
-    "Comma-separated Gaussian attributes to include in point-wise MSE loss. "
-    "Defaults to FeaturePredictor.output_features.",
+    "matching_cache_root",
+    "/project2/ricky/splatformer-data-to-4x",
+    "Persistent cache for reverse fitted alignment",
 )
 flags.DEFINE_boolean(
     "post_activate_loss",
@@ -123,6 +116,38 @@ def training(
 
 
 @gin.configurable
+def matching_fit(
+    total_steps=1000,
+    image_per_step=16,
+    log_interval=20,
+    preview_interval=200,
+    grad_clip_norm=0.0,
+    image_l1_loss_weight=1.0,
+    lpips_loss_weight=1.0,
+    enable_amp=True,
+    empty_cache_fre=-1,
+):
+    return {
+        "total_steps": total_steps,
+        "image_per_step": image_per_step,
+        "log_interval": log_interval,
+        "preview_interval": preview_interval,
+        "grad_clip_norm": grad_clip_norm,
+        "image_l1_loss_weight": image_l1_loss_weight,
+        "lpips_loss_weight": lpips_loss_weight,
+        "enable_amp": enable_amp,
+        "empty_cache_fre": empty_cache_fre,
+    }
+
+
+def build_matching_optimization(gaussians):
+    with gin.config_scope("matching_fit"):
+        optimizer = build_3DGSoptimizer(gaussians)
+        scheduler = build_scheduler(optimizer)
+    return optimizer, scheduler
+
+
+@gin.configurable
 def feature_mse_loss(loss_weights=None, quat_direct_mse=False):
     default_weights = {key: 1.0 for key in SUPPORTED_GS_KEYS}
     if loss_weights is None:
@@ -137,45 +162,85 @@ def feature_mse_loss(loss_weights=None, quat_direct_mse=False):
     return {"loss_weights": default_weights, "quat_direct_mse": quat_direct_mse}
 
 
-def _to_cpu(data):
+def compute_all_feature_mse_loss(
+    out_gs,
+    target_gs,
+    loss_weights,
+    post_activate_loss,
+    quat_direct_mse,
+):
+    losses = {}
+    weighted_losses = {}
+    total_loss = None
+    for key in SUPPORTED_GS_KEYS:
+        pred = out_gs[key]
+        target = target_gs[key].to(
+            device=pred.device, dtype=pred.dtype
+        )
+        if pred.shape != target.shape:
+            raise ValueError(
+                f"Shape mismatch for Gaussian attribute {key!r}: "
+                f"output {tuple(pred.shape)} vs target {tuple(target.shape)}"
+            )
+        loss = feature_loss_value(
+            key,
+            pred,
+            target,
+            post_activate_loss=post_activate_loss,
+            quat_direct_mse=quat_direct_mse,
+            means_loss_reduction=MEANS_LOSS_REDUCTION,
+        )
+        weighted_loss = float(loss_weights[key]) * loss
+        losses[key] = loss
+        weighted_losses[key] = weighted_loss
+        total_loss = (
+            weighted_loss if total_loss is None else total_loss + weighted_loss
+        )
+
+    return total_loss, losses, weighted_losses
+
+
+def to_cpu(data):
     if torch.is_tensor(data):
         return data.detach().cpu()
     if isinstance(data, dict):
-        return {k: _to_cpu(v) for k, v in data.items()}
+        return {k: to_cpu(v) for k, v in data.items()}
     if isinstance(data, list):
-        return [_to_cpu(v) for v in data]
+        return [to_cpu(v) for v in data]
     if isinstance(data, tuple):
-        return tuple(_to_cpu(v) for v in data)
+        return tuple(to_cpu(v) for v in data)
     return data
 
 
-def _default_wandb_name(output_dir):
-    output_dir = output_dir.rstrip("/")
-    parts = Path(output_dir).parts
-    return "/".join(parts[-2:]) if len(parts) >= 2 else output_dir
-
-
-def _init_wandb(output_dir):
+def init_wandb(output_dir):
     if not FLAGS.use_wandb:
         return None
     if wandb is None:
         raise ImportError("wandb is not installed. Install it or run without --use_wandb.")
 
+    normalized_output_dir = output_dir.rstrip("/")
+    output_parts = Path(normalized_output_dir).parts
+    default_name = (
+        "/".join(output_parts[-2:])
+        if len(output_parts) >= 2
+        else normalized_output_dir
+    )
     return wandb.init(
         project=FLAGS.wandb_project,
         dir=FLAGS.wandb_dir,
-        name=FLAGS.wandb_name or _default_wandb_name(output_dir),
+        name=FLAGS.wandb_name or default_name,
         config={
             "output_dir": output_dir,
             "eval_subdir": FLAGS.eval_subdir,
             "compare_with_input": FLAGS.compare_with_input,
             "save_viewer": FLAGS.save_viewer,
             "save_residuals": FLAGS.save_residuals,
-            "input_factor": FLAGS.input_factor,
-            "target_factor": FLAGS.target_factor,
+            "input_resolution": FLAGS.input_resolution,
+            "target_resolution": FLAGS.target_resolution,
             "alignment": FLAGS.alignment,
+            "matching_cache_root": FLAGS.matching_cache_root,
             "attribute_init": FLAGS.attribute_init,
-            "loss_features": FLAGS.loss_features,
+            "loss_attributes": list(SUPPORTED_GS_KEYS),
             "post_activate_loss": FLAGS.post_activate_loss,
             "means_origin_scale": FLAGS.means_origin_scale,
             "gin_config": gin.operative_config_str(),
@@ -183,41 +248,39 @@ def _init_wandb(output_dir):
     )
 
 
-def _wandb_log(data, step=None):
+def wandb_log(data, step=None):
     if wandb is not None and wandb.run is not None:
         wandb.log(data, step=step)
 
 
-def _build_dataset(scope):
-    with gin.config_scope(scope):
-        dataset = SplatFactoMultiLevelDataset()
-    required_factors = {FLAGS.input_factor, FLAGS.target_factor}
-    missing = sorted(required_factors - set(dataset.factors))
+def build_dataset(scope):
+    dataset = SplatFactoSRDataset.from_gin_scope(scope)
+    required_resolutions = {FLAGS.input_resolution, FLAGS.target_resolution}
+    missing = sorted(required_resolutions - set(dataset.resolutions))
     if missing:
         raise ValueError(
-            f"{scope} dataset factors {sorted(dataset.factors)} do not include required factors {missing}"
+            f"{scope} dataset resolutions {sorted(dataset.resolutions)} do not include required resolutions {missing}"
+        )
+    configured_pair = (
+        dataset.fit_source_resolution, dataset.fit_target_resolution
+    )
+    requested_pair = (FLAGS.input_resolution, FLAGS.target_resolution)
+    if configured_pair != requested_pair:
+        raise ValueError(
+            f"{scope} dataset fitted pair {configured_pair[0]}->{configured_pair[1]} "
+            f"does not match requested pair {requested_pair[0]}->{requested_pair[1]}"
         )
     return dataset
 
 
-def _next_train_batch(train_iter, train_dataset):
-    try:
-        return train_iter, next(train_iter)
-    except StopIteration:
-        train_iter = iter(train_dataset)
-        return train_iter, next(train_iter)
-
-
-def _densify_input(input_factor_entry, target_factor_entry, device):
-    return build_densified_input_gs(
-        input_factor_dict=input_factor_entry,
-        target_factor_dict=target_factor_entry,
-        alignment=FLAGS.alignment,
-        attribute_init=FLAGS.attribute_init,
-        emd_eps=FLAGS.emd_eps,
-        emd_iters=FLAGS.emd_iters,
-        device=device,
-    )
+def write_filtered_scenes(output_dir, datasets_by_split):
+    filtered_scenes = []
+    for split, dataset in datasets_by_split.items():
+        for item in dataset.filtered_scenes:
+            filtered_scenes.append({"split": split, **item})
+    with open(os.path.join(output_dir, "filtered_scenes.json"), "w") as f:
+        json.dump(filtered_scenes, f, indent=2)
+    return filtered_scenes
 
 
 def evaluate_single_scene(
@@ -236,16 +299,12 @@ def evaluate_single_scene(
     save_residuals=False,
     output_gt=True,
     wandb_step=None,
-    fixed_gt_gs=None,
-    fixed_attribute_keys=None,
     means_origin_scale=1.0,
 ):
     model.eval()
     metric_computer = MetricComputer()
     metric_computer_input = MetricComputer() if compare_with_input else None
     predicted_keys = list(getattr(model, "output_features", []))
-    if fixed_attribute_keys is None:
-        fixed_attribute_keys = []
 
     device = next(model.parameters()).device
     num_views = len(eval_images)
@@ -273,8 +332,6 @@ def evaluate_single_scene(
     with torch.no_grad():
         input_gs_device = gpu_utils.move_to_device(input_gs, device)
         out_gs = model(batch_normalized_gs=[input_gs_device], batch_scene_idx=[scene_idx])[0]
-        if fixed_gt_gs is not None:
-            out_gs = copy_gt_attributes(out_gs, fixed_gt_gs, fixed_attribute_keys)
         out_gs = unscale_means_origin(out_gs, means_origin_scale)
 
         pred_preview = []
@@ -368,7 +425,7 @@ def evaluate_single_scene(
                     caption=f"{scene_name} GT | input | pred",
                 )
             if wandb_images:
-                _wandb_log(wandb_images, step=wandb_step)
+                wandb_log(wandb_images, step=wandb_step)
 
         if save_viewer:
             viewerdir = os.path.join(output_dir, f"viewer/{scene_name}")
@@ -410,10 +467,10 @@ def evaluate_single_scene(
                 "scene_name": scene_name,
                 "residual_type": residual_type,
                 "residual_keys": residual_keys,
-                "residuals": _to_cpu(residuals),
-                "input_gs": _to_cpu(input_gs_device),
-                "output_gs": _to_cpu(out_gs),
-                "cameras": _to_cpu(eval_cameras),
+                "residuals": to_cpu(residuals),
+                "input_gs": to_cpu(input_gs_device),
+                "output_gs": to_cpu(out_gs),
+                "cameras": to_cpu(eval_cameras),
             }
             torch.save(pt_payload, os.path.join(residual_dir, f"{scene_stem}.pt"))
 
@@ -450,7 +507,6 @@ def evaluate_dataset(
     save_residuals=False,
     output_gt=False,
     wandb_step=None,
-    fixed_attribute_keys=None,
     means_origin_scale=1.0,
 ):
     os.makedirs(output_dir, exist_ok=True)
@@ -458,21 +514,52 @@ def evaluate_dataset(
     all_metrics_input = []
     logger = ProcessSafeLogger(os.path.join(output_dir, "eval.log")).get_logger()
     device = next(model.parameters()).device
+    matching_config = matching_fit()
 
     for scene_idx in tqdm(range(len(dataset.folders)), desc="Evaluating"):
         scene = dataset.load_scene(scene_idx)
-        input_factor_entry = scene["factor_data"][FLAGS.input_factor]
-        target_factor_entry = scene["factor_data"][FLAGS.target_factor]
-        eval_images, image_names, eval_cameras = dataset.load_factor_views(target_factor_entry)
-
-        target_gs = gpu_utils.move_to_device(target_factor_entry["gs_params"], device)
-        input_gs = _densify_input(input_factor_entry, target_factor_entry, device)
-
+        input_resolution_entry = scene["resolution_data"][FLAGS.input_resolution]
+        target_resolution_entry = scene["resolution_data"][FLAGS.target_resolution]
+        input_images, _, input_cameras = dataset.load_resolution_views(
+            input_resolution_entry
+        )
+        eval_images, image_names, eval_cameras = dataset.load_resolution_views(
+            target_resolution_entry
+        )
+        target_gs = gpu_utils.move_to_device(
+            target_resolution_entry["gs_params"], device
+        )
         scene_output_dir = os.path.join(output_dir, scene["scene_name"])
+        input_gs, attribute_target_gs, alignment_info = prepare_alignment(
+            dataset=dataset,
+            scene=scene,
+            input_resolution_entry=input_resolution_entry,
+            target_resolution_entry=target_resolution_entry,
+            target_images=eval_images,
+            target_cameras=eval_cameras,
+            target_gs=target_gs,
+            output_dir=scene_output_dir,
+            logger=logger,
+            device=device,
+            eval_chunk_size=len(eval_images),
+            alignment=FLAGS.alignment,
+            attribute_init=FLAGS.attribute_init,
+            emd_eps=FLAGS.emd_eps,
+            emd_iters=FLAGS.emd_iters,
+            input_resolution=FLAGS.input_resolution,
+            target_resolution=FLAGS.target_resolution,
+            matching_cache_root=FLAGS.matching_cache_root,
+            force_matching_fit=False,
+            matching_config=matching_config,
+            matching_optimizer_factory=build_matching_optimization,
+            input_images=input_images,
+            input_cameras=input_cameras,
+            write_artifacts=False,
+        )
         metrics, metrics_input = evaluate_single_scene(
             model=model,
             input_gs=input_gs,
-            gt_gs=target_gs,
+            gt_gs=attribute_target_gs,
             scene_idx=scene["idx"],
             scene_name=scene["scene_name"],
             eval_images=eval_images,
@@ -485,29 +572,31 @@ def evaluate_dataset(
             save_residuals=save_residuals,
             output_gt=output_gt,
             wandb_step=wandb_step,
-            fixed_gt_gs=target_gs,
-            fixed_attribute_keys=fixed_attribute_keys,
             means_origin_scale=means_origin_scale,
         )
         all_metrics.append(metrics)
         if compare_with_input:
             all_metrics_input.append(metrics_input)
         logger.info(
-            f"Scene {scene['scene_name']}: "
-            + " ".join([f"{key}: {value:.4f}" for key, value in metrics.items()])
+            f"Scene {scene['scene_name']} alignment={alignment_info}: "
+            + " ".join(
+                f"{key}: {value:.4f}" for key, value in metrics.items()
+            )
         )
 
     reduced_metrics = {}
-    if len(all_metrics) > 0:
-        metric_keys = all_metrics[0].keys()
-        for key in metric_keys:
-            reduced_metrics[key] = float(np.mean([metrics[key] for metrics in all_metrics]))
+    if all_metrics:
+        for key in all_metrics[0]:
+            reduced_metrics[key] = float(
+                np.mean([metrics[key] for metrics in all_metrics])
+            )
 
     reduced_metrics_input = {}
-    if compare_with_input and len(all_metrics_input) > 0:
-        metric_keys = all_metrics_input[0].keys()
-        for key in metric_keys:
-            reduced_metrics_input[key] = float(np.mean([metrics[key] for metrics in all_metrics_input]))
+    if compare_with_input and all_metrics_input:
+        for key in all_metrics_input[0]:
+            reduced_metrics_input[key] = float(
+                np.mean([metrics[key] for metrics in all_metrics_input])
+            )
 
     with open(os.path.join(output_dir, "metrics.json"), "w") as f:
         json.dump(reduced_metrics, f, indent=2)
@@ -526,19 +615,36 @@ def main(argv):
     gin.parse_config_files_and_bindings(FLAGS.gin_file, FLAGS.gin_param)
     train_cfg = training(output_dir=FLAGS.output_dir)
     mse_loss_cfg = feature_mse_loss()
+    matching_config = matching_fit()
     set_seed()
 
     with open(os.path.join(FLAGS.output_dir, "config.gin"), "w") as f:
         f.writelines(gin.operative_config_str())
 
     logger = ProcessSafeLogger(os.path.join(FLAGS.output_dir, "train.log")).get_logger()
-    wandb_run = _init_wandb(FLAGS.output_dir)
+    wandb_run = init_wandb(FLAGS.output_dir)
     device = torch.device("cuda")
 
-    train_dataset = _build_dataset("train_dataset")
-    test_dataset = _build_dataset("test_dataset")
+    train_dataset = build_dataset("train_dataset")
+    test_dataset = build_dataset("test_dataset")
+    filtered_scenes = write_filtered_scenes(
+        FLAGS.output_dir,
+        {"train": train_dataset, "test": test_dataset},
+    )
+    if filtered_scenes:
+        logger.info(
+            f"Saved {len(filtered_scenes)} filtered scenes to filtered_scenes.json"
+        )
 
     model = FeaturePredictor().to(device)
+    missing_outputs = sorted(
+        set(SUPPORTED_GS_KEYS) - set(model.output_features)
+    )
+    if missing_outputs:
+        raise ValueError(
+            f"FeaturePredictor.output_features must include all Gaussian "
+            f"attributes; missing {missing_outputs}"
+        )
     if model.resume_ckpt is not None:
         model.load_state_dict(torch.load(model.resume_ckpt, map_location="cpu"))
         logger.info(f"Loaded model checkpoint from {model.resume_ckpt}")
@@ -548,26 +654,26 @@ def main(argv):
     else:
         model.train()
 
-    reference_scene = train_dataset.load_scene(0)
-    reference_target_gs = reference_scene["factor_data"][FLAGS.target_factor]["gs_params"]
-    loss_features = parse_loss_features(FLAGS.loss_features, model, reference_target_gs)
-    fixed_attribute_keys = select_fixed_attribute_keys(loss_features, reference_target_gs)
     requested_means_origin_scale = float(FLAGS.means_origin_scale)
     if requested_means_origin_scale <= 0.0:
         raise ValueError(f"--means_origin_scale must be > 0, got {requested_means_origin_scale}")
-    means_origin_scale = requested_means_origin_scale if "means" in loss_features else 1.0
+    means_origin_scale = (
+        requested_means_origin_scale
+        if "means" in model.output_features
+        else 1.0
+    )
 
     training_brief = (
-        f"Train SR MSE input_factor={FLAGS.input_factor} target_factor={FLAGS.target_factor}\n"
+        f"Train SR MSE input_resolution={FLAGS.input_resolution} target_resolution={FLAGS.target_resolution}\n"
         f"train_scenes={len(train_dataset.folders)} test_scenes={len(test_dataset.folders)}\n"
         f"alignment={FLAGS.alignment} attribute_init={FLAGS.attribute_init}\n"
-        f"loss_features={','.join(loss_features)}\n"
+        f"matching_cache_root={FLAGS.matching_cache_root}\n"
+        f"loss_attributes={','.join(SUPPORTED_GS_KEYS)}\n"
         f"post_activate_loss={FLAGS.post_activate_loss}\n"
         f"means_origin_scale={requested_means_origin_scale}\n"
         f"effective_means_origin_scale={means_origin_scale}\n"
         f"quat_direct_mse={mse_loss_cfg['quat_direct_mse']}\n"
-        f"loss_weights={mse_loss_cfg['loss_weights']}\n"
-        f"eval_gt_attributes={','.join(fixed_attribute_keys) if fixed_attribute_keys else 'none'}"
+        f"loss_weights={mse_loss_cfg['loss_weights']}"
     )
     print(training_brief)
     logger.info(training_brief)
@@ -600,26 +706,60 @@ def main(argv):
         train_iter = iter(train_dataset)
         pbar = tqdm(range(resume_from_step, total_steps), desc="Training")
         for step in pbar:
-            train_iter, batch = _next_train_batch(train_iter, train_dataset)
-            input_factor_entry = batch["multilevel"][FLAGS.input_factor]
-            target_factor_entry = batch["multilevel"][FLAGS.target_factor]
+            try:
+                batch = next(train_iter)
+            except StopIteration:
+                train_iter = iter(train_dataset)
+                batch = next(train_iter)
+            input_resolution_entry = batch["multiresolution"][FLAGS.input_resolution]
+            target_resolution_entry = batch["multiresolution"][FLAGS.target_resolution]
 
-            target_gs = gpu_utils.move_to_device(target_factor_entry["gs_params"], device)
-            densified_input_gs = _densify_input(input_factor_entry, target_factor_entry, device)
-            loss_target_gs = scale_means_origin(target_gs, means_origin_scale)
-            batch_gs = [densified_input_gs]
+            target_gs = gpu_utils.move_to_device(
+                target_resolution_entry["gs_params"], device
+            )
+            aligned_input_gs, attribute_target_gs, alignment_info = prepare_alignment(
+                dataset=train_dataset,
+                scene={
+                    "scene_name": batch["scene_name"],
+                    "fit_lr_to_hr": batch["fit_lr_to_hr"],
+                },
+                input_resolution_entry=input_resolution_entry,
+                target_resolution_entry=target_resolution_entry,
+                target_images=target_resolution_entry["images"],
+                target_cameras=target_resolution_entry["cameras"],
+                target_gs=target_gs,
+                output_dir=os.path.join(FLAGS.output_dir, "train", batch["scene_name"]),
+                logger=logger,
+                device=device,
+                eval_chunk_size=len(target_resolution_entry["images"]),
+                alignment=FLAGS.alignment,
+                attribute_init=FLAGS.attribute_init,
+                emd_eps=FLAGS.emd_eps,
+                emd_iters=FLAGS.emd_iters,
+                input_resolution=FLAGS.input_resolution,
+                target_resolution=FLAGS.target_resolution,
+                matching_cache_root=FLAGS.matching_cache_root,
+                force_matching_fit=False,
+                matching_config=matching_config,
+                matching_optimizer_factory=build_matching_optimization,
+                input_images=input_resolution_entry["images"],
+                input_cameras=input_resolution_entry["cameras"],
+                write_artifacts=False,
+            )
+            loss_target_gs = scale_means_origin(
+                attribute_target_gs, means_origin_scale
+            )
+            batch_gs = [aligned_input_gs]
             batch_scene_idx = [batch["scene_idx"]]
 
             with torch.cuda.amp.autocast(enabled=enable_amp):
                 out_gs = model(batch_normalized_gs=batch_gs, batch_scene_idx=batch_scene_idx)[0]
-                total_loss, feature_losses, weighted_feature_losses = compute_feature_mse_loss(
-                    out_gs,
-                    loss_target_gs,
-                    loss_features,
-                    post_activate_loss=FLAGS.post_activate_loss,
+                total_loss, feature_losses, weighted_feature_losses = compute_all_feature_mse_loss(
+                    out_gs=out_gs,
+                    target_gs=loss_target_gs,
                     loss_weights=mse_loss_cfg["loss_weights"],
+                    post_activate_loss=FLAGS.post_activate_loss,
                     quat_direct_mse=mse_loss_cfg["quat_direct_mse"],
-                    means_loss_reduction=MEANS_LOSS_REDUCTION,
                 )
 
             if enable_amp:
@@ -656,14 +796,14 @@ def main(argv):
                     "train/total_loss": total_loss.item(),
                     "train/lr": optimizer.param_groups[0]["lr"],
                     "train/scene_idx": batch["scene_idx"],
-                    "train/input_gaussians": input_factor_entry["gs_params"]["means"].shape[0],
-                    "train/densified_gaussians": densified_input_gs["means"].shape[0],
-                    "train/target_gaussians": target_factor_entry["gs_params"]["means"].shape[0],
+                    "train/input_gaussians": input_resolution_entry["gs_params"]["means"].shape[0],
+                    "train/aligned_gaussians": aligned_input_gs["means"].shape[0],
+                    "train/target_gaussians": attribute_target_gs["means"].shape[0],
                 }
                 for key, value in feature_loss_values.items():
                     train_log[f"train/{key}_loss"] = value
                     train_log[f"train/{key}_weighted"] = weighted_loss_values[key]
-                _wandb_log(train_log, step=step)
+                wandb_log(train_log, step=step)
 
                 feature_loss_str = " ".join(
                     f"{key}_loss={value:.6f} {key}_weighted={weighted_loss_values[key]:.6f}"
@@ -671,15 +811,14 @@ def main(argv):
                 )
                 logger.info(
                     f"step={step} scene={batch['scene_name']} total={total_loss.item():.6f} "
-                    f"{feature_loss_str} lr={optimizer.param_groups[0]['lr']:.8f}"
+                    f"alignment={alignment_info} {feature_loss_str} lr={optimizer.param_groups[0]['lr']:.8f}"
                 )
 
             if step % log_image_interval == 0:
-                batch_cameras = gpu_utils.move_to_device(target_factor_entry["cameras"], device)
-                batch_images = gpu_utils.move_to_device(target_factor_entry["images"], device)
+                batch_cameras = gpu_utils.move_to_device(target_resolution_entry["cameras"], device)
+                batch_images = gpu_utils.move_to_device(target_resolution_entry["images"], device)
                 with torch.no_grad():
                     log_out_gs = model(batch_normalized_gs=batch_gs, batch_scene_idx=batch_scene_idx)[0]
-                    log_out_gs = copy_gt_attributes(log_out_gs, target_gs, fixed_attribute_keys)
                     log_out_gs = unscale_means_origin(log_out_gs, means_origin_scale)
                     pred_imgs, _ = gs_utils.rasterize_gaussians_to_multiimgs(log_out_gs, batch_cameras)
 
@@ -698,7 +837,7 @@ def main(argv):
                 cv2.imwrite(gt_path, gt_grid)
 
                 if wandb is not None and wandb.run is not None:
-                    _wandb_log(
+                    wandb_log(
                         {
                             "train/pred_grid": wandb.Image(pred_grid_rgb, caption=f"step={step} pred"),
                             "train/gt_grid": wandb.Image(gt_grid_rgb, caption=f"step={step} gt"),
@@ -717,16 +856,15 @@ def main(argv):
                     save_residuals=FLAGS.save_residuals,
                     output_gt=(step == 0),
                     wandb_step=step,
-                    fixed_attribute_keys=fixed_attribute_keys,
                     means_origin_scale=means_origin_scale,
                 )
                 metric_str = " ".join([f"{k}: {v:.4f}" for k, v in metrics.items()])
                 logger.info(f"Eval step {step}: {metric_str}")
-                _wandb_log({f"eval/{key}": value for key, value in metrics.items()}, step=step)
+                wandb_log({f"eval/{key}": value for key, value in metrics.items()}, step=step)
                 if FLAGS.compare_with_input:
                     metric_str = " ".join([f"{k}: {v:.4f}" for k, v in metrics_input.items()])
                     logger.info(f"Eval step {step} input: {metric_str}")
-                    _wandb_log(
+                    wandb_log(
                         {f"eval_input/{key}": value for key, value in metrics_input.items()},
                         step=step,
                     )
@@ -746,16 +884,15 @@ def main(argv):
         save_viewer=FLAGS.save_viewer,
         save_residuals=FLAGS.save_residuals,
         output_gt=True,
-        fixed_attribute_keys=fixed_attribute_keys,
         means_origin_scale=means_origin_scale,
     )
     metric_str = " ".join([f"{k}: {v:.4f}" for k, v in metrics.items()])
     logger.info(f"Final eval: {metric_str}")
-    _wandb_log({f"final_eval/{key}": value for key, value in metrics.items()})
+    wandb_log({f"final_eval/{key}": value for key, value in metrics.items()})
     if FLAGS.compare_with_input:
         metric_str = " ".join([f"{k}: {v:.4f}" for k, v in metrics_input.items()])
         logger.info(f"Final eval input: {metric_str}")
-        _wandb_log({f"final_eval_input/{key}": value for key, value in metrics_input.items()})
+        wandb_log({f"final_eval_input/{key}": value for key, value in metrics_input.items()})
 
     if wandb_run is not None:
         wandb_run.finish()

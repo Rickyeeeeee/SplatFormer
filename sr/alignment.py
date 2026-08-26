@@ -68,9 +68,12 @@ def prepare_alignment(
     force_matching_fit,
     matching_config,
     matching_optimizer_factory,
+    input_images=None,
+    input_cameras=None,
+    write_artifacts=True,
 ):
     if alignment in {"emd", "random"}:
-        aligned_input_gs, stage_gs = densification.build_densified_input(
+        densification_result = densification.build_densified_input(
             input_factor_dict=input_resolution_entry,
             target_factor_dict=target_resolution_entry,
             alignment="emd" if alignment == "emd" else "none",
@@ -78,8 +81,12 @@ def prepare_alignment(
             emd_eps=emd_eps,
             emd_iters=emd_iters,
             device=device,
-            return_stages=True,
+            return_stages=write_artifacts,
         )
+        if write_artifacts:
+            aligned_input_gs, stage_gs = densification_result
+        else:
+            aligned_input_gs = densification_result
         if alignment == "random":
             permutation = torch.randperm(
                 aligned_input_gs["means"].shape[0], device=device
@@ -87,6 +94,11 @@ def prepare_alignment(
             aligned_input_gs = {
                 key: value[permutation].clone()
                 for key, value in aligned_input_gs.items()
+            }
+
+        if not write_artifacts:
+            return aligned_input_gs, target_gs, {
+                "cache_status": "not_applicable"
             }
 
         stage_gs["03_input_high_res_gs.ply"] = aligned_input_gs
@@ -153,9 +165,14 @@ def prepare_alignment(
         artifact_cameras = target_cameras
         fitted_artifact_gs = aligned_target_gs
     elif alignment == "fit_hr_to_lr":
-        input_images, _, input_cameras = dataset.load_resolution_views(
-            input_resolution_entry
-        )
+        if (input_images is None) != (input_cameras is None):
+            raise ValueError(
+                "input_images and input_cameras must be supplied together"
+            )
+        if input_images is None:
+            input_images, _, input_cameras = dataset.load_resolution_views(
+                input_resolution_entry
+            )
         high_res_in_low_res_frame = matching.build_matching_source(
             target_resolution_entry, input_resolution_entry, device
         )
@@ -187,6 +204,20 @@ def prepare_alignment(
     else:
         raise ValueError(f"Unsupported alignment mode: {alignment}")
 
+    precomputed = cache["status"] == "dataset_precomputed"
+    alignment_info = {
+        "cache_status": cache["status"],
+        "cache_path": cache["checkpoint_path"],
+        "matching_steps": (
+            0 if precomputed else matching_config["total_steps"]
+        ),
+        "matching_images_per_step": (
+            0 if precomputed else matching_config["image_per_step"]
+        ),
+    }
+    if not write_artifacts:
+        return aligned_input_gs, aligned_target_gs, alignment_info
+
     artifact_chunk_size = dataset.image_per_scene or len(artifact_images)
     artifact_metrics = matching.save_matching_artifacts(
         output_dir,
@@ -205,14 +236,4 @@ def prepare_alignment(
                 f"{key}: {value:.4f}" for key, value in metrics.items()
             ),
         )
-    precomputed = cache["status"] == "dataset_precomputed"
-    return aligned_input_gs, aligned_target_gs, {
-        "cache_status": cache["status"],
-        "cache_path": cache["checkpoint_path"],
-        "matching_steps": (
-            0 if precomputed else matching_config["total_steps"]
-        ),
-        "matching_images_per_step": (
-            0 if precomputed else matching_config["image_per_step"]
-        ),
-    }
+    return aligned_input_gs, aligned_target_gs, alignment_info

@@ -242,7 +242,6 @@ def build_densified_input(
     emd_iters,
     device,
     output_dir=None,
-    gt_attribute_keys=None,
     return_stages=False,
 ):
     input_gs = gpu_utils.move_to_device(input_factor_dict["gs_params"], device)
@@ -284,11 +283,6 @@ def build_densified_input(
         densified_gs = initialize_3dgs_attributes(densified_gs)
     elif attribute_init != "aligned":
         raise ValueError(f"Unsupported attribute initialization: {attribute_init}")
-
-    if gt_attribute_keys:
-        densified_gs = gs_utils.copy_gt_attributes(
-            densified_gs, target_gs, gt_attribute_keys
-        )
 
     stages = densification_stages(
         input_in_target_frame,
