@@ -1,0 +1,60 @@
+# Unified all-attribute GSFM training with four alignment modes.
+set_seed.seed = 42
+
+total_steps = 200000
+training.total_steps = %total_steps
+training.eval_interval = 2000
+training.save_interval = 2000
+training.log_interval = 20
+training.log_image_interval = 2000
+training.grad_clip_norm = 2.0
+training.image_l1_loss_weight = 1.0
+training.lpips_loss_weight = 1.0
+training.resume_from_step = 0
+training.enable_amp = True
+training.empty_cache_fre = -1
+
+flow_matching.flow_steps = 5
+flow_matching.flow_noise_std = 0.0
+flow_matching.flow_t_eps = 1e-4
+flow_matching.loss_type = 'velocity'
+flow_matching.velocity_variance_floor = 1e-8
+
+loss_mixing.schedule = 'free-range-gs'
+
+# All six Gaussian attributes are always supervised.
+# These weights apply to the x1 objective; velocity loss uses unit attribute weights.
+feature_mse_loss.loss_weights = {
+    'means': 100.0,
+    'features_dc': 1.0,
+    'features_rest': 1.0,
+    'opacities': 1.0,
+    'scales': 1.0,
+    'quats': 10.0,
+}
+feature_mse_loss.quat_direct_mse = False
+
+train2D/build_optimizer.lr_dict = {
+    'base': 3e-4,
+    'embedding': 3e-4,
+    'backbone': 3e-4,
+    'features_dc': 3e-4,
+    'features_rest': 1.5e-6,
+    'scales': 3e-3,
+    'opacities': 3e-4,
+    'quats': 3e-4,
+    'means': 3e-4,
+}
+train2D/build_optimizer.optimizer_type = 'adam'
+train2D/build_optimizer.optimizer_params = {'eps': 1e-15}
+train2D/build_scheduler.total_step = %total_steps
+train2D/build_scheduler.schedule = 'linear'
+
+
+flow_matching.gs_statistics_path = '/project/ricky/splatformer-sr-data/gs_statistics.json'
+
+# The trainer enables target images dynamically for render-loss schedules.
+train_dataset/SplatFactoSRDevDataset.load_src_gs = True
+train_dataset/SplatFactoSRDevDataset.load_tgt_gs = True
+train_dataset/SplatFactoSRDevDataset.load_src_images = False
+train_dataset/SplatFactoSRDevDataset.load_tgt_images = False

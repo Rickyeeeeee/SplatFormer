@@ -14,16 +14,19 @@ try:
 except ImportError:
     wandb = None
 
-from dataset.GS_SR import SplatFactoSRDataset
+from dataset.GS_SR_dev import SplatFactoSRDevDataset
 from models.feature_predictor import FeaturePredictor
 from sr.alignment import prepare_alignment
 from utils import gpu_utils, gs_utils
 from utils.gpu_utils import seed_everything
-from utils.gs_utils import scale_means_origin, unscale_means_origin
 from utils.log_utils import ProcessSafeLogger
-from utils.loss_utils import SUPPORTED_GS_KEYS, feature_loss_value
+from utils.loss_utils import (
+    SUPPORTED_GS_KEYS,
+    compute_gaussian_attribute_loss,
+    gaussian_attribute_loss_config,
+)
 from utils.metrics import MetricComputer
-from utils.optimizers import build_3DGSoptimizer, build_optimizer, build_scheduler
+from utils.optimizers import build_optimizer, build_scheduler
 
 
 flags.DEFINE_string("output_dir", "output_sr_mse", "Output directory")
@@ -52,21 +55,10 @@ flags.DEFINE_enum(
 )
 flags.DEFINE_float("emd_eps", 0.01, "Auction EMD epsilon")
 flags.DEFINE_integer("emd_iters", 100, "Auction EMD iterations")
-flags.DEFINE_string(
-    "matching_cache_root",
-    "/project2/ricky/splatformer-data-to-4x",
-    "Persistent cache for reverse fitted alignment",
-)
 flags.DEFINE_boolean(
     "post_activate_loss",
     False,
     "Use feature-specific loss transforms: sigmoid opacities and geodesic quats.",
-)
-flags.DEFINE_float(
-    "means_origin_scale",
-    1.0,
-    "Training-only origin scale for target Gaussian means when computing means MSE loss. "
-    "Predicted means are divided by this value before render/export.",
 )
 flags.DEFINE_multi_string("gin_file", None, "List of paths to the config files.")
 flags.DEFINE_multi_string("gin_param", "", "Newline separated list of Gin parameter bindings.")
@@ -82,11 +74,10 @@ def set_seed(seed):
     seed_everything(seed)
 
 
-@gin.configurable
-def training(
+@gin.configurable("training")
+def training_config(
     output_dir=None,
     total_steps=gin.REQUIRED,
-    pretrain_steps=gin.REQUIRED,
     eval_interval=gin.REQUIRED,
     log_interval=gin.REQUIRED,
     save_interval=gin.REQUIRED,
@@ -101,7 +92,6 @@ def training(
     return {
         "output_dir": output_dir,
         "total_steps": total_steps,
-        "pretrain_steps": pretrain_steps,
         "eval_interval": eval_interval,
         "log_interval": log_interval,
         "save_interval": save_interval,
@@ -114,90 +104,6 @@ def training(
         "empty_cache_fre": empty_cache_fre,
     }
 
-
-@gin.configurable
-def matching_fit(
-    total_steps=1000,
-    image_per_step=16,
-    log_interval=20,
-    preview_interval=200,
-    grad_clip_norm=0.0,
-    image_l1_loss_weight=1.0,
-    lpips_loss_weight=1.0,
-    enable_amp=True,
-    empty_cache_fre=-1,
-):
-    return {
-        "total_steps": total_steps,
-        "image_per_step": image_per_step,
-        "log_interval": log_interval,
-        "preview_interval": preview_interval,
-        "grad_clip_norm": grad_clip_norm,
-        "image_l1_loss_weight": image_l1_loss_weight,
-        "lpips_loss_weight": lpips_loss_weight,
-        "enable_amp": enable_amp,
-        "empty_cache_fre": empty_cache_fre,
-    }
-
-
-def build_matching_optimization(gaussians):
-    with gin.config_scope("matching_fit"):
-        optimizer = build_3DGSoptimizer(gaussians)
-        scheduler = build_scheduler(optimizer)
-    return optimizer, scheduler
-
-
-@gin.configurable
-def feature_mse_loss(loss_weights=None, quat_direct_mse=False):
-    default_weights = {key: 1.0 for key in SUPPORTED_GS_KEYS}
-    if loss_weights is None:
-        loss_weights = {}
-    unknown_keys = sorted(set(loss_weights) - set(SUPPORTED_GS_KEYS))
-    if unknown_keys:
-        raise ValueError(
-            f"Unsupported feature_mse_loss.loss_weights keys: {unknown_keys}. "
-            f"Supported keys are: {SUPPORTED_GS_KEYS}"
-        )
-    default_weights.update({key: float(value) for key, value in loss_weights.items()})
-    return {"loss_weights": default_weights, "quat_direct_mse": quat_direct_mse}
-
-
-def compute_all_feature_mse_loss(
-    out_gs,
-    target_gs,
-    loss_weights,
-    post_activate_loss,
-    quat_direct_mse,
-):
-    losses = {}
-    weighted_losses = {}
-    total_loss = None
-    for key in SUPPORTED_GS_KEYS:
-        pred = out_gs[key]
-        target = target_gs[key].to(
-            device=pred.device, dtype=pred.dtype
-        )
-        if pred.shape != target.shape:
-            raise ValueError(
-                f"Shape mismatch for Gaussian attribute {key!r}: "
-                f"output {tuple(pred.shape)} vs target {tuple(target.shape)}"
-            )
-        loss = feature_loss_value(
-            key,
-            pred,
-            target,
-            post_activate_loss=post_activate_loss,
-            quat_direct_mse=quat_direct_mse,
-            means_loss_reduction=MEANS_LOSS_REDUCTION,
-        )
-        weighted_loss = float(loss_weights[key]) * loss
-        losses[key] = loss
-        weighted_losses[key] = weighted_loss
-        total_loss = (
-            weighted_loss if total_loss is None else total_loss + weighted_loss
-        )
-
-    return total_loss, losses, weighted_losses
 
 
 def to_cpu(data):
@@ -238,11 +144,9 @@ def init_wandb(output_dir):
             "input_resolution": FLAGS.input_resolution,
             "target_resolution": FLAGS.target_resolution,
             "alignment": FLAGS.alignment,
-            "matching_cache_root": FLAGS.matching_cache_root,
             "attribute_init": FLAGS.attribute_init,
             "loss_attributes": list(SUPPORTED_GS_KEYS),
             "post_activate_loss": FLAGS.post_activate_loss,
-            "means_origin_scale": FLAGS.means_origin_scale,
             "gin_config": gin.operative_config_str(),
         },
     )
@@ -253,24 +157,43 @@ def wandb_log(data, step=None):
         wandb.log(data, step=step)
 
 
-def build_dataset(scope):
-    dataset = SplatFactoSRDataset.from_gin_scope(scope)
-    required_resolutions = {FLAGS.input_resolution, FLAGS.target_resolution}
-    missing = sorted(required_resolutions - set(dataset.resolutions))
-    if missing:
-        raise ValueError(
-            f"{scope} dataset resolutions {sorted(dataset.resolutions)} do not include required resolutions {missing}"
+def build_dataset(scope, alignment=None):
+    return SplatFactoSRDevDataset.from_gin_scope(scope, alignment=alignment)
+
+
+def build_gaussian_pair(dataset, scene, device):
+    input_data = scene["data"][dataset.src_resolution]
+    target_data = scene["data"][dataset.tgt_resolution]
+    target_gs = gpu_utils.move_to_device(target_data["gs_params"], device)
+    if FLAGS.alignment == "fit_lr_to_hr":
+        input_gs = gpu_utils.move_to_device(input_data["gs_params"], device)
+        target_gs = gpu_utils.move_to_device(scene[FLAGS.alignment]["tgt_gs"], device)
+        alignment_info = {"status": "dataset_preloaded", "direction": FLAGS.alignment}
+    elif FLAGS.alignment == "fit_hr_to_lr":
+        input_gs = gpu_utils.move_to_device(scene[FLAGS.alignment]["tgt_gs"], device)
+        alignment_info = {"status": "dataset_preloaded", "direction": FLAGS.alignment}
+    else:
+        input_gs, target_gs, alignment_info = prepare_alignment(
+            dataset=dataset,
+            scene=scene,
+            input_resolution_entry=input_data,
+            target_resolution_entry=target_data,
+            target_images=None,
+            target_cameras=None,
+            target_gs=target_gs,
+            output_dir="",
+            logger=None,
+            device=device,
+            eval_chunk_size=0,
+            alignment=FLAGS.alignment,
+            attribute_init=FLAGS.attribute_init,
+            emd_eps=FLAGS.emd_eps,
+            emd_iters=FLAGS.emd_iters,
+            input_resolution=dataset.src_resolution,
+            target_resolution=dataset.tgt_resolution,
+            write_artifacts=False,
         )
-    configured_pair = (
-        dataset.fit_source_resolution, dataset.fit_target_resolution
-    )
-    requested_pair = (FLAGS.input_resolution, FLAGS.target_resolution)
-    if configured_pair != requested_pair:
-        raise ValueError(
-            f"{scope} dataset fitted pair {configured_pair[0]}->{configured_pair[1]} "
-            f"does not match requested pair {requested_pair[0]}->{requested_pair[1]}"
-        )
-    return dataset
+    return input_data, target_data, input_gs, target_gs, alignment_info
 
 
 def write_filtered_scenes(output_dir, datasets_by_split):
@@ -299,7 +222,6 @@ def evaluate_single_scene(
     save_residuals=False,
     output_gt=True,
     wandb_step=None,
-    means_origin_scale=1.0,
 ):
     model.eval()
     metric_computer = MetricComputer()
@@ -332,7 +254,6 @@ def evaluate_single_scene(
     with torch.no_grad():
         input_gs_device = gpu_utils.move_to_device(input_gs, device)
         out_gs = model(batch_normalized_gs=[input_gs_device], batch_scene_idx=[scene_idx])[0]
-        out_gs = unscale_means_origin(out_gs, means_origin_scale)
 
         pred_preview = []
         gt_preview = []
@@ -445,46 +366,6 @@ def evaluate_single_scene(
                     filename=os.path.join(viewerdir, "point_cloud/iteration_2/point_cloud.ply"),
                 )
 
-        if save_residuals:
-            residual_type = "out_minus_input"
-            residual_keys = [key for key in predicted_keys if key in out_gs and key in input_gs_device]
-            if len(residual_keys) == 0:
-                residual_keys = sorted([key for key in out_gs.keys() if key in input_gs_device])
-
-            residuals = {}
-            residual_stats = {}
-            for key in residual_keys:
-                residual = out_gs[key] - input_gs_device[key]
-                residuals[key] = residual
-                residual_stats[key] = {
-                    "mean": float(residual.mean().item()),
-                    "abs_mean": float(residual.abs().mean().item()),
-                }
-
-            scene_stem = f"{int(scene_idx)}_{gs_utils.sanitize_for_filename(scene_name)}"
-            pt_payload = {
-                "scene_idx": int(scene_idx),
-                "scene_name": scene_name,
-                "residual_type": residual_type,
-                "residual_keys": residual_keys,
-                "residuals": to_cpu(residuals),
-                "input_gs": to_cpu(input_gs_device),
-                "output_gs": to_cpu(out_gs),
-                "cameras": to_cpu(eval_cameras),
-            }
-            torch.save(pt_payload, os.path.join(residual_dir, f"{scene_stem}.pt"))
-
-            stats_payload = {
-                "scene_idx": int(scene_idx),
-                "scene_name": scene_name,
-                "num_gaussians": int(input_gs_device["means"].shape[0]),
-                "residual_type": residual_type,
-                "residual_keys": residual_keys,
-                "residual_stats": residual_stats,
-            }
-            with open(os.path.join(residual_dir, f"{scene_stem}.json"), "w") as f:
-                json.dump(stats_payload, f, indent=2)
-
     metrics = metric_computer.finalize()
     metric_computer.write_to_file(os.path.join(output_dir, "metrics.json"))
 
@@ -507,60 +388,26 @@ def evaluate_dataset(
     save_residuals=False,
     output_gt=False,
     wandb_step=None,
-    means_origin_scale=1.0,
 ):
     os.makedirs(output_dir, exist_ok=True)
     all_metrics = []
     all_metrics_input = []
     logger = ProcessSafeLogger(os.path.join(output_dir, "eval.log")).get_logger()
     device = next(model.parameters()).device
-    matching_config = matching_fit()
-
     for scene_idx in tqdm(range(len(dataset.folders)), desc="Evaluating"):
-        scene = dataset.load_scene(scene_idx)
-        input_resolution_entry = scene["resolution_data"][FLAGS.input_resolution]
-        target_resolution_entry = scene["resolution_data"][FLAGS.target_resolution]
-        input_images, _, input_cameras = dataset.load_resolution_views(
-            input_resolution_entry
+        scene = dataset.load_scene(scene_idx, fit_alignment=FLAGS.alignment)
+        input_resolution_entry, target_resolution_entry, input_gs, attribute_target_gs, alignment_info = build_gaussian_pair(
+            dataset, scene, device
         )
-        eval_images, image_names, eval_cameras = dataset.load_resolution_views(
-            target_resolution_entry
-        )
-        target_gs = gpu_utils.move_to_device(
-            target_resolution_entry["gs_params"], device
-        )
+        eval_images = target_resolution_entry["images"]
+        image_names = target_resolution_entry["images_name"]
+        eval_cameras = target_resolution_entry["cameras"]
         scene_output_dir = os.path.join(output_dir, scene["scene_name"])
-        input_gs, attribute_target_gs, alignment_info = prepare_alignment(
-            dataset=dataset,
-            scene=scene,
-            input_resolution_entry=input_resolution_entry,
-            target_resolution_entry=target_resolution_entry,
-            target_images=eval_images,
-            target_cameras=eval_cameras,
-            target_gs=target_gs,
-            output_dir=scene_output_dir,
-            logger=logger,
-            device=device,
-            eval_chunk_size=len(eval_images),
-            alignment=FLAGS.alignment,
-            attribute_init=FLAGS.attribute_init,
-            emd_eps=FLAGS.emd_eps,
-            emd_iters=FLAGS.emd_iters,
-            input_resolution=FLAGS.input_resolution,
-            target_resolution=FLAGS.target_resolution,
-            matching_cache_root=FLAGS.matching_cache_root,
-            force_matching_fit=False,
-            matching_config=matching_config,
-            matching_optimizer_factory=build_matching_optimization,
-            input_images=input_images,
-            input_cameras=input_cameras,
-            write_artifacts=False,
-        )
         metrics, metrics_input = evaluate_single_scene(
             model=model,
             input_gs=input_gs,
             gt_gs=attribute_target_gs,
-            scene_idx=scene["idx"],
+            scene_idx=scene["scene_idx"],
             scene_name=scene["scene_name"],
             eval_images=eval_images,
             eval_cameras=eval_cameras,
@@ -572,7 +419,6 @@ def evaluate_dataset(
             save_residuals=save_residuals,
             output_gt=output_gt,
             wandb_step=wandb_step,
-            means_origin_scale=means_origin_scale,
         )
         all_metrics.append(metrics)
         if compare_with_input:
@@ -607,15 +453,11 @@ def evaluate_dataset(
     return reduced_metrics, reduced_metrics_input
 
 
-def main(argv):
-    del argv
+def training():
     os.makedirs(FLAGS.output_dir, exist_ok=True)
 
-    gin.bind_parameter("training.output_dir", FLAGS.output_dir)
-    gin.parse_config_files_and_bindings(FLAGS.gin_file, FLAGS.gin_param)
-    train_cfg = training(output_dir=FLAGS.output_dir)
-    mse_loss_cfg = feature_mse_loss()
-    matching_config = matching_fit()
+    train_cfg = training_config(output_dir=FLAGS.output_dir)
+    loss_config = gaussian_attribute_loss_config()
     set_seed()
 
     with open(os.path.join(FLAGS.output_dir, "config.gin"), "w") as f:
@@ -625,7 +467,7 @@ def main(argv):
     wandb_run = init_wandb(FLAGS.output_dir)
     device = torch.device("cuda")
 
-    train_dataset = build_dataset("train_dataset")
+    train_dataset = build_dataset("train_dataset", alignment=FLAGS.alignment)
     test_dataset = build_dataset("test_dataset")
     filtered_scenes = write_filtered_scenes(
         FLAGS.output_dir,
@@ -637,14 +479,7 @@ def main(argv):
         )
 
     model = FeaturePredictor().to(device)
-    missing_outputs = sorted(
-        set(SUPPORTED_GS_KEYS) - set(model.output_features)
-    )
-    if missing_outputs:
-        raise ValueError(
-            f"FeaturePredictor.output_features must include all Gaussian "
-            f"attributes; missing {missing_outputs}"
-        )
+
     if model.resume_ckpt is not None:
         model.load_state_dict(torch.load(model.resume_ckpt, map_location="cpu"))
         logger.info(f"Loaded model checkpoint from {model.resume_ckpt}")
@@ -654,26 +489,14 @@ def main(argv):
     else:
         model.train()
 
-    requested_means_origin_scale = float(FLAGS.means_origin_scale)
-    if requested_means_origin_scale <= 0.0:
-        raise ValueError(f"--means_origin_scale must be > 0, got {requested_means_origin_scale}")
-    means_origin_scale = (
-        requested_means_origin_scale
-        if "means" in model.output_features
-        else 1.0
-    )
-
     training_brief = (
         f"Train SR MSE input_resolution={FLAGS.input_resolution} target_resolution={FLAGS.target_resolution}\n"
         f"train_scenes={len(train_dataset.folders)} test_scenes={len(test_dataset.folders)}\n"
         f"alignment={FLAGS.alignment} attribute_init={FLAGS.attribute_init}\n"
-        f"matching_cache_root={FLAGS.matching_cache_root}\n"
         f"loss_attributes={','.join(SUPPORTED_GS_KEYS)}\n"
         f"post_activate_loss={FLAGS.post_activate_loss}\n"
-        f"means_origin_scale={requested_means_origin_scale}\n"
-        f"effective_means_origin_scale={means_origin_scale}\n"
-        f"quat_direct_mse={mse_loss_cfg['quat_direct_mse']}\n"
-        f"loss_weights={mse_loss_cfg['loss_weights']}"
+        f"quat_direct_mse={loss_config.quat_direct_mse}\n"
+        f"loss_weights={loss_config.loss_weights}"
     )
     print(training_brief)
     logger.info(training_brief)
@@ -694,7 +517,6 @@ def main(argv):
     # Keep render-loss training gin keys accepted for compatibility; this script optimizes GS MSE only.
     _ = train_cfg["image_l1_loss_weight"]
     _ = train_cfg["lpips_loss_weight"]
-    _ = train_cfg["pretrain_steps"]
 
     scaler = torch.cuda.amp.GradScaler(enabled=enable_amp)
 
@@ -706,60 +528,22 @@ def main(argv):
         train_iter = iter(train_dataset)
         pbar = tqdm(range(resume_from_step, total_steps), desc="Training")
         for step in pbar:
-            try:
-                batch = next(train_iter)
-            except StopIteration:
-                train_iter = iter(train_dataset)
-                batch = next(train_iter)
-            input_resolution_entry = batch["multiresolution"][FLAGS.input_resolution]
-            target_resolution_entry = batch["multiresolution"][FLAGS.target_resolution]
-
-            target_gs = gpu_utils.move_to_device(
-                target_resolution_entry["gs_params"], device
-            )
-            aligned_input_gs, attribute_target_gs, alignment_info = prepare_alignment(
-                dataset=train_dataset,
-                scene={
-                    "scene_name": batch["scene_name"],
-                    "fit_lr_to_hr": batch["fit_lr_to_hr"],
-                },
-                input_resolution_entry=input_resolution_entry,
-                target_resolution_entry=target_resolution_entry,
-                target_images=target_resolution_entry["images"],
-                target_cameras=target_resolution_entry["cameras"],
-                target_gs=target_gs,
-                output_dir=os.path.join(FLAGS.output_dir, "train", batch["scene_name"]),
-                logger=logger,
-                device=device,
-                eval_chunk_size=len(target_resolution_entry["images"]),
-                alignment=FLAGS.alignment,
-                attribute_init=FLAGS.attribute_init,
-                emd_eps=FLAGS.emd_eps,
-                emd_iters=FLAGS.emd_iters,
-                input_resolution=FLAGS.input_resolution,
-                target_resolution=FLAGS.target_resolution,
-                matching_cache_root=FLAGS.matching_cache_root,
-                force_matching_fit=False,
-                matching_config=matching_config,
-                matching_optimizer_factory=build_matching_optimization,
-                input_images=input_resolution_entry["images"],
-                input_cameras=input_resolution_entry["cameras"],
-                write_artifacts=False,
-            )
-            loss_target_gs = scale_means_origin(
-                attribute_target_gs, means_origin_scale
+            batch = next(train_iter)
+            input_resolution_entry, target_resolution_entry, aligned_input_gs, attribute_target_gs, alignment_info = build_gaussian_pair(
+                train_dataset, batch, device
             )
             batch_gs = [aligned_input_gs]
             batch_scene_idx = [batch["scene_idx"]]
 
             with torch.cuda.amp.autocast(enabled=enable_amp):
                 out_gs = model(batch_normalized_gs=batch_gs, batch_scene_idx=batch_scene_idx)[0]
-                total_loss, feature_losses, weighted_feature_losses = compute_all_feature_mse_loss(
+                total_loss, feature_losses, weighted_feature_losses = compute_gaussian_attribute_loss(
                     out_gs=out_gs,
-                    target_gs=loss_target_gs,
-                    loss_weights=mse_loss_cfg["loss_weights"],
+                    target_gs=attribute_target_gs,
+                    loss_weights=loss_config.loss_weights,
                     post_activate_loss=FLAGS.post_activate_loss,
-                    quat_direct_mse=mse_loss_cfg["quat_direct_mse"],
+                    quat_direct_mse=loss_config.quat_direct_mse,
+                    means_loss_reduction=loss_config.means_loss_reduction,
                 )
 
             if enable_amp:
@@ -814,37 +598,6 @@ def main(argv):
                     f"alignment={alignment_info} {feature_loss_str} lr={optimizer.param_groups[0]['lr']:.8f}"
                 )
 
-            if step % log_image_interval == 0:
-                batch_cameras = gpu_utils.move_to_device(target_resolution_entry["cameras"], device)
-                batch_images = gpu_utils.move_to_device(target_resolution_entry["images"], device)
-                with torch.no_grad():
-                    log_out_gs = model(batch_normalized_gs=batch_gs, batch_scene_idx=batch_scene_idx)[0]
-                    log_out_gs = unscale_means_origin(log_out_gs, means_origin_scale)
-                    pred_imgs, _ = gs_utils.rasterize_gaussians_to_multiimgs(log_out_gs, batch_cameras)
-
-                pred_imgs_uint8 = [(im * 255).detach().cpu().numpy().astype(np.uint8) for im in pred_imgs]
-                pred_grid_rgb = gs_utils.make_grid(pred_imgs_uint8)
-                pred_grid = cv2.cvtColor(pred_grid_rgb, cv2.COLOR_RGB2BGR)
-                pred_path = os.path.join(FLAGS.output_dir, "train", f"{step:08d}_pred.png")
-                cv2.imwrite(pred_path, pred_grid)
-
-                gt_imgs_uint8 = [
-                    (img[..., :3] * 255).detach().cpu().numpy().astype(np.uint8) for img in batch_images
-                ]
-                gt_grid_rgb = gs_utils.make_grid(gt_imgs_uint8)
-                gt_grid = cv2.cvtColor(gt_grid_rgb, cv2.COLOR_RGB2BGR)
-                gt_path = os.path.join(FLAGS.output_dir, "train", f"{step:08d}_gt.png")
-                cv2.imwrite(gt_path, gt_grid)
-
-                if wandb is not None and wandb.run is not None:
-                    wandb_log(
-                        {
-                            "train/pred_grid": wandb.Image(pred_grid_rgb, caption=f"step={step} pred"),
-                            "train/gt_grid": wandb.Image(gt_grid_rgb, caption=f"step={step} gt"),
-                        },
-                        step=step,
-                    )
-
             if step % eval_interval == 0:
                 eval_dir = os.path.join(FLAGS.output_dir, "eval", f"{step:08d}")
                 metrics, metrics_input = evaluate_dataset(
@@ -856,7 +609,6 @@ def main(argv):
                     save_residuals=FLAGS.save_residuals,
                     output_gt=(step == 0),
                     wandb_step=step,
-                    means_origin_scale=means_origin_scale,
                 )
                 metric_str = " ".join([f"{k}: {v:.4f}" for k, v in metrics.items()])
                 logger.info(f"Eval step {step}: {metric_str}")
@@ -884,7 +636,6 @@ def main(argv):
         save_viewer=FLAGS.save_viewer,
         save_residuals=FLAGS.save_residuals,
         output_gt=True,
-        means_origin_scale=means_origin_scale,
     )
     metric_str = " ".join([f"{k}: {v:.4f}" for k, v in metrics.items()])
     logger.info(f"Final eval: {metric_str}")
@@ -896,6 +647,13 @@ def main(argv):
 
     if wandb_run is not None:
         wandb_run.finish()
+
+
+def main(argv):
+    del argv
+    gin.bind_parameter("training.output_dir", FLAGS.output_dir)
+    gin.parse_config_files_and_bindings(FLAGS.gin_file, FLAGS.gin_param)
+    training()
 
 
 if __name__ == "__main__":

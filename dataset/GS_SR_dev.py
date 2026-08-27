@@ -35,14 +35,14 @@ class SplatFactoSRDevDataset(torch.utils.data.IterableDataset):
         dataset_name: str = "objaverse",
         src_resolution: int = 128,
         tgt_resolution: int = 512,
-        load_gs: bool = True,
-        load_images: bool = True,
+        load_src_gs: bool = True,
+        load_tgt_gs: bool = True,
+        load_src_images: bool = True,
+        load_tgt_images: bool = True,
+        alignment: Optional[str] = None,
     ):
         if train_or_test not in ("train", "test"):
             raise ValueError("train_or_test must be either 'train' or 'test'")
-        if not load_gs and not load_images:
-            raise ValueError("At least one of load_gs or load_images must be enabled")
-
         self.train_or_test = train_or_test
         self.dataset_root = os.fspath(dataset_root)
         self.fit_lr_to_hr_root = os.fspath(fit_lr_to_hr_root)
@@ -58,8 +58,11 @@ class SplatFactoSRDevDataset(torch.utils.data.IterableDataset):
         self.dataset_name = dataset_name
         self.src_resolution = int(src_resolution)
         self.tgt_resolution = int(tgt_resolution)
-        self.load_gs = bool(load_gs)
-        self.load_images = bool(load_images)
+        self.load_src_gs = bool(load_src_gs)
+        self.load_tgt_gs = bool(load_tgt_gs)
+        self.load_src_images = bool(load_src_images)
+        self.load_tgt_images = bool(load_tgt_images)
+        self.alignment = alignment
         self.coordinate_frame = COORDINATE_FRAME
         self.coordinate_frame_version = COORDINATE_FRAME_VERSION
         if self.src_resolution == self.tgt_resolution:
@@ -74,9 +77,9 @@ class SplatFactoSRDevDataset(torch.utils.data.IterableDataset):
             self.counter = 0
 
     @classmethod
-    def from_gin_scope(cls, scope):
+    def from_gin_scope(cls, scope, **kwargs):
         with gin.config_scope(scope):
-            return cls()
+            return cls(**kwargs)
 
     @property
     def split_root(self):
@@ -214,9 +217,6 @@ class SplatFactoSRDevDataset(torch.utils.data.IterableDataset):
         valid_fit_alignments = (None, "emd", "random", "fit_lr_to_hr", "fit_hr_to_lr")
         if fit_alignment not in valid_fit_alignments:
             raise ValueError(f"Unsupported fit_alignment: {fit_alignment}")
-        if fit_alignment in ("fit_lr_to_hr", "fit_hr_to_lr") and not self.load_gs:
-            raise ValueError("Preloaded alignment requires load_gs=True")
-
         # 1. Calculate coordinate scaler from source GS
         src_gs_paths = scene_info["resolution_paths"][self.src_resolution]
         src_gs_raw, _ = gs_io.load_gsplat(src_gs_paths["gsplat_dir"])
@@ -230,8 +230,12 @@ class SplatFactoSRDevDataset(torch.utils.data.IterableDataset):
         normalized_gs = {}
         resolution_scalers = {self.src_resolution: coordinate_scaler}
         fitted_gs_pair = None
-        if self.load_gs:
+        needs_target_gs = self.load_tgt_gs or fit_alignment in (
+            "fit_lr_to_hr", "fit_hr_to_lr"
+        )
+        if self.load_src_gs:
             normalized_gs[self.src_resolution] = normalized_src_gs
+        if needs_target_gs:
             tgt_gs_paths = scene_info["resolution_paths"][self.tgt_resolution]
             tgt_gs_raw, _ = gs_io.load_gsplat(tgt_gs_paths["gsplat_dir"])
             tgt_gs_mask = self.processor.selection_mask(tgt_gs_raw)
@@ -279,9 +283,17 @@ class SplatFactoSRDevDataset(torch.utils.data.IterableDataset):
         background = self.build_background()
         for resolution in (self.src_resolution, self.tgt_resolution):
             res_data = {}
-            if self.load_gs:
+            load_gs = (
+                self.load_src_gs if resolution == self.src_resolution
+                else self.load_tgt_gs
+            )
+            load_images = (
+                self.load_src_images if resolution == self.src_resolution
+                else self.load_tgt_images
+            )
+            if load_gs:
                 res_data["gs_params"] = normalized_gs[resolution]
-            if self.load_images:
+            if load_images:
                 camera_data = self.load_camera_meta(
                     scene_info, resolution, coordinate_scaler
                 )
@@ -358,4 +370,6 @@ class SplatFactoSRDevDataset(torch.utils.data.IterableDataset):
             scene_idx = self.remaining_scenes.pop(0)
             if self.train_or_test == "train" and not self.remaining_scenes:
                 self.refresh_remaining_training()
-            yield self.load_scene(scene_idx, sample_views=True)
+            yield self.load_scene(
+                scene_idx, sample_views=True, fit_alignment=self.alignment
+            )

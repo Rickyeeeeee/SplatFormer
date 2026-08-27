@@ -1,12 +1,14 @@
 dataset_root = '/project/ricky/splatformer-sr-data'
 train_scene_list = '/project/ricky/splatformer-sr-data/psnr_filtered_scenes.csv'
-test_scene_list = '/project/ricky/splatformer-sr-data/test_valid_scenes.csv'
-fit_lr_to_hr_root = '/project/ricky/splatformer-sr-data/test-set-4x-up/objaverse'
-fit_hr_to_lr_root = '/project/ricky/splatformer-sr-data/test-set-4x-up/objaverse'
+test_scene_list = '/project/ricky/splatformer-sr-data/test_psnr_filtered_scenes.csv'
+train_fit_lr_to_hr_root = '/project/ricky/splatformer-sr-data/train-set-4x-up/objaverse'
+train_fit_hr_to_lr_root = '/project/ricky/splatformer-sr-data/train-set-4x-up/objaverse'
+test_fit_lr_to_hr_root = '/project/ricky/splatformer-sr-data/test-set-4x-up/objaverse'
+test_fit_hr_to_lr_root = '/project/ricky/splatformer-sr-data/test-set-4x-up/objaverse'
 
 SplatFactoSRDevDataset.dataset_root = %dataset_root
-SplatFactoSRDevDataset.fit_lr_to_hr_root = %fit_lr_to_hr_root
-SplatFactoSRDevDataset.fit_hr_to_lr_root = %fit_hr_to_lr_root
+SplatFactoSRDevDataset.fit_lr_to_hr_root = %train_fit_lr_to_hr_root
+SplatFactoSRDevDataset.fit_hr_to_lr_root = %train_fit_hr_to_lr_root
 SplatFactoSRDevDataset.train_scene_list = %train_scene_list
 SplatFactoSRDevDataset.test_scene_list = %test_scene_list
 SplatFactoSRDevDataset.dataset_name = 'objaverse'
@@ -16,13 +18,17 @@ SplatFactoSRDevDataset.max_gs_num = 1000000
 SplatFactoSRDevDataset.src_resolution = 128
 SplatFactoSRDevDataset.tgt_resolution = 512
 SplatFactoSRDevDataset.background_color = [0, 0, 0]
-SplatFactoSRDevDataset.load_gs = True
-SplatFactoSRDevDataset.load_images = True
+SplatFactoSRDevDataset.load_src_gs = True
+SplatFactoSRDevDataset.load_tgt_gs = True
+SplatFactoSRDevDataset.load_src_images = True
+SplatFactoSRDevDataset.load_tgt_images = True
 
 train_dataset/SplatFactoSRDevDataset.train_or_test = 'train'
 train_dataset/SplatFactoSRDevDataset.image_per_scene = 8
 train_dataset/SplatFactoSRDevDataset.split_across_gpus = True
 
 test_dataset/SplatFactoSRDevDataset.train_or_test = 'test'
+test_dataset/SplatFactoSRDevDataset.fit_lr_to_hr_root = %test_fit_lr_to_hr_root
+test_dataset/SplatFactoSRDevDataset.fit_hr_to_lr_root = %test_fit_hr_to_lr_root
 test_dataset/SplatFactoSRDevDataset.image_per_scene = None
 test_dataset/SplatFactoSRDevDataset.split_across_gpus = False

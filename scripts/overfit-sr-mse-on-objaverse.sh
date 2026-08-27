@@ -5,7 +5,7 @@ set -euo pipefail
 GPU_ID=${GPU_ID:-4}
 DATASET_ROOT=${DATASET_ROOT:-/project/ricky/splatformer-sr-data}
 TRAIN_SCENE_LIST=${TRAIN_SCENE_LIST:-${DATASET_ROOT}/psnr_filtered_scenes.csv}
-TEST_SCENE_LIST=${TEST_SCENE_LIST:-${DATASET_ROOT}/test_valid_scenes.csv}
+TEST_SCENE_LIST=${TEST_SCENE_LIST:-${DATASET_ROOT}/test_psnr_filtered_scenes.csv}
 FIT_LR_TO_HR_ROOT=${FIT_LR_TO_HR_ROOT:-${DATASET_ROOT}/test-set-4x-up/objaverse}
 FIT_HR_TO_LR_ROOT=${FIT_HR_TO_LR_ROOT:-${DATASET_ROOT}/test-set-4x-up/objaverse}
 scene_name=${SCENE_NAME:-3e288ee8aced4a0797e66d53536112b1}
@@ -90,12 +90,14 @@ TORCH_CUDNN_V8_API_DISABLED=1 CUDA_VISIBLE_DEVICES="${GPU_ID}" python overfit-sr
     --gin_param="dataset_root='${DATASET_ROOT}'" \
     --gin_param="train_scene_list='${TRAIN_SCENE_LIST}'" \
     --gin_param="test_scene_list='${TEST_SCENE_LIST}'" \
-    --gin_param="fit_lr_to_hr_root='${FIT_LR_TO_HR_ROOT}'" \
-    --gin_param="fit_hr_to_lr_root='${FIT_HR_TO_LR_ROOT}'" \
+    --gin_param="test_fit_lr_to_hr_root='${FIT_LR_TO_HR_ROOT}'" \
+    --gin_param="test_fit_hr_to_lr_root='${FIT_HR_TO_LR_ROOT}'" \
     --gin_param="SplatFactoSRDevDataset.src_resolution=${input_resolution}" \
     --gin_param="SplatFactoSRDevDataset.tgt_resolution=${target_resolution}" \
-    --gin_param="SplatFactoSRDevDataset.load_gs=True" \
-    --gin_param="SplatFactoSRDevDataset.load_images=True" \
+    --gin_param="SplatFactoSRDevDataset.load_src_gs=True" \
+    --gin_param="SplatFactoSRDevDataset.load_tgt_gs=True" \
+    --gin_param="SplatFactoSRDevDataset.load_src_images=True" \
+    --gin_param="SplatFactoSRDevDataset.load_tgt_images=True" \
     --gin_param="FeaturePredictor.output_features_type='${output_features_type}'" \
     --gin_param="FeaturePredictor.max_scale_normalized=${max_scale_normalized}" \
     --gin_param="FeaturePredictor.grid_resolution=${grid_resolution}" \

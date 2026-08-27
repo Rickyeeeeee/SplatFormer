@@ -426,8 +426,13 @@ def main(argv):
 
     # Load one input/target-resolution scene and its high-resolution evaluation views.
     dataset = SplatFactoSRDevDataset.from_gin_scope("test_dataset")
-    if not dataset.load_gs or not dataset.load_images:
-        raise ValueError("SR dev overfitting requires load_gs=True and load_images=True")
+    if not all((
+        dataset.load_src_gs,
+        dataset.load_tgt_gs,
+        dataset.load_src_images,
+        dataset.load_tgt_images,
+    )):
+        raise ValueError("SR dev overfitting requires every source and target payload")
     scene_idx = dataset.scene_index(FLAGS.scene_name)
     scene = dataset.load_scene(scene_idx, fit_alignment=FLAGS.alignment)
     training(

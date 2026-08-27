@@ -16,7 +16,7 @@ try:
 except ImportError:
     wandb = None
 
-from dataset.GS_SR import SplatFactoSRDataset
+from dataset.GS_SR_dev import SplatFactoSRDevDataset
 from models.feature_predictor import FeaturePredictor
 from utils import gpu_utils, gs_utils, loss_utils
 from utils.gpu_utils import seed_everything
@@ -58,11 +58,10 @@ def reduce_mean(value):
     return reduced
 
 
-@gin.configurable
-def training(
+@gin.configurable("training")
+def training_config(
     output_dir=None,
     total_steps=gin.REQUIRED,
-    pretrain_steps=gin.REQUIRED,
     eval_interval=gin.REQUIRED,
     log_interval=gin.REQUIRED,
     save_interval=gin.REQUIRED,
@@ -77,7 +76,6 @@ def training(
     return {
         "output_dir": output_dir,
         "total_steps": total_steps,
-        "pretrain_steps": pretrain_steps,
         "eval_interval": eval_interval,
         "log_interval": log_interval,
         "save_interval": save_interval,
@@ -130,23 +128,7 @@ def init_wandb(output_dir):
     )
 
 def build_dataset(scope):
-    dataset = SplatFactoSRDataset.from_gin_scope(scope)
-    required_resolutions = {FLAGS.input_resolution, FLAGS.target_resolution}
-    missing = sorted(required_resolutions - set(dataset.resolutions))
-    if missing:
-        raise ValueError(
-            f"{scope} dataset resolutions {sorted(dataset.resolutions)} do not include required resolutions {missing}"
-        )
-    configured_pair = (
-        dataset.fit_source_resolution, dataset.fit_target_resolution
-    )
-    requested_pair = (FLAGS.input_resolution, FLAGS.target_resolution)
-    if configured_pair != requested_pair:
-        raise ValueError(
-            f"{scope} dataset fitted pair {configured_pair[0]}->{configured_pair[1]} "
-            f"does not match requested pair {requested_pair[0]}->{requested_pair[1]}"
-        )
-    return dataset
+    return SplatFactoSRDevDataset.from_gin_scope(scope)
 
 
 def normalize_filtered_scene(split, filtered_scene):
@@ -452,46 +434,6 @@ def evaluate_single_scene(
                     filename=os.path.join(viewerdir, "point_cloud/02_gt_gs.ply"),
                 )
 
-        if save_residuals:
-            residual_type = "out_minus_input"
-            residual_keys = [key for key in predicted_keys if key in out_gs and key in input_gs_device]
-            if len(residual_keys) == 0:
-                residual_keys = sorted([key for key in out_gs.keys() if key in input_gs_device])
-
-            residuals = {}
-            residual_stats = {}
-            for key in residual_keys:
-                residual = out_gs[key] - input_gs_device[key]
-                residuals[key] = residual
-                residual_stats[key] = {
-                    "mean": float(residual.mean().item()),
-                    "abs_mean": float(residual.abs().mean().item()),
-                }
-
-            scene_stem = f"{int(scene_idx)}_{gs_utils.sanitize_for_filename(scene_name)}"
-            pt_payload = {
-                "scene_idx": int(scene_idx),
-                "scene_name": scene_name,
-                "residual_type": residual_type,
-                "residual_keys": residual_keys,
-                "residuals": to_cpu(residuals),
-                "input_gs": to_cpu(input_gs_device),
-                "output_gs": to_cpu(out_gs),
-                "cameras": to_cpu(eval_cameras),
-            }
-            torch.save(pt_payload, os.path.join(residual_dir, f"{scene_stem}.pt"))
-
-            stats_payload = {
-                "scene_idx": int(scene_idx),
-                "scene_name": scene_name,
-                "num_gaussians": int(input_gs_device["means"].shape[0]),
-                "residual_type": residual_type,
-                "residual_keys": residual_keys,
-                "residual_stats": residual_stats,
-            }
-            with open(os.path.join(residual_dir, f"{scene_stem}.json"), "w") as f:
-                json.dump(stats_payload, f, indent=2)
-
     metrics = metric_computer.finalize()
     with open(os.path.join(output_dir, "metrics.json"), "w") as f:
         json.dump(image_metrics, f, indent=2)
@@ -543,14 +485,12 @@ def evaluate_dataset(
         scene_name = scene_info["scene_name"]
         try:
             scene = dataset.load_scene(scene_idx)
-            input_resolution_entry = scene["resolution_data"][FLAGS.input_resolution]
-            target_resolution_entry = scene["resolution_data"][FLAGS.target_resolution]
-            eval_images, image_names, eval_cameras = dataset.load_resolution_views(target_resolution_entry)
-            input_gs = gs_utils.convert_gaussian_frame(
-                input_resolution_entry["gs_params"],
-                input_resolution_entry["scaler"],
-                target_resolution_entry["scaler"],
-            )
+            input_resolution_entry = scene["data"][dataset.src_resolution]
+            target_resolution_entry = scene["data"][dataset.tgt_resolution]
+            eval_images = target_resolution_entry["images"]
+            image_names = target_resolution_entry["images_name"]
+            eval_cameras = target_resolution_entry["cameras"]
+            input_gs = input_resolution_entry["gs_params"]
 
             scene_output_dir = os.path.join(output_dir, scene["scene_name"])
             metrics, metrics_input, metrics_gt_low_res, metrics_gt_high_res = evaluate_single_scene(
@@ -559,7 +499,7 @@ def evaluate_dataset(
                 gt_gs=target_resolution_entry["gs_params"],
                 low_res_gt_gs=input_gs,
                 evaluate_baselines=evaluate_baselines,
-                scene_idx=scene["idx"],
+                scene_idx=scene["scene_idx"],
                 scene_name=scene["scene_name"],
                 eval_images=eval_images,
                 eval_cameras=eval_cameras,
@@ -600,7 +540,7 @@ def evaluate_dataset(
             all_metrics_gt_high_res.append(metrics_gt_high_res)
             all_metrics_input.append(metrics_input)
         scene_metrics = {
-            "scene_idx": scene["idx"],
+            "scene_idx": scene["scene_idx"],
             "scene_name": scene["scene_name"],
             "output_gs": metrics,
         }
@@ -698,8 +638,7 @@ def evaluate_dataset(
     )
 
 
-def main(argv):
-    del argv
+def training():
     distributed = int(os.environ.get("WORLD_SIZE", "1")) > 1
     if distributed:
         dist.init_process_group(backend="nccl")
@@ -711,9 +650,7 @@ def main(argv):
 
     os.makedirs(FLAGS.output_dir, exist_ok=True)
 
-    gin.bind_parameter("training.output_dir", FLAGS.output_dir)
-    gin.parse_config_files_and_bindings(FLAGS.gin_file, FLAGS.gin_param)
-    train_cfg = training(output_dir=FLAGS.output_dir)
+    train_cfg = training_config(output_dir=FLAGS.output_dir)
     set_seed(rank=rank)
 
     logger = (
@@ -785,7 +722,6 @@ def main(argv):
     empty_cache_fre = train_cfg["empty_cache_fre"]
     image_l1_loss_weight = train_cfg["image_l1_loss_weight"]
     lpips_loss_weight = train_cfg["lpips_loss_weight"]
-    _ = train_cfg["pretrain_steps"]
 
     scaler = torch.cuda.amp.GradScaler(enabled=enable_amp)
     lpips_loss_func = loss_utils.lpips_loss_fn() if lpips_loss_weight > 0 else None
@@ -810,15 +746,10 @@ def main(argv):
             except StopIteration:
                 train_iter = iter(train_dataset)
                 batch = next(train_iter)
-            input_resolution_entry = batch["multiresolution"][FLAGS.input_resolution]
-            target_resolution_entry = batch["multiresolution"][FLAGS.target_resolution]
+            input_resolution_entry = batch["data"][train_dataset.src_resolution]
+            target_resolution_entry = batch["data"][train_dataset.tgt_resolution]
 
             input_gs = gpu_utils.move_to_device(input_resolution_entry["gs_params"], device)
-            input_gs = gs_utils.convert_gaussian_frame(
-                input_gs,
-                input_resolution_entry["scaler"],
-                target_resolution_entry["scaler"],
-            )
             batch_scene_idx = [batch["scene_idx"]]
             batch_cameras = gpu_utils.move_to_device(target_resolution_entry["cameras"], device)
             batch_images = gpu_utils.move_to_device(target_resolution_entry["images"], device)
@@ -875,9 +806,6 @@ def main(argv):
                     "psnr": reduce_mean(train_psnr),
                     "input_gaussians": reduce_mean(
                         total_loss.new_tensor(input_resolution_entry["gs_params"]["means"].shape[0])
-                    ),
-                    "target_gaussians": reduce_mean(
-                        total_loss.new_tensor(target_resolution_entry["gs_params"]["means"].shape[0])
                     ),
                     "views": reduce_mean(total_loss.new_tensor(len(batch_images))),
                 }
@@ -1007,6 +935,13 @@ def main(argv):
     if distributed:
         dist.barrier()
         dist.destroy_process_group()
+
+
+def main(argv):
+    del argv
+    gin.bind_parameter("training.output_dir", FLAGS.output_dir)
+    gin.parse_config_files_and_bindings(FLAGS.gin_file, FLAGS.gin_param)
+    training()
 
 
 if __name__ == "__main__":
