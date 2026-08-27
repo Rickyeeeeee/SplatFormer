@@ -1,9 +1,9 @@
 # Unified all-attribute SR-MSE training.
+
 set_seed.seed = 42
 
 total_steps = 200000
 training.total_steps = %total_steps
-training.pretrain_steps = 0
 training.eval_interval = 2000
 training.save_interval = 2000
 training.log_interval = 20
@@ -13,32 +13,8 @@ training.resume_from_step = 0
 training.enable_amp = True
 training.empty_cache_fre = -1
 
-# Render supervision is used only to construct fit_lr_to_hr/fit_hr_to_lr pairs.
-matching_total_steps = 2000
-matching_fit.total_steps = %matching_total_steps
-matching_fit.image_per_step = 32
-matching_fit.log_interval = 20
-matching_fit.preview_interval = 200
-matching_fit.grad_clip_norm = 0.0
-matching_fit.enable_amp = True
-matching_fit.empty_cache_fre = -1
-
-matching_fit/build_3DGSoptimizer.lr_dict = {
-    "base": 1e-3,
-    "means": 1.6e-4,
-    "features_dc": 2.5e-3,
-    "features_rest": 1.25e-4,
-    "opacities": 5e-2,
-    "scales": 5e-3,
-    "quats": 1e-3,
-}
-matching_fit/build_3DGSoptimizer.optimizer_type = 'adam'
-matching_fit/build_3DGSoptimizer.optimizer_params = {'eps': 1e-15}
-matching_fit/build_scheduler.total_step = %matching_total_steps
-matching_fit/build_scheduler.schedule = 'constant'
-
 # All six attributes are always supervised; these values only weight their MSE terms.
-feature_mse_loss.loss_weights = {
+gaussian_attribute_loss_config.loss_weights = {
     "means": 100.0,
     "features_dc": 1.0,
     "features_rest": 1.0,
@@ -46,7 +22,7 @@ feature_mse_loss.loss_weights = {
     "scales": 1.0,
     "quats": 10.0,
 }
-feature_mse_loss.quat_direct_mse = False
+gaussian_attribute_loss_config.quat_direct_mse = False
 
 train2D/build_optimizer.lr_dict = {
     "base": 3e-4,

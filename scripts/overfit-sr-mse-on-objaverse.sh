@@ -3,6 +3,11 @@
 set -euo pipefail
 
 GPU_ID=${GPU_ID:-4}
+DATASET_ROOT=${DATASET_ROOT:-/project/ricky/splatformer-sr-data}
+TRAIN_SCENE_LIST=${TRAIN_SCENE_LIST:-${DATASET_ROOT}/psnr_filtered_scenes.csv}
+TEST_SCENE_LIST=${TEST_SCENE_LIST:-${DATASET_ROOT}/test_valid_scenes.csv}
+FIT_LR_TO_HR_ROOT=${FIT_LR_TO_HR_ROOT:-${DATASET_ROOT}/test-set-4x-up/objaverse}
+FIT_HR_TO_LR_ROOT=${FIT_HR_TO_LR_ROOT:-${DATASET_ROOT}/test-set-4x-up/objaverse}
 scene_name=${SCENE_NAME:-3e288ee8aced4a0797e66d53536112b1}
 
 total_steps=${1:-1000}
@@ -18,13 +23,7 @@ direct_prediction=${10:-${DIRECT_PREDICTION:-false}}
 gs_statistics_path=${11:-${GS_STATISTICS_PATH:-}}
 
 grid_resolution=${GRID_RESOLUTION:-384}
-matching_steps=${MATCHING_STEPS:-2000}
-matching_image_per_step=${MATCHING_IMAGE_PER_STEP:-16}
-matching_l1_weight=${MATCHING_L1_LOSS_WEIGHT:-1.0}
-matching_lpips_weight=${MATCHING_LPIPS_LOSS_WEIGHT:-1.0}
-matching_cache_root=${MATCHING_CACHE_ROOT:-/project2/ricky/splatformer-data-to-4x}
-force_matching_fit=${FORCE_MATCHING_FIT:-false}
-output_root=${OUTPUT_ROOT:-/project2/ricky/experiments/0825}
+output_root=${OUTPUT_ROOT:-/project2/ricky/experiments/0827/input_frame_v1}
 to_bit() {
     case "$1" in
         true|True|TRUE|1|yes|Yes|YES) echo 1 ;;
@@ -70,7 +69,7 @@ if [ -n "${gs_statistics_path}" ]; then
     gs_statistics_args=(--gs_statistics_path="${gs_statistics_path}")
 fi
 
-out_name=${scene_name}_${alignment}_${attribute_init}_ir${input_resolution}_tr${target_resolution}_grid${grid_resolution}${stats_suffix}
+out_name=${scene_name}_${alignment}_${attribute_init}_ir${input_resolution}_tr${target_resolution}_grid${grid_resolution}_input_frame_v1${stats_suffix}
 output_dir=${output_root}/${out_name}
 
 echo "Using GPU: ${GPU_ID}"
@@ -83,23 +82,24 @@ TORCH_CUDNN_V8_API_DISABLED=1 CUDA_VISIBLE_DEVICES="${GPU_ID}" python overfit-sr
     --scene_name="${scene_name}" \
     --alignment="${alignment}" \
     --attribute_init="${attribute_init}" \
-    --input_resolution="${input_resolution}" \
-    --target_resolution="${target_resolution}" \
     --post_activate_loss="${post_activate_loss}" \
-    --matching_cache_root="${matching_cache_root}" \
-    --force_matching_fit="${force_matching_fit}" \
     "${gs_statistics_args[@]}" \
     --gin_file=configs/model/ptv3.gin \
+    --gin_file=configs/dataset/objaverse-sr-dev.gin \
     --gin_file=configs/overfit/sr_mse.gin \
-    --gin_file=configs/dataset/objaverse-sr.gin \
+    --gin_param="dataset_root='${DATASET_ROOT}'" \
+    --gin_param="train_scene_list='${TRAIN_SCENE_LIST}'" \
+    --gin_param="test_scene_list='${TEST_SCENE_LIST}'" \
+    --gin_param="fit_lr_to_hr_root='${FIT_LR_TO_HR_ROOT}'" \
+    --gin_param="fit_hr_to_lr_root='${FIT_HR_TO_LR_ROOT}'" \
+    --gin_param="SplatFactoSRDevDataset.src_resolution=${input_resolution}" \
+    --gin_param="SplatFactoSRDevDataset.tgt_resolution=${target_resolution}" \
+    --gin_param="SplatFactoSRDevDataset.load_gs=True" \
+    --gin_param="SplatFactoSRDevDataset.load_images=True" \
     --gin_param="FeaturePredictor.output_features_type='${output_features_type}'" \
     --gin_param="FeaturePredictor.max_scale_normalized=${max_scale_normalized}" \
     --gin_param="FeaturePredictor.grid_resolution=${grid_resolution}" \
     --gin_param="total_steps=${total_steps}" \
     --gin_param="training.save_interval=${save_interval}" \
     --gin_param="training.eval_interval=${eval_interval}" \
-    --gin_param="training.log_image_interval=${log_image_interval}" \
-    --gin_param="matching_total_steps=${matching_steps}" \
-    --gin_param="matching_fit.image_per_step=${matching_image_per_step}" \
-    --gin_param="matching_fit.image_l1_loss_weight=${matching_l1_weight}" \
-    --gin_param="matching_fit.lpips_loss_weight=${matching_lpips_weight}"
+    --gin_param="training.log_image_interval=${log_image_interval}"

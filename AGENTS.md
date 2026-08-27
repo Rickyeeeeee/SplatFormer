@@ -15,6 +15,8 @@ utilities, training/evaluation scripts, and generated-data tooling.
 ## Code Guidelines
 
 - Add concise single-line comments for important code sections.
+- Keep function calls on one line when the complete call fits naturally; do
+  not expand a simple `function(arg)` call across three lines unnecessarily.
 - Do not introduce local helper functions unless they are necessary. Put
   genuinely reusable functionality in the appropriate module under `utils/`.
 - This is research code: prefer direct, readable implementations and minimize

@@ -247,11 +247,14 @@ def build_densified_input(
     input_gs = gpu_utils.move_to_device(input_factor_dict["gs_params"], device)
     target_gs = gpu_utils.move_to_device(target_factor_dict["gs_params"], device)
     target_count = target_gs["means"].shape[0]
-    input_in_target_frame = gs_utils.convert_gaussian_frame(
-        input_gs,
-        input_factor_dict["scaler"],
-        target_factor_dict["scaler"],
-    )
+    if "scaler" not in input_factor_dict and "scaler" not in target_factor_dict:
+        input_in_target_frame = input_gs
+    else:
+        input_in_target_frame = gs_utils.convert_gaussian_frame(
+            input_gs,
+            input_factor_dict["scaler"],
+            target_factor_dict["scaler"],
+        )
     interpolated_gs = midpoint_interpolate_gaussians(
         input_in_target_frame, target_count
     )

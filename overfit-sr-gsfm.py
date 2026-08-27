@@ -8,7 +8,7 @@ import torch
 from absl import app, flags
 from tqdm import tqdm
 
-from dataset.GS_SR import SplatFactoSRDataset
+from dataset.GS_SR_dev import SplatFactoSRDevDataset
 from models.feature_flow_predictor import GSFlowPredictor
 from models.feature_predictor import FeaturePredictor  # Registers legacy Gin keys.
 from sr import flow
@@ -19,7 +19,7 @@ from utils.gs_utils import make_grid
 from utils.log_utils import ProcessSafeLogger
 from utils.loss_utils import SUPPORTED_GS_KEYS
 from utils.metrics import MetricComputer
-from utils.optimizers import build_3DGSoptimizer, build_optimizer, build_scheduler
+from utils.optimizers import build_optimizer, build_scheduler
 
 
 flags.DEFINE_string("output_dir", "output_overfit_gsfm_noemd", "Output directory")
@@ -27,18 +27,10 @@ flags.DEFINE_string("eval_subdir", "eval_final", "Eval subdirectory")
 flags.DEFINE_string("scene_name", "", "Scene name to overfit")
 flags.DEFINE_boolean("compare_with_input", False, "Compare with input 3DGS")
 flags.DEFINE_boolean("save_viewer", True, "Save viewer point clouds")
-flags.DEFINE_integer("input_resolution", 128, "Low-resolution GS resolution used as flow source")
-flags.DEFINE_integer("target_resolution", 512, "High-resolution GS/image resolution used as flow target")
 flags.DEFINE_enum("alignment", "emd", ["emd", "random", "fit_lr_to_hr", "fit_hr_to_lr"], "Matching modes")
 flags.DEFINE_enum("attribute_init", "aligned", ["aligned", "3dgs"], "attribute initialization for emd and random.",)
 flags.DEFINE_float("emd_eps", 0.01, "Auction EMD epsilon")
 flags.DEFINE_integer("emd_iters", 100, "Auction EMD iterations")
-flags.DEFINE_string("matching_cache_root", "/project2/ricky/splatformer-data-to-4x", "Reverse-fit cache")
-flags.DEFINE_boolean(
-    "force_matching_fit",
-    False,
-    "Rerun the selected fit without reading or writing its persistent cache",
-)
 flags.DEFINE_multi_string("gin_file", None, "List of paths to the config files.")
 flags.DEFINE_multi_string("gin_param", "", "Newline separated list of Gin parameter bindings.")
 
@@ -50,39 +42,6 @@ MEANS_LOSS_REDUCTION = "mean"  # Set to "sum" to match PUFM-style summed point l
 @gin.configurable
 def set_seed(seed):
     seed_everything(seed)
-
-
-@gin.configurable
-def training(
-    output_dir=None,
-    total_steps=gin.REQUIRED,
-    pretrain_steps=gin.REQUIRED,
-    eval_interval=gin.REQUIRED,
-    log_interval=gin.REQUIRED,
-    save_interval=gin.REQUIRED,
-    log_image_interval=gin.REQUIRED,
-    grad_clip_norm=gin.REQUIRED,
-    image_l1_loss_weight=1.0,
-    lpips_loss_weight=0.0,
-    resume_from_step=0,
-    enable_amp=False,
-    empty_cache_fre=-1,
-):
-    return {
-        "output_dir": output_dir,
-        "total_steps": total_steps,
-        "pretrain_steps": pretrain_steps,
-        "eval_interval": eval_interval,
-        "log_interval": log_interval,
-        "save_interval": save_interval,
-        "log_image_interval": log_image_interval,
-        "grad_clip_norm": grad_clip_norm,
-        "image_l1_loss_weight": image_l1_loss_weight,
-        "lpips_loss_weight": lpips_loss_weight,
-        "resume_from_step": resume_from_step,
-        "enable_amp": enable_amp,
-        "empty_cache_fre": empty_cache_fre,
-    }
 
 
 @gin.configurable
@@ -119,38 +78,6 @@ def loss_mixing(schedule="linear"):
             f"expected one of {valid_schedules}"
         )
     return {"schedule": schedule}
-
-
-@gin.configurable
-def matching_fit(
-    total_steps=1000,
-    image_per_step=16,
-    log_interval=20,
-    preview_interval=200,
-    grad_clip_norm=0.0,
-    image_l1_loss_weight=1.0,
-    lpips_loss_weight=1.0,
-    enable_amp=True,
-    empty_cache_fre=-1,
-):
-    return {
-        "total_steps": total_steps,
-        "image_per_step": image_per_step,
-        "log_interval": log_interval,
-        "preview_interval": preview_interval,
-        "grad_clip_norm": grad_clip_norm,
-        "image_l1_loss_weight": image_l1_loss_weight,
-        "lpips_loss_weight": lpips_loss_weight,
-        "enable_amp": enable_amp,
-        "empty_cache_fre": empty_cache_fre,
-    }
-
-
-def build_matching_optimization(gaussians):
-    with gin.config_scope("matching_fit"):
-        optimizer = build_3DGSoptimizer(gaussians)
-        scheduler = build_scheduler(optimizer)
-    return optimizer, scheduler
 
 
 @gin.configurable
@@ -360,58 +287,74 @@ def evaluate_single_scene(
     return metrics, metrics_input
 
 
-def main(argv):
-    del argv
-    os.makedirs(FLAGS.output_dir, exist_ok=True)
-
-    gin.parse_config_files_and_bindings(FLAGS.gin_file, FLAGS.gin_param)
-    train_cfg = training(output_dir=FLAGS.output_dir)
+@gin.configurable
+def training(
+    dataset,
+    scene,
+    output_dir,
+    logger,
+    device,
+    total_steps=gin.REQUIRED,
+    eval_interval=gin.REQUIRED,
+    log_interval=gin.REQUIRED,
+    save_interval=gin.REQUIRED,
+    log_image_interval=gin.REQUIRED,
+    grad_clip_norm=gin.REQUIRED,
+    image_l1_loss_weight=1.0,
+    lpips_loss_weight=0.0,
+    resume_from_step=0,
+    enable_amp=False,
+    empty_cache_fre=-1,
+):
     flow_cfg = flow_matching()
     if not (0.0 < float(flow_cfg["flow_t_eps"]) < 0.5):
         raise ValueError(f"flow_t_eps must be in (0, 0.5), got {flow_cfg['flow_t_eps']}")
     mix_cfg = loss_mixing()
     mse_loss_cfg = feature_mse_loss()
-    set_seed()
+    input_resolution = dataset.src_resolution
+    target_resolution = dataset.tgt_resolution
+    if scene["coordinate_frame"] != "input_resolution":
+        raise ValueError("SR dev overfitting requires input_resolution coordinates")
+    input_resolution_entry = scene["data"][input_resolution]
+    target_resolution_entry = scene["data"][target_resolution]
 
-    logger = ProcessSafeLogger(os.path.join(FLAGS.output_dir, "overfit.log")).get_logger()
-    device = torch.device("cuda")
-
-    dataset = SplatFactoSRDataset.from_gin_scope("test_dataset")
-    scene_idx = dataset.scene_index(FLAGS.scene_name)
-    scene = dataset.load_scene(scene_idx)
-    input_resolution_entry = scene["resolution_data"][FLAGS.input_resolution]
-    target_resolution_entry = scene["resolution_data"][FLAGS.target_resolution]
-
-    target_images, target_image_names, target_cameras = dataset.load_resolution_views(target_resolution_entry)
+    target_images = target_resolution_entry["images"]
+    target_image_names = target_resolution_entry["images_name"]
+    target_cameras = target_resolution_entry["cameras"]
 
     target_gs = gpu_utils.move_to_device(target_resolution_entry["gs_params"], device)
     eval_chunk_size = dataset.image_per_scene or len(target_images)
     if eval_chunk_size <= 0:
         eval_chunk_size = len(target_images)
 
-    source_gs, matching_target_gs, alignment_info = prepare_alignment(
-        dataset=dataset,
-        scene=scene,
-        input_resolution_entry=input_resolution_entry,
-        target_resolution_entry=target_resolution_entry,
-        target_images=target_images,
-        target_cameras=target_cameras,
-        target_gs=target_gs,
-        output_dir=FLAGS.output_dir,
-        logger=logger,
-        device=device,
-        eval_chunk_size=eval_chunk_size,
-        alignment=FLAGS.alignment,
-        attribute_init=FLAGS.attribute_init,
-        emd_eps=FLAGS.emd_eps,
-        emd_iters=FLAGS.emd_iters,
-        input_resolution=FLAGS.input_resolution,
-        target_resolution=FLAGS.target_resolution,
-        matching_cache_root=FLAGS.matching_cache_root,
-        force_matching_fit=FLAGS.force_matching_fit,
-        matching_config=matching_fit(),
-        matching_optimizer_factory=build_matching_optimization,
-    )
+    if FLAGS.alignment == "fit_lr_to_hr":
+        source_gs = gpu_utils.move_to_device(input_resolution_entry["gs_params"], device)
+        matching_target_gs = gpu_utils.move_to_device(scene[FLAGS.alignment]["tgt_gs"], device)
+        alignment_info = {"status": "dataset_preloaded", "direction": FLAGS.alignment}
+    elif FLAGS.alignment == "fit_hr_to_lr":
+        source_gs = gpu_utils.move_to_device(scene[FLAGS.alignment]["tgt_gs"], device)
+        matching_target_gs = target_gs
+        alignment_info = {"status": "dataset_preloaded", "direction": FLAGS.alignment}
+    else:
+        source_gs, matching_target_gs, alignment_info = prepare_alignment(
+            dataset=dataset,
+            scene=scene,
+            input_resolution_entry=input_resolution_entry,
+            target_resolution_entry=target_resolution_entry,
+            target_images=target_images,
+            target_cameras=target_cameras,
+            target_gs=target_gs,
+            output_dir=output_dir,
+            logger=logger,
+            device=device,
+            eval_chunk_size=eval_chunk_size,
+            alignment=FLAGS.alignment,
+            attribute_init=FLAGS.attribute_init,
+            emd_eps=FLAGS.emd_eps,
+            emd_iters=FLAGS.emd_iters,
+            input_resolution=input_resolution,
+            target_resolution=target_resolution,
+        )
 
     model = GSFlowPredictor().to(device)
     missing_outputs = sorted(set(SUPPORTED_GS_KEYS) - set(model.output_features))
@@ -421,7 +364,9 @@ def main(argv):
             f"attributes; missing {missing_outputs}"
         )
     if model.resume_ckpt is not None:
-        model.load_state_dict(torch.load(model.resume_ckpt, map_location="cpu"))
+        raise ValueError(
+            "GS_SR_dev overfitting does not support resume_ckpt; start from scratch"
+        )
     model.train()
 
     loss_target_gs = matching_target_gs
@@ -451,26 +396,15 @@ def main(argv):
         flow_loss_weights = {key: 1.0 for key in SUPPORTED_GS_KEYS}
     else:
         flow_loss_weights = mse_loss_cfg["loss_weights"]
-    batch_scene_idx = [scene["idx"]]
+    batch_scene_idx = [scene["scene_idx"]]
 
     with gin.config_scope("train2D"):
         optimizer = build_optimizer(model)
         scheduler = build_scheduler(optimizer)
 
-    with open(os.path.join(FLAGS.output_dir, "config.gin"), "w") as f:
+    with open(os.path.join(output_dir, "config.gin"), "w") as f:
         f.writelines(gin.operative_config_str())
 
-    total_steps = train_cfg["total_steps"]
-    log_interval = train_cfg["log_interval"]
-    log_image_interval = train_cfg["log_image_interval"]
-    save_interval = train_cfg["save_interval"]
-    eval_interval = train_cfg["eval_interval"]
-    grad_clip_norm = train_cfg["grad_clip_norm"]
-    resume_from_step = train_cfg["resume_from_step"]
-    enable_amp = train_cfg["enable_amp"]
-    empty_cache_fre = train_cfg["empty_cache_fre"]
-    image_l1_loss_weight = train_cfg["image_l1_loss_weight"]
-    lpips_loss_weight = train_cfg["lpips_loss_weight"]
     is_fm_only = mix_cfg["schedule"] == "fm-only"
     render_view_count = 0
     if not is_fm_only:
@@ -481,12 +415,12 @@ def main(argv):
     scaler = torch.cuda.amp.GradScaler(enabled=enable_amp)
     lpips_loss_func = loss_utils.lpips_loss_fn() if not is_fm_only and lpips_loss_weight > 0 else None
 
-    print(
-        f"GSFM scene={scene['scene_name']} idx={scene['idx']} "
+    training_brief = (
+        f"GSFM scene={scene['scene_name']} idx={scene['scene_idx']} "
         f"target_views={len(target_images)} "
         f"input_gaussians={input_resolution_entry['gs_params']['means'].shape[0]} "
         f"matching_target_gaussians={matching_target_gs['means'].shape[0]} "
-        f"input_resolution={FLAGS.input_resolution} target_resolution={FLAGS.target_resolution} "
+        f"input_resolution={input_resolution} target_resolution={target_resolution} "
         f"alignment={FLAGS.alignment} "
         f"attribute_init={FLAGS.attribute_init if FLAGS.alignment in {'emd', 'random'} else 'inactive'} "
         f"alignment_info={alignment_info} "
@@ -501,18 +435,26 @@ def main(argv):
         f"lpips_loss_weight={lpips_loss_weight} "
         f"render_views_per_step={render_view_count} "
         f"quat_direct_mse={mse_loss_cfg['quat_direct_mse']} "
-        f"loss_weights={flow_loss_weights}"
+        f"loss_weights={flow_loss_weights}\n"
+        f"dataset_class={type(dataset).__name__} "
+        f"coordinate_frame={scene['coordinate_frame']} "
+        f"coordinate_frame_version={scene['coordinate_frame_version']} "
+        f"coordinate_resolution={scene['coordinate_resolution']}\n"
+        f"fit_lr_to_hr_root={dataset.fit_lr_to_hr_root}\n"
+        f"fit_hr_to_lr_root={dataset.fit_hr_to_lr_root}"
     )
+    print(training_brief)
+    logger.info(training_brief)
 
-    os.makedirs(os.path.join(FLAGS.output_dir, "train"), exist_ok=True)
-    os.makedirs(os.path.join(FLAGS.output_dir, "checkpoints"), exist_ok=True)
+    os.makedirs(os.path.join(output_dir, "train"), exist_ok=True)
+    os.makedirs(os.path.join(output_dir, "checkpoints"), exist_ok=True)
 
     train_images_device = gpu_utils.move_to_device(target_images, device)
     train_cameras_device = gpu_utils.move_to_device(target_cameras, device)
     gt_imgs_uint8 = [(img[..., :3] * 255).detach().cpu().numpy().astype(np.uint8) for img in train_images_device]
     if len(gt_imgs_uint8) > 0:
         gt_grid = cv2.cvtColor(make_grid(gt_imgs_uint8), cv2.COLOR_RGB2BGR)
-        cv2.imwrite(os.path.join(FLAGS.output_dir, "train", "00000000_gt.png"), gt_grid)
+        cv2.imwrite(os.path.join(output_dir, "train", "00000000_gt.png"), gt_grid)
 
     optimizer.zero_grad(set_to_none=True)
     pbar = tqdm(range(resume_from_step, total_steps))
@@ -522,7 +464,9 @@ def main(argv):
         t = torch.empty(1, device=device).uniform_(flow_t_eps, 1.0 - flow_t_eps)
         if not is_fm_only:
             camera_indices = np.random.permutation(len(target_images))[:render_view_count]
-            train_images, _, train_cameras = dataset.load_resolution_views(target_resolution_entry, camera_ids=camera_indices)
+            train_images = [target_images[index] for index in camera_indices]
+            train_cameras = dict(target_cameras)
+            train_cameras["camera_to_worlds"] = target_cameras["camera_to_worlds"][camera_indices]
             train_images = gpu_utils.move_to_device(train_images, device)
             train_cameras = gpu_utils.move_to_device(train_cameras, device)
         query_flow_gs, flow_noise, gamma, gamma_dot = flow.sample_stochastic_interpolant(
@@ -646,16 +590,22 @@ def main(argv):
         if step % log_image_interval == 0:
             with torch.no_grad():
                 train_out_gs = flow.sample_flow_model(
-                    model, source_flow_gs, scene["idx"], int(flow_cfg["flow_steps"])
+                    model, source_flow_gs, scene["scene_idx"], int(flow_cfg["flow_steps"])
                 )
                 pred_imgs, _ = gs_utils.rasterize_gaussians_to_multiimgs(train_out_gs, train_cameras_device)
                 pred_imgs_uint8 = [(im * 255).detach().cpu().numpy().astype(np.uint8) for im in pred_imgs[:9]]
                 if len(pred_imgs_uint8) > 0:
                     pred_grid = cv2.cvtColor(make_grid(pred_imgs_uint8), cv2.COLOR_RGB2BGR)
-                    cv2.imwrite(os.path.join(FLAGS.output_dir, "train", f"{step:08d}_pred.png"), pred_grid)
+                    cv2.imwrite(os.path.join(output_dir, "train", f"{step:08d}_pred.png"), pred_grid)
 
-        if step % eval_interval == 0:
-            eval_base_dir = os.path.join(FLAGS.output_dir, "eval", f"{step:08d}")
+        is_final_step = step == total_steps - 1
+        if step % eval_interval == 0 or is_final_step:
+            eval_base_dir = (
+                os.path.join(output_dir, FLAGS.eval_subdir)
+                if is_final_step
+                else os.path.join(output_dir, "eval", f"{step:08d}")
+            )
+            eval_label = "Final eval" if is_final_step else f"Eval step {step}"
             for eval_flow_steps in EVAL_FLOW_STEPS:
                 eval_dir = os.path.join(eval_base_dir, f"flow_steps_{eval_flow_steps:02d}")
                 metrics, metrics_input = evaluate_single_scene(
@@ -663,7 +613,7 @@ def main(argv):
                     input_gs=source_gs,
                     source_flow_gs=source_flow_gs,
                     gt_gs=matching_target_gs,
-                    scene_idx=scene["idx"],
+                    scene_idx=scene["scene_idx"],
                     scene_name=scene["scene_name"],
                     eval_images=target_images,
                     eval_cameras=target_cameras,
@@ -673,48 +623,44 @@ def main(argv):
                     eval_chunk_size=eval_chunk_size,
                     compare_with_input=FLAGS.compare_with_input,
                     save_viewer=FLAGS.save_viewer,
-                    output_gt=(step == 0 and eval_flow_steps == EVAL_FLOW_STEPS[0]),
+                    output_gt=((step == 0 or is_final_step) and eval_flow_steps == EVAL_FLOW_STEPS[0]),
                 )
                 metric_str = " ".join([f"{k}: {v:.4f}" for k, v in metrics.items()])
-                logger.info(f"Eval step {step} flow_steps={eval_flow_steps}: {metric_str}")
-                print(f"Eval step {step} flow_steps={eval_flow_steps}: {metric_str}")
+                logger.info(f"{eval_label} flow_steps={eval_flow_steps}: {metric_str}")
+                print(f"{eval_label} flow_steps={eval_flow_steps}: {metric_str}")
                 if FLAGS.compare_with_input:
                     metric_str = " ".join([f"{k}: {v:.4f}" for k, v in metrics_input.items()])
-                    print(f"Eval input step {step} flow_steps={eval_flow_steps}: {metric_str}")
+                    if is_final_step:
+                        logger.info(f"{eval_label} input flow_steps={eval_flow_steps}: {metric_str}")
+                    print(f"{eval_label} input flow_steps={eval_flow_steps}: {metric_str}")
 
         if (step + 1) % save_interval == 0:
-            torch.save(model.state_dict(), os.path.join(FLAGS.output_dir, "checkpoints", f"model_{step:08d}.pth"))
+            torch.save(model.state_dict(), os.path.join(output_dir, "checkpoints", f"model_{step:08d}.pth"))
 
-    torch.save(model.state_dict(), os.path.join(FLAGS.output_dir, "checkpoints", "model_last.pth"))
+    torch.save(model.state_dict(), os.path.join(output_dir, "checkpoints", "model_last.pth"))
 
-    final_eval_base_dir = os.path.join(FLAGS.output_dir, FLAGS.eval_subdir)
-    for eval_flow_steps in EVAL_FLOW_STEPS:
-        final_eval_dir = os.path.join(final_eval_base_dir, f"flow_steps_{eval_flow_steps:02d}")
-        metrics, metrics_input = evaluate_single_scene(
-            model=model,
-            input_gs=source_gs,
-            source_flow_gs=source_flow_gs,
-            gt_gs=matching_target_gs,
-            scene_idx=scene["idx"],
-            scene_name=scene["scene_name"],
-            eval_images=target_images,
-            eval_cameras=target_cameras,
-            image_names=target_image_names,
-            output_dir=final_eval_dir,
-            flow_steps=int(eval_flow_steps),
-            eval_chunk_size=eval_chunk_size,
-            compare_with_input=FLAGS.compare_with_input,
-            save_viewer=FLAGS.save_viewer,
-            output_gt=(eval_flow_steps == EVAL_FLOW_STEPS[0]),
-        )
 
-        metric_str = " ".join([f"{k}: {v:.4f}" for k, v in metrics.items()])
-        logger.info(f"Final eval flow_steps={eval_flow_steps}: {metric_str}")
-        print(f"Final eval flow_steps={eval_flow_steps}: {metric_str}")
-        if FLAGS.compare_with_input:
-            metric_str = " ".join([f"{k}: {v:.4f}" for k, v in metrics_input.items()])
-            logger.info(f"Final eval input flow_steps={eval_flow_steps}: {metric_str}")
-            print(f"Final eval input flow_steps={eval_flow_steps}: {metric_str}")
+def main(argv):
+    del argv
+    output_dir = FLAGS.output_dir
+    os.makedirs(output_dir, exist_ok=True)
+    gin.parse_config_files_and_bindings(FLAGS.gin_file, FLAGS.gin_param)
+    set_seed()
+    logger = ProcessSafeLogger(os.path.join(output_dir, "overfit.log")).get_logger()
+    device = torch.device("cuda")
+
+    dataset = SplatFactoSRDevDataset.from_gin_scope("test_dataset")
+    if not dataset.load_gs or not dataset.load_images:
+        raise ValueError("SR dev overfitting requires load_gs=True and load_images=True")
+    scene_idx = dataset.scene_index(FLAGS.scene_name)
+    scene = dataset.load_scene(scene_idx, fit_alignment=FLAGS.alignment)
+    training(
+        dataset=dataset,
+        scene=scene,
+        output_dir=output_dir,
+        logger=logger,
+        device=device,
+    )
 
 
 if __name__ == "__main__":

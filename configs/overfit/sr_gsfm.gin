@@ -3,7 +3,6 @@ set_seed.seed = 42
 
 total_steps = 200000
 training.total_steps = %total_steps
-training.pretrain_steps = 0
 training.eval_interval = 2000
 training.save_interval = 2000
 training.log_interval = 20
@@ -22,32 +21,6 @@ flow_matching.loss_type = 'velocity'
 flow_matching.velocity_variance_floor = 1e-8
 
 loss_mixing.schedule = 'free-range-gs'
-
-# Fixed-cardinality gsplat fit that establishes the flow target correspondence.
-matching_total_steps = 2000
-matching_fit.total_steps = %matching_total_steps
-matching_fit.image_per_step = 32
-matching_fit.log_interval = 20
-matching_fit.preview_interval = 200
-matching_fit.grad_clip_norm = 0.0
-matching_fit.image_l1_loss_weight = 1.0
-matching_fit.lpips_loss_weight = 1.0
-matching_fit.enable_amp = True
-matching_fit.empty_cache_fre = -1
-
-matching_fit/build_3DGSoptimizer.lr_dict = {
-    'base': 1e-3,
-    'means': 1.6e-4,
-    'features_dc': 2.5e-3,
-    'features_rest': 1.25e-4,
-    'opacities': 5e-2,
-    'scales': 5e-3,
-    'quats': 1e-3,
-}
-matching_fit/build_3DGSoptimizer.optimizer_type = 'adam'
-matching_fit/build_3DGSoptimizer.optimizer_params = {'eps': 1e-15}
-matching_fit/build_scheduler.total_step = %matching_total_steps
-matching_fit/build_scheduler.schedule = 'constant'
 
 # All six Gaussian attributes are always supervised.
 # These weights apply to the x1 objective; velocity loss uses unit attribute weights.

@@ -142,11 +142,14 @@ def build_matching_source(input_resolution_dict, target_resolution_dict, device)
     input_gs = gpu_utils.move_to_device(
         input_resolution_dict["gs_params"], device
     )
-    source_gs = gs_utils.convert_gaussian_frame(
-        input_gs,
-        input_resolution_dict["scaler"],
-        target_resolution_dict["scaler"],
-    )
+    if "scaler" not in input_resolution_dict and "scaler" not in target_resolution_dict:
+        source_gs = input_gs
+    else:
+        source_gs = gs_utils.convert_gaussian_frame(
+            input_gs,
+            input_resolution_dict["scaler"],
+            target_resolution_dict["scaler"],
+        )
     if source_gs["means"].shape[0] != input_gs["means"].shape[0]:
         raise RuntimeError("Matching source construction changed the Gaussian count")
     return source_gs

@@ -1,9 +1,21 @@
 import json
+from dataclasses import dataclass
 
+import gin
 import torch
 import torch.nn.functional as F
 
 SUPPORTED_GS_KEYS = ["means", "features_dc", "features_rest", "opacities", "scales", "quats"]
+
+
+@dataclass(frozen=True)
+class GaussianAttributeLossConfig:
+    """Fixed options for the all-attribute Gaussian loss."""
+
+    loss_weights: dict
+    quat_direct_mse: bool
+    means_loss_reduction: str
+
 def load_gs_statistics_normalizers(
     stats_path,
     target_resolution,
@@ -106,51 +118,6 @@ def load_gs_statistics_normalizers(
     return normalizers, selected_statistics
 
 
-def unique_preserve_order(values):
-    seen = set()
-    unique = []
-    for value in values:
-        if value not in seen:
-            seen.add(value)
-            unique.append(value)
-    return unique
-
-
-def parse_loss_features(
-    raw_loss_features,
-    model,
-    target_gs,
-    supported_keys=SUPPORTED_GS_KEYS,
-    no_features_message="No Gaussian attributes selected for MSE loss",
-):
-    if raw_loss_features is None or raw_loss_features.strip() == "":
-        loss_features = list(getattr(model, "output_features", []))
-    else:
-        loss_features = [feature.strip() for feature in raw_loss_features.split(",") if feature.strip()]
-
-    loss_features = unique_preserve_order(loss_features)
-    if len(loss_features) == 0:
-        raise ValueError(no_features_message)
-
-    unsupported = [feature for feature in loss_features if feature not in supported_keys]
-    if unsupported:
-        raise ValueError(
-            f"Unsupported loss feature(s): {unsupported}. "
-            f"Supported features are: {list(supported_keys)}"
-        )
-
-    missing = [feature for feature in loss_features if feature not in target_gs]
-    if missing:
-        raise ValueError(f"Selected loss feature(s) missing from target GS: {missing}")
-
-    return loss_features
-
-
-def fixed_attribute_keys(loss_features, target_gs, supported_keys=SUPPORTED_GS_KEYS):
-    loss_set = set(loss_features)
-    return [key for key in supported_keys if key in target_gs and key not in loss_set]
-
-
 def feature_loss_value(
     key,
     pred: torch.Tensor,
@@ -170,9 +137,6 @@ def feature_loss_value(
                 return normalized_error.mean()
             if means_loss_reduction == "sum":
                 return normalized_error.sum()
-            raise ValueError(
-                f"Unsupported means_loss_reduction={means_loss_reduction}; expected 'mean' or 'sum'"
-            )
         return normalized_error.square().mean()
     if key == "means":
         # error = (pred - target).square()
@@ -181,10 +145,6 @@ def feature_loss_value(
             return error.mean()
         if means_loss_reduction == "sum":
             return error.sum()
-        raise ValueError(
-            f"Unsupported means_loss_reduction={means_loss_reduction}; expected 'mean' or 'sum'"
-        )
-
 
 
     if key == "opacities" and post_activate_loss:
@@ -201,66 +161,57 @@ def feature_loss_value(
     return F.mse_loss(pred, target)
 
 
-def feature_mse_loss(
+@gin.configurable
+def gaussian_attribute_loss_config(
+    loss_weights=None,
+    quat_direct_mse=False,
+    means_loss_reduction="mean",
+):
+    """Return fixed options for the all-attribute Gaussian loss."""
+    resolved_weights = {key: 1.0 for key in SUPPORTED_GS_KEYS}
+    if loss_weights is not None:
+        resolved_weights.update(loss_weights)
+    return GaussianAttributeLossConfig(
+        loss_weights=resolved_weights,
+        quat_direct_mse=quat_direct_mse,
+        means_loss_reduction=means_loss_reduction,
+    )
+
+
+def compute_gaussian_attribute_loss(
     out_gs,
     target_gs,
-    loss_features,
-    loss_weights=None,
+    loss_weights,
     post_activate_loss=False,
     quat_direct_mse=False,
     means_loss_reduction="mean",
     component_normalizers=None,
-    output_label="model output",
-    total_loss_error="No MSE losses were computed",
-    grad_error=(
-        "Selected loss features do not receive gradients. "
-        "Make sure FeaturePredictor.output_features includes at least one selected loss feature."
-    ),
 ):
+    """Compute and weight every Gaussian attribute loss."""
     losses = {}
     weighted_losses = {}
-    total_loss = None
-    if loss_weights is None:
-        loss_weights = {key: 1.0 for key in loss_features}
-
-    for key in loss_features:
-        if key not in out_gs:
-            raise ValueError(f"Selected loss feature '{key}' missing from {output_label}")
-        if key not in target_gs:
-            raise ValueError(f"Selected loss feature '{key}' missing from target GS")
-        if out_gs[key].shape != target_gs[key].shape:
-            raise ValueError(
-                f"Shape mismatch for loss feature '{key}': "
-                f"output {tuple(out_gs[key].shape)} vs target {tuple(target_gs[key].shape)}"
-            )
+    total_loss = 0.0
+    for key in SUPPORTED_GS_KEYS:
         pred = out_gs[key]
-        component_normalizer = None
-        if component_normalizers is not None and key in component_normalizers:
-            component_normalizer = component_normalizers[key].to(device=pred.device, dtype=pred.dtype)
-            if component_normalizer.shape != pred.shape[1:]:
-                raise ValueError(
-                    f"Normalizer shape mismatch for loss feature '{key}': "
-                    f"normalizer {tuple(component_normalizer.shape)} vs feature {tuple(pred.shape[1:])}"
-                )
         target = target_gs[key].to(device=pred.device, dtype=pred.dtype)
+        normalizer = None
+        if component_normalizers is not None:
+            normalizer = component_normalizers.get(key)
+            if normalizer is not None:
+                normalizer = normalizer.to(device=pred.device, dtype=pred.dtype)
         loss = feature_loss_value(
             key,
             pred,
             target,
             post_activate_loss=post_activate_loss,
             quat_direct_mse=quat_direct_mse,
-            component_normalizer=component_normalizer,
             means_loss_reduction=means_loss_reduction,
+            component_normalizer=normalizer,
         )
-        weighted_loss = float(loss_weights.get(key, 1.0)) * loss
+        weighted_loss = loss_weights[key] * loss
         losses[key] = loss
         weighted_losses[key] = weighted_loss
-        total_loss = weighted_loss if total_loss is None else total_loss + weighted_loss
-
-    if total_loss is None:
-        raise ValueError(total_loss_error)
-    if not total_loss.requires_grad:
-        raise ValueError(grad_error)
+        total_loss = total_loss + weighted_loss
     return total_loss, losses, weighted_losses
 
 
