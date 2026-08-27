@@ -8,7 +8,7 @@ import torch
 from absl import app, flags
 from tqdm import tqdm
 
-from dataset.GS_SR_dev import SplatFactoSRDevDataset
+from dataset.GS_SR import SplatFactoSRDataset
 from models.feature_flow_predictor import GSFlowPredictor
 from models.feature_predictor import FeaturePredictor  # Registers legacy Gin keys.
 from sr import flow
@@ -365,7 +365,7 @@ def training(
         )
     if model.resume_ckpt is not None:
         raise ValueError(
-            "GS_SR_dev overfitting does not support resume_ckpt; start from scratch"
+            "GS_SR overfitting does not support resume_ckpt; start from scratch"
         )
     model.train()
 
@@ -649,7 +649,7 @@ def main(argv):
     logger = ProcessSafeLogger(os.path.join(output_dir, "overfit.log")).get_logger()
     device = torch.device("cuda")
 
-    dataset = SplatFactoSRDevDataset.from_gin_scope("test_dataset")
+    dataset = SplatFactoSRDataset.from_gin_scope("test_dataset")
     if not all((
         dataset.load_src_gs,
         dataset.load_tgt_gs,

@@ -54,7 +54,7 @@ train2D/build_scheduler.schedule = 'linear'
 flow_matching.gs_statistics_path = '/project/ricky/splatformer-sr-data/gs_statistics.json'
 
 # The trainer enables target images dynamically for render-loss schedules.
-train_dataset/SplatFactoSRDevDataset.load_src_gs = True
-train_dataset/SplatFactoSRDevDataset.load_tgt_gs = True
-train_dataset/SplatFactoSRDevDataset.load_src_images = False
-train_dataset/SplatFactoSRDevDataset.load_tgt_images = False
+train_dataset/SplatFactoSRDataset.load_src_gs = True
+train_dataset/SplatFactoSRDataset.load_tgt_gs = True
+train_dataset/SplatFactoSRDataset.load_src_images = False
+train_dataset/SplatFactoSRDataset.load_tgt_images = False

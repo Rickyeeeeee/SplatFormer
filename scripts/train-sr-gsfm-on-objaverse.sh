@@ -33,14 +33,14 @@ CUDA_VISIBLE_DEVICES=${GPU_ID} python train-sr-gsfm.py \
     --alignment="${ALIGNMENT}" \
     --attribute_init="${ATTRIBUTE_INIT}" \
     --gin_file=configs/model/ptv3_flow.gin \
-    --gin_file=configs/dataset/objaverse-sr-dev.gin \
+    --gin_file=configs/dataset/objaverse-sr.gin \
     --gin_file=configs/train/sr_gsfm.gin \
     --gin_param="GSFlowPredictor.grid_resolution=1024" \
     --gin_param="dataset_root='${DATASET_ROOT}'" \
     --gin_param="train_scene_list='${TRAIN_SCENE_LIST}'" \
     --gin_param="test_scene_list='${TEST_SCENE_LIST}'" \
-    --gin_param="SplatFactoSRDevDataset.src_resolution=${INPUT_RESOLUTION}" \
-    --gin_param="SplatFactoSRDevDataset.tgt_resolution=${TARGET_RESOLUTION}" \
+    --gin_param="SplatFactoSRDataset.src_resolution=${INPUT_RESOLUTION}" \
+    --gin_param="SplatFactoSRDataset.tgt_resolution=${TARGET_RESOLUTION}" \
     --gin_param="flow_matching.gs_statistics_path='${GS_STATISTICS_PATH}'" \
     --gin_param="flow_matching.flow_steps=${FLOW_STEPS}" \
     --gin_param="flow_matching.flow_noise_std=${FLOW_NOISE_STD}" \

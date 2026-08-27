@@ -14,7 +14,7 @@ try:
 except ImportError:
     wandb = None
 
-from dataset.GS_SR_dev import SplatFactoSRDevDataset
+from dataset.GS_SR import SplatFactoSRDataset
 from models.feature_predictor import FeaturePredictor
 from sr.alignment import prepare_alignment
 from utils import gpu_utils, gs_utils
@@ -158,7 +158,7 @@ def wandb_log(data, step=None):
 
 
 def build_dataset(scope, alignment=None):
-    return SplatFactoSRDevDataset.from_gin_scope(scope, alignment=alignment)
+    return SplatFactoSRDataset.from_gin_scope(scope, alignment=alignment)
 
 
 def build_gaussian_pair(dataset, scene, device):

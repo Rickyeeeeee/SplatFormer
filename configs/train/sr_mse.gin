@@ -39,9 +39,9 @@ train2D/build_scheduler.schedule = 'constant'
 
 
 # GS-only training; evaluation retains images for render metrics.
-SplatFactoSRDevDataset.max_gs_num = 100000
-train_dataset/SplatFactoSRDevDataset.load_src_gs = True
-train_dataset/SplatFactoSRDevDataset.load_tgt_gs = True
-train_dataset/SplatFactoSRDevDataset.load_src_images = False
-train_dataset/SplatFactoSRDevDataset.load_tgt_images = False
-train_dataset/SplatFactoSRDevDataset.split_across_gpus = False
+SplatFactoSRDataset.max_gs_num = 100000
+train_dataset/SplatFactoSRDataset.load_src_gs = True
+train_dataset/SplatFactoSRDataset.load_tgt_gs = True
+train_dataset/SplatFactoSRDataset.load_src_images = False
+train_dataset/SplatFactoSRDataset.load_tgt_images = False
+train_dataset/SplatFactoSRDataset.split_across_gpus = False

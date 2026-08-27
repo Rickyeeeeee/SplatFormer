@@ -26,13 +26,13 @@ torchrun --nnodes=1 --nproc_per_node="${NGPUS}" --rdzv-endpoint="localhost:${MAS
     --input_resolution="${INPUT_RESOLUTION}" \
     --target_resolution="${TARGET_RESOLUTION}" \
     --gin_file=configs/model/ptv3.gin \
-    --gin_file=configs/dataset/objaverse-sr-dev.gin \
+    --gin_file=configs/dataset/objaverse-sr.gin \
     --gin_file=configs/train/sr.gin \
     --gin_param="dataset_root=\"${DATASET_ROOT}\"" \
     --gin_param="train_scene_list=\"${TRAIN_SCENE_LIST}\"" \
     --gin_param="test_scene_list=\"${TEST_SCENE_LIST}\"" \
-    --gin_param="SplatFactoSRDevDataset.src_resolution=${INPUT_RESOLUTION}" \
-    --gin_param="SplatFactoSRDevDataset.tgt_resolution=${TARGET_RESOLUTION}" \
+    --gin_param="SplatFactoSRDataset.src_resolution=${INPUT_RESOLUTION}" \
+    --gin_param="SplatFactoSRDataset.tgt_resolution=${TARGET_RESOLUTION}" \
     --gin_param="total_steps=${TOTAL_STEPS}" \
     --gin_param="training.save_interval=${SAVE_INTERVAL}" \
     --gin_param="training.eval_interval=${EVAL_INTERVAL}" \

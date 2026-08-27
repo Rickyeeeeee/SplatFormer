@@ -45,19 +45,19 @@ CUDA_VISIBLE_DEVICES=${GPU_ID} python overfit-sr-gsfm.py \
     --gin_param="flow_matching.loss_type='${flow_loss_type}'" \
     --gin_param="flow_matching.flow_t_eps=${flow_t_eps}" \
     --gin_file=configs/model/ptv3_flow.gin \
-    --gin_file=configs/dataset/objaverse-sr-dev.gin \
+    --gin_file=configs/dataset/objaverse-sr.gin \
     --gin_file=configs/overfit/sr_gsfm.gin \
     --gin_param="dataset_root='${DATASET_ROOT}'" \
     --gin_param="train_scene_list='${TRAIN_SCENE_LIST}'" \
     --gin_param="test_scene_list='${TEST_SCENE_LIST}'" \
     --gin_param="test_fit_lr_to_hr_root='${FIT_LR_TO_HR_ROOT}'" \
     --gin_param="test_fit_hr_to_lr_root='${FIT_HR_TO_LR_ROOT}'" \
-    --gin_param="SplatFactoSRDevDataset.src_resolution=${input_resolution}" \
-    --gin_param="SplatFactoSRDevDataset.tgt_resolution=${target_resolution}" \
-    --gin_param="SplatFactoSRDevDataset.load_src_gs=True" \
-    --gin_param="SplatFactoSRDevDataset.load_tgt_gs=True" \
-    --gin_param="SplatFactoSRDevDataset.load_src_images=True" \
-    --gin_param="SplatFactoSRDevDataset.load_tgt_images=True" \
+    --gin_param="SplatFactoSRDataset.src_resolution=${input_resolution}" \
+    --gin_param="SplatFactoSRDataset.tgt_resolution=${target_resolution}" \
+    --gin_param="SplatFactoSRDataset.load_src_gs=True" \
+    --gin_param="SplatFactoSRDataset.load_tgt_gs=True" \
+    --gin_param="SplatFactoSRDataset.load_src_images=True" \
+    --gin_param="SplatFactoSRDataset.load_tgt_images=True" \
     --gin_param="PointTransformerV3FlowModel.drop_path=${ptv3_drop_path}" \
     --gin_param="PointTransformerV3FlowModel.shuffle_orders=${ptv3_shuffle_orders}" \
     --gin_param="PointTransformerV3FlowModel.shuffle_orders_eval=${ptv3_shuffle_orders_eval}" \

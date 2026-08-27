@@ -85,19 +85,19 @@ TORCH_CUDNN_V8_API_DISABLED=1 CUDA_VISIBLE_DEVICES="${GPU_ID}" python overfit-sr
     --post_activate_loss="${post_activate_loss}" \
     "${gs_statistics_args[@]}" \
     --gin_file=configs/model/ptv3.gin \
-    --gin_file=configs/dataset/objaverse-sr-dev.gin \
+    --gin_file=configs/dataset/objaverse-sr.gin \
     --gin_file=configs/overfit/sr_mse.gin \
     --gin_param="dataset_root='${DATASET_ROOT}'" \
     --gin_param="train_scene_list='${TRAIN_SCENE_LIST}'" \
     --gin_param="test_scene_list='${TEST_SCENE_LIST}'" \
     --gin_param="test_fit_lr_to_hr_root='${FIT_LR_TO_HR_ROOT}'" \
     --gin_param="test_fit_hr_to_lr_root='${FIT_HR_TO_LR_ROOT}'" \
-    --gin_param="SplatFactoSRDevDataset.src_resolution=${input_resolution}" \
-    --gin_param="SplatFactoSRDevDataset.tgt_resolution=${target_resolution}" \
-    --gin_param="SplatFactoSRDevDataset.load_src_gs=True" \
-    --gin_param="SplatFactoSRDevDataset.load_tgt_gs=True" \
-    --gin_param="SplatFactoSRDevDataset.load_src_images=True" \
-    --gin_param="SplatFactoSRDevDataset.load_tgt_images=True" \
+    --gin_param="SplatFactoSRDataset.src_resolution=${input_resolution}" \
+    --gin_param="SplatFactoSRDataset.tgt_resolution=${target_resolution}" \
+    --gin_param="SplatFactoSRDataset.load_src_gs=True" \
+    --gin_param="SplatFactoSRDataset.load_tgt_gs=True" \
+    --gin_param="SplatFactoSRDataset.load_src_images=True" \
+    --gin_param="SplatFactoSRDataset.load_tgt_images=True" \
     --gin_param="FeaturePredictor.output_features_type='${output_features_type}'" \
     --gin_param="FeaturePredictor.max_scale_normalized=${max_scale_normalized}" \
     --gin_param="FeaturePredictor.grid_resolution=${grid_resolution}" \

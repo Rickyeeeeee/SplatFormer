@@ -57,13 +57,13 @@ CUDA_VISIBLE_DEVICES=${GPU_ID} python train-sr-mse.py \
     --attribute_init="${ATTRIBUTE_INIT}" \
     --post_activate_loss="${POST_ACTIVATE_LOSS}" \
     --gin_file=configs/model/ptv3.gin \
-    --gin_file=configs/dataset/objaverse-sr-dev.gin \
+    --gin_file=configs/dataset/objaverse-sr.gin \
     --gin_file=configs/train/sr_mse.gin \
     --gin_param="dataset_root=\"${DATASET_ROOT}\"" \
     --gin_param="train_scene_list=\"${TRAIN_SCENE_LIST}\"" \
     --gin_param="test_scene_list=\"${TEST_SCENE_LIST}\"" \
-    --gin_param="SplatFactoSRDevDataset.src_resolution=${INPUT_RESOLUTION}" \
-    --gin_param="SplatFactoSRDevDataset.tgt_resolution=${TARGET_RESOLUTION}" \
+    --gin_param="SplatFactoSRDataset.src_resolution=${INPUT_RESOLUTION}" \
+    --gin_param="SplatFactoSRDataset.tgt_resolution=${TARGET_RESOLUTION}" \
     --gin_param="FeaturePredictor.output_features_type=\"${OUTPUT_FEATURES_TYPE}\"" \
     --gin_param="FeaturePredictor.max_scale_normalized=${MAX_SCALE_NORMALIZED}" \
     --gin_param="FeaturePredictor.grid_resolution=1024" \
@@ -71,7 +71,7 @@ CUDA_VISIBLE_DEVICES=${GPU_ID} python train-sr-mse.py \
     --gin_param="training.save_interval=${SAVE_INTERVAL}" \
     --gin_param="training.eval_interval=${EVAL_INTERVAL}" \
     --gin_param="training.log_image_interval=${LOG_IMAGE_INTERVAL}" \
-    --gin_param="train_dataset/SplatFactoSRDevDataset.load_src_gs=True" \
-    --gin_param="train_dataset/SplatFactoSRDevDataset.load_tgt_gs=True" \
-    --gin_param="train_dataset/SplatFactoSRDevDataset.load_src_images=False" \
-    --gin_param="train_dataset/SplatFactoSRDevDataset.load_tgt_images=False"
+    --gin_param="train_dataset/SplatFactoSRDataset.load_src_gs=True" \
+    --gin_param="train_dataset/SplatFactoSRDataset.load_tgt_gs=True" \
+    --gin_param="train_dataset/SplatFactoSRDataset.load_src_images=False" \
+    --gin_param="train_dataset/SplatFactoSRDataset.load_tgt_images=False"

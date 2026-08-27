@@ -16,7 +16,7 @@ try:
 except ImportError:
     wandb = None
 
-from dataset.GS_SR_dev import SplatFactoSRDevDataset
+from dataset.GS_SR import SplatFactoSRDataset
 from models.feature_predictor import FeaturePredictor
 from utils import gpu_utils, gs_utils, loss_utils
 from utils.gpu_utils import seed_everything
@@ -128,7 +128,7 @@ def init_wandb(output_dir):
     )
 
 def build_dataset(scope):
-    return SplatFactoSRDevDataset.from_gin_scope(scope)
+    return SplatFactoSRDataset.from_gin_scope(scope)
 
 
 def normalize_filtered_scene(split, filtered_scene):

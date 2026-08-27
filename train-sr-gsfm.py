@@ -14,7 +14,7 @@ try:
 except ImportError:
     wandb = None
 
-from dataset.GS_SR_dev import SplatFactoSRDevDataset
+from dataset.GS_SR import SplatFactoSRDataset
 from models.feature_flow_predictor import GSFlowPredictor
 from models.feature_predictor import FeaturePredictor  # Registers legacy Gin keys.
 from sr import flow
@@ -315,7 +315,7 @@ def wandb_log(values, step=None):
 
 
 def build_dataset(scope, alignment=None, **kwargs):
-    return SplatFactoSRDevDataset.from_gin_scope(scope, alignment=alignment, **kwargs)
+    return SplatFactoSRDataset.from_gin_scope(scope, alignment=alignment, **kwargs)
 
 
 def build_gaussian_pair(dataset, scene, device):

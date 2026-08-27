@@ -10,7 +10,7 @@ import torch
 from absl import app, flags
 from tqdm import tqdm
 
-from dataset.GS_SR_dev import SplatFactoSRDevDataset
+from dataset.GS_SR import SplatFactoSRDataset
 from models.feature_predictor import FeaturePredictor
 from sr.alignment import prepare_alignment
 from utils import gpu_utils, gs_utils
@@ -425,7 +425,7 @@ def main(argv):
     device = torch.device("cuda")
 
     # Load one input/target-resolution scene and its high-resolution evaluation views.
-    dataset = SplatFactoSRDevDataset.from_gin_scope("test_dataset")
+    dataset = SplatFactoSRDataset.from_gin_scope("test_dataset")
     if not all((
         dataset.load_src_gs,
         dataset.load_tgt_gs,
