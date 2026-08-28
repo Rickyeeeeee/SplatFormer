@@ -1,6 +1,6 @@
 [submodule "Pointcept"]
 	path = Pointcept
-	url = https://github.com/ChenYutongTHU/Pointcept.git
+	url = https://github.com/Rickyeeeeee/Pointcept.git
 [submodule "DataGenerator"]
 	path = DataGenerator
 	url = https://github.com/Rickyeeeeee/SplatFormerDataGenerator.git
