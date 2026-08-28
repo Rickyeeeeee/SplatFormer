@@ -1,10 +1,10 @@
 # Unified all-attribute GSFM training with four alignment modes.
 set_seed.seed = 42
 
-total_steps = 200000
+total_steps = 600000
 training.total_steps = %total_steps
-training.eval_interval = 2000
-training.save_interval = 2000
+training.eval_interval = 6000
+training.save_interval = 6000
 training.log_interval = 20
 training.log_image_interval = 2000
 training.grad_clip_norm = 2.0
@@ -20,7 +20,7 @@ flow_matching.flow_t_eps = 1e-4
 flow_matching.loss_type = 'velocity'
 flow_matching.velocity_variance_floor = 1e-8
 
-loss_mixing.schedule = 'free-range-gs'
+loss_mixing.schedule = 'fm-only'
 
 # All six Gaussian attributes are always supervised.
 # These weights apply to the x1 objective; velocity loss uses unit attribute weights.
@@ -35,15 +35,15 @@ feature_mse_loss.loss_weights = {
 feature_mse_loss.quat_direct_mse = False
 
 train2D/build_optimizer.lr_dict = {
-    'base': 3e-4,
-    'embedding': 3e-4,
-    'backbone': 3e-4,
-    'features_dc': 3e-4,
+    'base': 3e-5,
+    'embedding': 3e-5,
+    'backbone': 3e-5,
+    'features_dc': 3e-5,
     'features_rest': 1.5e-6,
-    'scales': 3e-3,
-    'opacities': 3e-4,
-    'quats': 3e-4,
-    'means': 3e-4,
+    'scales': 3e-5,
+    'opacities': 3e-5,
+    'quats': 3e-5,
+    'means': 3e-5,
 }
 train2D/build_optimizer.optimizer_type = 'adam'
 train2D/build_optimizer.optimizer_params = {'eps': 1e-15}

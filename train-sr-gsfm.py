@@ -46,7 +46,7 @@ flags.DEFINE_multi_string("gin_file", None, "List of paths to the config files."
 flags.DEFINE_multi_string("gin_param", "", "Newline separated list of Gin parameter bindings.")
 
 FLAGS = flags.FLAGS
-EVAL_FLOW_STEPS = [1, 5, 20]
+EVAL_FLOW_STEPS = [10]
 MEANS_LOSS_REDUCTION = "mean"  # Set to "sum" to match PUFM-style summed point loss.
 
 
