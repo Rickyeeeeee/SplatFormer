@@ -2,15 +2,15 @@
 set -euo pipefail
 
 GPU_ID=${GPU_ID:-8}
-TOTAL_STEPS=${1:-600000}
-SAVE_INTERVAL=${2:-6000}
-EVAL_INTERVAL=${3:-6000}
+TOTAL_STEPS=${1:-1000000}
+SAVE_INTERVAL=${2:-10000}
+EVAL_INTERVAL=${3:-10000}
 LOG_IMAGE_INTERVAL=${4:-1000}
 ALIGNMENT=${5:-${ALIGNMENT:-fit_lr_to_hr}}
 ATTRIBUTE_INIT=${6:-${ATTRIBUTE_INIT:-aligned}}
 INPUT_RESOLUTION=${7:-${INPUT_RESOLUTION:-128}}
 TARGET_RESOLUTION=${8:-${TARGET_RESOLUTION:-512}}
-MIX_SCHEDULE=${9:-${MIX_SCHEDULE:-linear}}
+MIX_SCHEDULE=${9:-${MIX_SCHEDULE:-fm-only}}
 FLOW_LOSS_TYPE=${10:-${FLOW_LOSS_TYPE:-velocity}}
 FLOW_STEPS=${11:-${FLOW_STEPS:-5}}
 FLOW_NOISE_STD=${12:-${FLOW_NOISE_STD:-0.0}}
@@ -21,7 +21,7 @@ DATASET_ROOT=${DATASET_ROOT:-/project/ricky/splatformer-sr-data}
 TRAIN_SCENE_LIST=${TRAIN_SCENE_LIST:-${DATASET_ROOT}/psnr_filtered_scenes.csv}
 TEST_SCENE_LIST=${TEST_SCENE_LIST:-${DATASET_ROOT}/test_psnr_filtered_scenes.csv}
 GS_STATISTICS_PATH=${GS_STATISTICS_PATH:-${DATASET_ROOT}/gs_statistics.json}
-OUTPUT_DIR=${OUTPUT_DIR:-/project2/ricky/outputs/0828/objaverse_splatformer_sr_gsfm_${INPUT_RESOLUTION}to${TARGET_RESOLUTION}_${ALIGNMENT}_${MIX_SCHEDULE}}
+OUTPUT_DIR=${OUTPUT_DIR:-/project2/ricky/outputs/0905-gpu11/objaverse_splatformer_sr_gsfm_${INPUT_RESOLUTION}to${TARGET_RESOLUTION}_${ALIGNMENT}_${MIX_SCHEDULE}}
 
 case "${MIX_SCHEDULE}" in
     linear|free-range-gs|fm-only) ;;
@@ -35,7 +35,7 @@ CUDA_VISIBLE_DEVICES=${GPU_ID} python train-sr-gsfm.py \
     --gin_file=configs/model/ptv3_flow.gin \
     --gin_file=configs/dataset/objaverse-sr.gin \
     --gin_file=configs/train/sr_gsfm.gin \
-    --gin_param="GSFlowPredictor.grid_resolution=768" \
+    --gin_param="GSFlowPredictor.grid_resolution=2048" \
     --gin_param="dataset_root='${DATASET_ROOT}'" \
     --gin_param="train_scene_list='${TRAIN_SCENE_LIST}'" \
     --gin_param="test_scene_list='${TEST_SCENE_LIST}'" \

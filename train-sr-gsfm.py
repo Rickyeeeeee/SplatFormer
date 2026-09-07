@@ -49,6 +49,7 @@ FLAGS = flags.FLAGS
 EVAL_FLOW_STEPS = [10]
 MEANS_LOSS_REDUCTION = "mean"  # Set to "sum" to match PUFM-style summed point loss.
 
+torch.set_num_threads(8)
 
 @gin.configurable
 def set_seed(seed):
@@ -448,7 +449,11 @@ def training():
                 train_cameras = gpu_utils.move_to_device(train_cameras, device)
             query_gs, flow_noise, gamma, gamma_dot = flow.sample_stochastic_interpolant(source_flow_gs, target_flow_gs, time_value, float(flow_config["flow_noise_std"]))
             with torch.cuda.amp.autocast(enabled=config["enable_amp"]):
-                predicted_velocity = model(batch_flow_gs=[query_gs], batch_scene_idx=[scene["scene_idx"]], batch_reference_means=[source_flow_gs["means"]], t=time_value)[0]
+                predicted_velocity = model(
+                    batch_flow_gs=[query_gs], 
+                    batch_scene_idx=[scene["scene_idx"]], 
+                    batch_reference_means=[source_flow_gs["means"]], 
+                    t=time_value)[0]
                 predicted_x1 = flow.predict_x1_from_velocity(model, source_flow_gs, query_gs, predicted_velocity, flow_noise, gamma, gamma_dot, time_value)
                 if flow_config["loss_type"] == "velocity":
                     flow_loss, attribute_losses, weighted_attribute_losses = flow.compute_variance_normalized_velocity_loss(

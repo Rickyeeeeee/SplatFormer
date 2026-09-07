@@ -13,7 +13,7 @@ SplatFactoSRDataset.train_scene_list = %train_scene_list
 SplatFactoSRDataset.test_scene_list = %test_scene_list
 SplatFactoSRDataset.dataset_name = 'objaverse'
 SplatFactoSRDataset.remove_outlier_ndevs = -1
-SplatFactoSRDataset.image_per_scene = 4
+SplatFactoSRDataset.image_per_scene = 16
 SplatFactoSRDataset.max_gs_num = 1000000
 SplatFactoSRDataset.src_resolution = 128
 SplatFactoSRDataset.tgt_resolution = 512
@@ -24,7 +24,7 @@ SplatFactoSRDataset.load_src_images = True
 SplatFactoSRDataset.load_tgt_images = True
 
 train_dataset/SplatFactoSRDataset.train_or_test = 'train'
-train_dataset/SplatFactoSRDataset.image_per_scene = 4
+train_dataset/SplatFactoSRDataset.image_per_scene = 16
 train_dataset/SplatFactoSRDataset.split_across_gpus = True
 
 test_dataset/SplatFactoSRDataset.train_or_test = 'test'

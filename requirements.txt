@@ -1,4 +1,4 @@
--f https://data.pyg.org/whl/torch-2.1.2+cu118.html
+-f https://data.pyg.org/whl/torch-2.7.1+cu128.html
 torch-geometric
 torch-scatter
 torch-sparse
@@ -29,3 +29,4 @@ splines
 wandb
 opencv-python
 lpips
+gin-config
