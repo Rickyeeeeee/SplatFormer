@@ -51,7 +51,11 @@ def flow_matching(
     flow_t_eps=1e-4,
     loss_type="velocity",
     velocity_variance_floor=1e-8,
+    velocity_variance_source="matching",
+    gs_statistics_path="/project/ricky/splatformer-sr-data-scaled/test_gs_statistics.json",
 ):
+    if velocity_variance_source not in ("matching", "precomputed_scene", "precomputed_aggregate"):
+        raise ValueError(f"Unsupported velocity_variance_source={velocity_variance_source!r}")
     if loss_type not in ("velocity", "x1"):
         raise ValueError(
             f"Unsupported flow_matching.loss_type={loss_type!r}; expected 'velocity' or 'x1'"
@@ -67,6 +71,8 @@ def flow_matching(
         "flow_t_eps": flow_t_eps,
         "loss_type": loss_type,
         "velocity_variance_floor": float(velocity_variance_floor),
+        "velocity_variance_source": velocity_variance_source,
+        "gs_statistics_path": gs_statistics_path,
     }
 
 @gin.configurable
@@ -379,19 +385,59 @@ def training(
             flow_cfg["velocity_variance_floor"],
         )
     )
+    # Report all sources, independently of which variance normalizes the loss.
+    selected_source = flow_cfg["velocity_variance_source"]
+    stats_path = flow_cfg["gs_statistics_path"]
     variance_report = {
-        key: {
-            "variance": raw_velocity_variances[key].detach().cpu().tolist(),
-            "effective_variance": velocity_variances[key].detach().cpu().tolist(),
-        }
-        for key in SUPPORTED_GS_KEYS
+        "scene_name": scene["scene_name"],
+        "gs_statistics_path": stats_path,
+        "selected_source": selected_source,
+        "used_for_loss": flow_cfg["loss_type"] == "velocity",
+        "sources": {"matching": {
+            key: {
+                "mean": (target_flow_gs[key] - source_flow_gs[key]).detach().float().mean(dim=0).cpu().tolist(),
+                "variance": raw_velocity_variances[key].detach().cpu().tolist(),
+                "effective_variance": velocity_variances[key].detach().cpu().tolist(),
+            }
+            for key in SUPPORTED_GS_KEYS
+        }},
     }
-    variance_message = (
-        "GT matching velocity variances: "
-        + json.dumps(variance_report, sort_keys=True)
-    )
+    available_variances = {"matching": velocity_variances}
+    statistics = None
+    statistics_error = None
+    try:
+        with open(stats_path) as statistics_file:
+            statistics = json.load(statistics_file)
+    except (OSError, ValueError) as error:
+        statistics_error = str(error)
+    for source in ("precomputed_scene", "precomputed_aggregate"):
+        try:
+            if statistics_error is not None:
+                raise ValueError(statistics_error)
+            delta = (statistics["scenes"][scene["scene_name"]] if source == "precomputed_scene" else statistics["aggregate"])["delta"]
+            raw, effective = flow.delta_velocity_variances(delta, flow_cfg["velocity_variance_floor"], device=device, dtype=torch.float32)
+            source_report = {}
+            for key in SUPPORTED_GS_KEYS:
+                mean = torch.as_tensor(delta[flow.STATISTIC_KEYS[key]]["mean"], device=device, dtype=torch.float32)
+                component_shape = source_flow_gs[key].shape[1:]
+                if torch.broadcast_shapes(effective[key].shape, component_shape) != component_shape:
+                    raise ValueError(f"Incompatible variance shape for {key}: {tuple(effective[key].shape)} vs {tuple(component_shape)}")
+                if torch.broadcast_shapes(mean.shape, component_shape) != component_shape:
+                    raise ValueError(f"Incompatible mean shape for {key}: {tuple(mean.shape)} vs {tuple(component_shape)}")
+                if not torch.isfinite(mean).all() or not torch.isfinite(raw[key]).all():
+                    raise ValueError(f"Non-finite statistics for {key}")
+                source_report[key] = {"mean": mean.cpu().tolist(), "variance": raw[key].cpu().tolist(), "effective_variance": effective[key].cpu().tolist()}
+            variance_report["sources"][source] = source_report
+            available_variances[source] = effective
+        except (KeyError, TypeError, ValueError, RuntimeError) as error:
+            variance_report["sources"][source] = {"unavailable": str(error)}
+    variance_message = "Velocity normalization statistics: " + json.dumps(variance_report, sort_keys=True)
     print(variance_message)
     logger.info(variance_message)
+    if flow_cfg["loss_type"] == "velocity":
+        if selected_source not in available_variances:
+            raise ValueError(f"Selected velocity variance source {selected_source!r} unavailable: {variance_report['sources'][selected_source]}")
+        velocity_variances = available_variances[selected_source]
     if flow_cfg["loss_type"] == "velocity":
         flow_loss_weights = {key: 1.0 for key in SUPPORTED_GS_KEYS}
     else:

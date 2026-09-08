@@ -9,24 +9,23 @@ from utils.loss_utils import SUPPORTED_GS_KEYS
 FLOW_EPSILON = 1e-6
 
 
-def load_aggregate_velocity_variances(stats_path, variance_floor, device=None, dtype=None):
-    """Load fixed global velocity variances from aggregate delta statistics."""
-    with open(stats_path) as statistics_file:
-        delta_statistics = json.load(statistics_file)["aggregate"]["delta"]
+STATISTIC_KEYS = {
+    "means": "means",
+    "features_dc": "sh0",
+    "features_rest": "shN",
+    "opacities": "opacities",
+    "scales": "scales",
+    "quats": "quats",
+}
 
-    statistic_keys = {
-        "means": "means",
-        "features_dc": "sh0",
-        "features_rest": "shN",
-        "opacities": "opacities",
-        "scales": "scales",
-        "quats": "quats",
-    }
+
+def delta_velocity_variances(delta_statistics, variance_floor, device=None, dtype=None):
+    """Convert stored standard deviations to raw and floored variances."""
     raw_variances = {}
     effective_variances = {}
     for key in SUPPORTED_GS_KEYS:
         std = torch.as_tensor(
-            delta_statistics[statistic_keys[key]]["std"],
+            delta_statistics[STATISTIC_KEYS[key]]["std"],
             device=device,
             dtype=dtype,
         )
@@ -35,6 +34,14 @@ def load_aggregate_velocity_variances(stats_path, variance_floor, device=None, d
             float(variance_floor)
         )
     return raw_variances, effective_variances
+
+
+def load_aggregate_velocity_variances(stats_path, variance_floor, device=None, dtype=None):
+    """Load fixed global velocity variances from aggregate delta statistics."""
+    with open(stats_path) as statistics_file:
+        delta_statistics = json.load(statistics_file)["aggregate"]["delta"]
+
+    return delta_velocity_variances(delta_statistics, variance_floor, device=device, dtype=dtype)
 
 
 def loss_mix_weights(t, schedule):

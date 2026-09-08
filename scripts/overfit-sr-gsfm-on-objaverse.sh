@@ -24,6 +24,8 @@ flow_steps=${11:-${FLOW_STEPS:-1}}
 flow_noise_std=${12:-${FLOW_NOISE_STD:-0.0}}
 image_l1_loss_weight=${13:-${IMAGE_L1_LOSS_WEIGHT:-1.0}}
 lpips_loss_weight=${14:-${LPIPS_LOSS_WEIGHT:-1.0}}
+velocity_variance_source=${VELOCITY_VARIANCE_SOURCE:-matching}
+gs_statistics_path=${GS_STATISTICS_PATH:-/project/ricky/splatformer-sr-data-scaled/test_gs_statistics.json}
 flow_t_eps=${FLOW_T_EPS:-1e-4}
 ptv3_drop_path=${PTV3_DROP_PATH:-0.0}
 ptv3_shuffle_orders=${PTV3_SHUFFLE_ORDERS:-True}
@@ -40,6 +42,8 @@ CUDA_VISIBLE_DEVICES=${GPU_ID} python overfit-sr-gsfm.py \
     --scene_name="${scene_name}" \
     --alignment="${alignment}" \
     --attribute_init="${attribute_init}" \
+    --gin_param="flow_matching.velocity_variance_source='${velocity_variance_source}'" \
+    --gin_param="flow_matching.gs_statistics_path='${gs_statistics_path}'" \
     --gin_param="flow_matching.flow_steps=${flow_steps}" \
     --gin_param="flow_matching.flow_noise_std=${flow_noise_std}" \
     --gin_param="flow_matching.loss_type='${flow_loss_type}'" \
