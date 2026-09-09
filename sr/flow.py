@@ -19,15 +19,28 @@ STATISTIC_KEYS = {
 }
 
 
+def delta_statistic_tensor(
+    delta_statistics, key, statistic, device=None, dtype=None
+):
+    """Load a stored delta statistic in the runtime Gaussian feature shape."""
+    value = torch.as_tensor(
+        delta_statistics[STATISTIC_KEYS[key]][statistic],
+        device=device,
+        dtype=dtype,
+    )
+    # Statistics retain SH0's coefficient axis, while runtime features_dc is [N, 3].
+    if key == "features_dc" and value.ndim == 2 and value.shape[0] == 1:
+        value = value.squeeze(0)
+    return value
+
+
 def delta_velocity_variances(delta_statistics, variance_floor, device=None, dtype=None):
     """Convert stored standard deviations to raw and floored variances."""
     raw_variances = {}
     effective_variances = {}
     for key in SUPPORTED_GS_KEYS:
-        std = torch.as_tensor(
-            delta_statistics[STATISTIC_KEYS[key]]["std"],
-            device=device,
-            dtype=dtype,
+        std = delta_statistic_tensor(
+            delta_statistics, key, "std", device=device, dtype=dtype
         )
         raw_variances[key] = std.square()
         effective_variances[key] = raw_variances[key].clamp_min(

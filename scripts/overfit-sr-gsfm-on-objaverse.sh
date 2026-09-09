@@ -2,7 +2,7 @@
 
 set -euo pipefail
 GPU_ID=${GPU_ID:-5}
-DATASET_ROOT=${DATASET_ROOT:-/project/ricky/splatformer-sr-data}
+DATASET_ROOT=${DATASET_ROOT:-/project/ricky/splatformer-sr-data-scaled}
 TRAIN_SCENE_LIST=${TRAIN_SCENE_LIST:-${DATASET_ROOT}/psnr_filtered_scenes.csv}
 TEST_SCENE_LIST=${TEST_SCENE_LIST:-${DATASET_ROOT}/test_psnr_filtered_scenes.csv}
 FIT_LR_TO_HR_ROOT=${FIT_LR_TO_HR_ROOT:-${DATASET_ROOT}/test-set-4x-up/objaverse}
@@ -14,7 +14,7 @@ total_steps=${1:-4000}
 save_interval=${2:-4000}
 eval_interval=${3:-400}
 log_image_interval=${4:-400}
-alignment=${5:-emd}
+alignment=${5:-fit_lr_to_hr}
 attribute_init=${6:-aligned}
 input_resolution=${7:-128}
 target_resolution=${8:-512}
@@ -25,16 +25,17 @@ flow_noise_std=${12:-${FLOW_NOISE_STD:-0.0}}
 image_l1_loss_weight=${13:-${IMAGE_L1_LOSS_WEIGHT:-1.0}}
 lpips_loss_weight=${14:-${LPIPS_LOSS_WEIGHT:-1.0}}
 velocity_variance_source=${VELOCITY_VARIANCE_SOURCE:-matching}
-gs_statistics_path=${GS_STATISTICS_PATH:-/project/ricky/splatformer-sr-data-scaled/test_gs_statistics.json}
+gs_statistics_path=${GS_STATISTICS_PATH:-/project/ricky/splatformer-sr-data/test_gs_statistics.json}
 flow_t_eps=${FLOW_T_EPS:-1e-4}
 ptv3_drop_path=${PTV3_DROP_PATH:-0.0}
 ptv3_shuffle_orders=${PTV3_SHUFFLE_ORDERS:-True}
 ptv3_shuffle_orders_eval=${PTV3_SHUFFLE_ORDERS_EVAL:-False}
 ptv3_turn_off_bn=${PTV3_TURN_OFF_BN:-True}
-grid_resolution=${GRID_RESOLUTION:-384}
+grid_resolution=${GRID_RESOLUTION:-512}
+run_date=$(date +%m%d)
 
 out_name=${scene_name}_${alignment}_${attribute_init}_ir${input_resolution}_tr${target_resolution}_gsfm_all_${mix_schedule}_grid${grid_resolution}_input_frame_v1
-output_root=${OUTPUT_ROOT:-/project2/ricky/experiments/0827/overfit_sr_gsfm_512_input_frame_v1}
+output_root=${OUTPUT_ROOT:-/project2/ricky/experiments/${run_date}/overfit_sr_gsfm_512_input_frame_v1}
 output_dir=${OUTPUT_DIR:-${output_root}/${out_name}}
 
 CUDA_VISIBLE_DEVICES=${GPU_ID} python overfit-sr-gsfm.py \

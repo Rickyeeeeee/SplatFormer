@@ -106,6 +106,51 @@ def feature_mse_loss(loss_weights=None, quat_direct_mse=False):
     }
 
 
+def _format_stat_values(values):
+    """Format nested statistics compactly for terminal and text-log output."""
+    if isinstance(values, list):
+        return "[" + ", ".join(_format_stat_values(value) for value in values) + "]"
+    if isinstance(values, float):
+        return f"{values:.6g}"
+    return str(values)
+
+
+def format_velocity_variance_report(report):
+    """Build a readable summary; the complete values are saved separately as JSON."""
+    selected_source = report["selected_source"]
+    lines = [
+        "Velocity normalization statistics",
+        "  scene: {}".format(report["scene_name"]),
+        "  selected source: {}".format(selected_source),
+        "  used for loss: {}".format(report["used_for_loss"]),
+        "  statistics file: {}".format(report["gs_statistics_path"]),
+        "  (effective variance is shown only when it differs from raw variance)",
+    ]
+    for source, source_report in report["sources"].items():
+        selected_marker = " [selected]" if source == selected_source else ""
+        if "unavailable" in source_report:
+            lines.append(
+                "  {}{}: unavailable ({})".format(
+                    source, selected_marker, source_report["unavailable"]
+                )
+            )
+            continue
+
+        lines.append("  {}{}:".format(source, selected_marker))
+        for key in SUPPORTED_GS_KEYS:
+            statistics = source_report[key]
+            summary = "mean={}  variance={}".format(
+                _format_stat_values(statistics["mean"]),
+                _format_stat_values(statistics["variance"]),
+            )
+            if statistics["effective_variance"] != statistics["variance"]:
+                summary += "  effective_variance={}".format(
+                    _format_stat_values(statistics["effective_variance"])
+                )
+            lines.append("    {}: {}".format(key, summary))
+    return "\n".join(lines)
+
+
 def compute_all_feature_mse_loss(
     out_gs,
     target_gs,
@@ -418,7 +463,9 @@ def training(
             raw, effective = flow.delta_velocity_variances(delta, flow_cfg["velocity_variance_floor"], device=device, dtype=torch.float32)
             source_report = {}
             for key in SUPPORTED_GS_KEYS:
-                mean = torch.as_tensor(delta[flow.STATISTIC_KEYS[key]]["mean"], device=device, dtype=torch.float32)
+                mean = flow.delta_statistic_tensor(
+                    delta, key, "mean", device=device, dtype=torch.float32
+                )
                 component_shape = source_flow_gs[key].shape[1:]
                 if torch.broadcast_shapes(effective[key].shape, component_shape) != component_shape:
                     raise ValueError(f"Incompatible variance shape for {key}: {tuple(effective[key].shape)} vs {tuple(component_shape)}")
@@ -431,7 +478,11 @@ def training(
             available_variances[source] = effective
         except (KeyError, TypeError, ValueError, RuntimeError) as error:
             variance_report["sources"][source] = {"unavailable": str(error)}
-    variance_message = "Velocity normalization statistics: " + json.dumps(variance_report, sort_keys=True)
+    variance_report_path = os.path.join(output_dir, "velocity_variance_statistics.json")
+    with open(variance_report_path, "w") as variance_report_file:
+        json.dump(variance_report, variance_report_file, indent=2, sort_keys=True)
+        variance_report_file.write("\n")
+    variance_message = format_velocity_variance_report(variance_report)
     print(variance_message)
     logger.info(variance_message)
     if flow_cfg["loss_type"] == "velocity":
