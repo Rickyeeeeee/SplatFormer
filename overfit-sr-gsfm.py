@@ -24,7 +24,9 @@ from utils.optimizers import build_optimizer, build_scheduler
 
 flags.DEFINE_string("output_dir", "output_overfit_gsfm_noemd", "Output directory")
 flags.DEFINE_string("eval_subdir", "eval_final", "Eval subdirectory")
-flags.DEFINE_string("scene_name", "", "Scene name to overfit")
+flags.DEFINE_string("scene_name", "", "Scene name to overfit in one mode")
+flags.DEFINE_enum("scene_mode", "one", ["one", "many"], "Overfit one scene or a fixed random scene set")
+flags.DEFINE_integer("scene_count", 1, "Number of scenes selected in many mode")
 flags.DEFINE_boolean("compare_with_input", False, "Compare with input 3DGS")
 flags.DEFINE_boolean("save_viewer", True, "Save viewer point clouds")
 flags.DEFINE_enum("alignment", "emd", ["emd", "random", "fit_lr_to_hr", "fit_hr_to_lr"], "Matching modes")
@@ -42,6 +44,7 @@ MEANS_LOSS_REDUCTION = "mean"  # Set to "sum" to match PUFM-style summed point l
 @gin.configurable
 def set_seed(seed):
     seed_everything(seed)
+    return seed
 
 
 @gin.configurable
@@ -338,30 +341,9 @@ def evaluate_single_scene(
     return metrics, metrics_input
 
 
-@gin.configurable
-def training(
-    dataset,
-    scene,
-    output_dir,
-    logger,
-    device,
-    total_steps=gin.REQUIRED,
-    eval_interval=gin.REQUIRED,
-    log_interval=gin.REQUIRED,
-    save_interval=gin.REQUIRED,
-    log_image_interval=gin.REQUIRED,
-    grad_clip_norm=gin.REQUIRED,
-    image_l1_loss_weight=1.0,
-    lpips_loss_weight=0.0,
-    resume_from_step=0,
-    enable_amp=False,
-    empty_cache_fre=-1,
-):
-    flow_cfg = flow_matching()
-    if not (0.0 < float(flow_cfg["flow_t_eps"]) < 0.5):
-        raise ValueError(f"flow_t_eps must be in (0, 0.5), got {flow_cfg['flow_t_eps']}")
-    mix_cfg = loss_mixing()
-    mse_loss_cfg = feature_mse_loss()
+def prepare_overfit_scene(dataset, scene, output_dir, logger, device, flow_cfg):
+    """Prepare fixed alignment and normalization once for a scene."""
+    os.makedirs(output_dir, exist_ok=True)
     input_resolution = dataset.src_resolution
     target_resolution = dataset.tgt_resolution
     if scene["coordinate_frame"] != "input_resolution":
@@ -406,19 +388,6 @@ def training(
             input_resolution=input_resolution,
             target_resolution=target_resolution,
         )
-
-    model = GSFlowPredictor().to(device)
-    missing_outputs = sorted(set(SUPPORTED_GS_KEYS) - set(model.output_features))
-    if missing_outputs:
-        raise ValueError(
-            f"GSFlowPredictor.output_features must include all Gaussian "
-            f"attributes; missing {missing_outputs}"
-        )
-    if model.resume_ckpt is not None:
-        raise ValueError(
-            "GS_SR overfitting does not support resume_ckpt; start from scratch"
-        )
-    model.train()
 
     loss_target_gs = matching_target_gs
     source_flow_gs = gs_utils.clone_gaussians(source_gs)
@@ -489,11 +458,101 @@ def training(
         if selected_source not in available_variances:
             raise ValueError(f"Selected velocity variance source {selected_source!r} unavailable: {variance_report['sources'][selected_source]}")
         velocity_variances = available_variances[selected_source]
+    logger.info(
+        f"Scene={scene['scene_name']} idx={scene['scene_idx']} "
+        f"input_resolution={input_resolution} target_resolution={target_resolution} "
+        f"input_gaussians={input_resolution_entry['gs_params']['means'].shape[0]} "
+        f"matching_target_gaussians={matching_target_gs['means'].shape[0]} "
+        f"coordinate_frame={scene['coordinate_frame']} "
+        f"coordinate_frame_version={scene['coordinate_frame_version']} "
+        f"coordinate_resolution={scene['coordinate_resolution']} "
+        f"alignment_info={alignment_info} attribute_init={FLAGS.attribute_init} "
+        f"fit_lr_to_hr_root={dataset.fit_lr_to_hr_root} fit_hr_to_lr_root={dataset.fit_hr_to_lr_root}"
+    )
+    return {
+        "scene_idx": scene["scene_idx"], "scene_name": scene["scene_name"],
+        "source_gs": source_gs, "source_flow_gs": source_flow_gs,
+        "target_flow_gs": target_flow_gs, "velocity_variances": velocity_variances,
+        "target_images": target_images, "target_cameras": target_cameras,
+        "target_image_names": target_image_names, "eval_chunk_size": eval_chunk_size,
+    }
+
+
+@gin.configurable
+def training(
+    dataset,
+    scene_indices,
+    output_dir,
+    logger,
+    device,
+    total_steps=gin.REQUIRED,
+    eval_interval=gin.REQUIRED,
+    log_interval=gin.REQUIRED,
+    save_interval=gin.REQUIRED,
+    log_image_interval=gin.REQUIRED,
+    grad_clip_norm=gin.REQUIRED,
+    image_l1_loss_weight=1.0,
+    lpips_loss_weight=0.0,
+    resume_from_step=0,
+    enable_amp=False,
+    empty_cache_fre=-1,
+):
+    flow_cfg = flow_matching()
+    if not (0.0 < float(flow_cfg["flow_t_eps"]) < 0.5):
+        raise ValueError(f"flow_t_eps must be in (0, 0.5), got {flow_cfg['flow_t_eps']}")
+    mix_cfg = loss_mixing()
+    mse_loss_cfg = feature_mse_loss()
     if flow_cfg["loss_type"] == "velocity":
         flow_loss_weights = {key: 1.0 for key in SUPPORTED_GS_KEYS}
     else:
         flow_loss_weights = mse_loss_cfg["loss_weights"]
-    batch_scene_idx = [scene["scene_idx"]]
+
+    is_fm_only = mix_cfg["schedule"] == "fm-only"
+    many = FLAGS.scene_mode == "many"
+    prepared_scenes = []
+    # Cache fixed scene data on CPU; only the active scene needs GPU storage.
+    for scene_idx in scene_indices:
+        scene_name = dataset.folders[scene_idx]["scene_name"]
+        scene_dir = os.path.join(output_dir, "scenes", scene_name) if many else output_dir
+        try:
+            scene = dataset.load_scene(scene_idx, fit_alignment=FLAGS.alignment)
+            prepared = prepare_overfit_scene(dataset, scene, scene_dir, logger, device, flow_cfg)
+        except Exception as error:
+            raise RuntimeError(f"Failed to prepare scene {scene_name!r} (index {scene_idx})") from error
+        view_count = len(prepared["target_images"])
+        prepared["render_view_count"] = 0 if is_fm_only else min(dataset.image_per_scene or view_count, view_count)
+        if not prepared["target_images"]:
+            raise ValueError(f"Scene {scene_name!r} has no target views")
+        if not is_fm_only and prepared["render_view_count"] <= 0:
+            raise ValueError(f"Scene {scene_name!r} has no render-loss views")
+        train_dir = os.path.join(output_dir, "train", scene_name) if many else os.path.join(output_dir, "train")
+        os.makedirs(train_dir, exist_ok=True)
+        prepared["train_dir"] = train_dir
+        gt_imgs_uint8 = [(img[..., :3] * 255).detach().cpu().numpy().astype(np.uint8) for img in prepared["target_images"]]
+        gt_grid = cv2.cvtColor(make_grid(gt_imgs_uint8), cv2.COLOR_RGB2BGR)
+        cv2.imwrite(os.path.join(train_dir, "00000000_gt.png"), gt_grid)
+        logger.info(
+            f"GSFM scene={scene_name} idx={scene_idx} target_views={view_count} "
+            f"render_views_per_step={prepared['render_view_count']} alignment={FLAGS.alignment} "
+            f"flow_config={flow_cfg} loss_mix_schedule={mix_cfg['schedule']} "
+            f"image_l1_loss_weight={image_l1_loss_weight} lpips_loss_weight={lpips_loss_weight} "
+            f"quat_direct_mse={mse_loss_cfg['quat_direct_mse']} loss_weights={flow_loss_weights}"
+        )
+        prepared_scenes.append(gpu_utils.to_cpu(prepared) if many else prepared)
+        del scene, prepared
+    os.makedirs(os.path.join(output_dir, "checkpoints"), exist_ok=True)
+    model = GSFlowPredictor().to(device)
+    missing_outputs = sorted(set(SUPPORTED_GS_KEYS) - set(model.output_features))
+    if missing_outputs:
+        raise ValueError(
+            f"GSFlowPredictor.output_features must include all Gaussian "
+            f"attributes; missing {missing_outputs}"
+        )
+    if model.resume_ckpt is not None:
+        raise ValueError(
+            "GS_SR overfitting does not support resume_ckpt; start from scratch"
+        )
+    model.train()
 
     with gin.config_scope("train2D"):
         optimizer = build_optimizer(model)
@@ -502,62 +561,30 @@ def training(
     with open(os.path.join(output_dir, "config.gin"), "w") as f:
         f.writelines(gin.operative_config_str())
 
-    is_fm_only = mix_cfg["schedule"] == "fm-only"
-    render_view_count = 0
-    if not is_fm_only:
-        render_view_count = min(dataset.image_per_scene or len(target_images), len(target_images))
-        if render_view_count <= 0:
-            raise ValueError("No target views available for render loss")
-
     scaler = torch.cuda.amp.GradScaler(enabled=enable_amp)
     lpips_loss_func = loss_utils.lpips_loss_fn() if not is_fm_only and lpips_loss_weight > 0 else None
-
-    training_brief = (
-        f"GSFM scene={scene['scene_name']} idx={scene['scene_idx']} "
-        f"target_views={len(target_images)} "
-        f"input_gaussians={input_resolution_entry['gs_params']['means'].shape[0]} "
-        f"matching_target_gaussians={matching_target_gs['means'].shape[0]} "
-        f"input_resolution={input_resolution} target_resolution={target_resolution} "
-        f"alignment={FLAGS.alignment} "
-        f"attribute_init={FLAGS.attribute_init if FLAGS.alignment in {'emd', 'random'} else 'inactive'} "
-        f"alignment_info={alignment_info} "
-        f"attribute_keys={','.join(SUPPORTED_GS_KEYS)} "
-        f"flow_steps={flow_cfg['flow_steps']} "
-        f"flow_noise_std={flow_cfg['flow_noise_std']} "
-        f"flow_t_eps={flow_cfg['flow_t_eps']} "
-        f"flow_loss_type={flow_cfg['loss_type']} "
-        f"velocity_variance_floor={flow_cfg['velocity_variance_floor']} "
-        f"loss_mix_schedule={mix_cfg['schedule']} "
-        f"image_l1_loss_weight={image_l1_loss_weight} "
-        f"lpips_loss_weight={lpips_loss_weight} "
-        f"render_views_per_step={render_view_count} "
-        f"quat_direct_mse={mse_loss_cfg['quat_direct_mse']} "
-        f"loss_weights={flow_loss_weights}\n"
-        f"dataset_class={type(dataset).__name__} "
-        f"coordinate_frame={scene['coordinate_frame']} "
-        f"coordinate_frame_version={scene['coordinate_frame_version']} "
-        f"coordinate_resolution={scene['coordinate_resolution']}\n"
-        f"fit_lr_to_hr_root={dataset.fit_lr_to_hr_root}\n"
-        f"fit_hr_to_lr_root={dataset.fit_hr_to_lr_root}"
-    )
-    print(training_brief)
-    logger.info(training_brief)
-
-    os.makedirs(os.path.join(output_dir, "train"), exist_ok=True)
-    os.makedirs(os.path.join(output_dir, "checkpoints"), exist_ok=True)
-
-    train_images_device = gpu_utils.move_to_device(target_images, device)
-    train_cameras_device = gpu_utils.move_to_device(target_cameras, device)
-    gt_imgs_uint8 = [(img[..., :3] * 255).detach().cpu().numpy().astype(np.uint8) for img in train_images_device]
-    if len(gt_imgs_uint8) > 0:
-        gt_grid = cv2.cvtColor(make_grid(gt_imgs_uint8), cv2.COLOR_RGB2BGR)
-        cv2.imwrite(os.path.join(output_dir, "train", "00000000_gt.png"), gt_grid)
+    scene_order = []
 
     optimizer.zero_grad(set_to_none=True)
     pbar = tqdm(range(resume_from_step, total_steps))
     flow_t_eps = float(flow_cfg["flow_t_eps"])
     flow_noise_std = float(flow_cfg["flow_noise_std"])
     for step in pbar:
+        if many:
+            if not scene_order:
+                scene_order = np.random.permutation(len(prepared_scenes)).tolist()
+            active = prepared_scenes[scene_order.pop()]
+        else:
+            active = prepared_scenes[0]
+        scene = active
+        source_flow_gs = gpu_utils.move_to_device(active["source_flow_gs"], device)
+        target_flow_gs = gpu_utils.move_to_device(active["target_flow_gs"], device)
+        loss_target_gs = target_flow_gs
+        velocity_variances = gpu_utils.move_to_device(active["velocity_variances"], device)
+        target_images = active["target_images"]
+        target_cameras = active["target_cameras"]
+        render_view_count = active["render_view_count"]
+        batch_scene_idx = [active["scene_idx"]]
         t = torch.empty(1, device=device).uniform_(flow_t_eps, 1.0 - flow_t_eps)
         if not is_fm_only:
             camera_indices = np.random.permutation(len(target_images))[:render_view_count]
@@ -671,7 +698,7 @@ def training(
                 ]
             )
             logger.info(
-                f"step={step} total={total_loss.item():.6f} "
+                f"step={step} scene={scene['scene_name']} idx={scene['scene_idx']} total={total_loss.item():.6f} "
                 f"mix_schedule={mix_cfg['schedule']} "
                 f"fm_loss={fm_loss.item():.6f} fm_weight={fm_mix_weight.item():.6f} "
                 f"render_loss={render_loss.item():.6f} render_weight={render_mix_weight.item():.6f} "
@@ -689,11 +716,24 @@ def training(
                 train_out_gs = flow.sample_flow_model(
                     model, source_flow_gs, scene["scene_idx"], int(flow_cfg["flow_steps"])
                 )
-                pred_imgs, _ = gs_utils.rasterize_gaussians_to_multiimgs(train_out_gs, train_cameras_device)
+                pred_imgs, _ = gs_utils.rasterize_gaussians_to_multiimgs(train_out_gs, gpu_utils.move_to_device(target_cameras, device))
                 pred_imgs_uint8 = [(im * 255).detach().cpu().numpy().astype(np.uint8) for im in pred_imgs[:9]]
                 if len(pred_imgs_uint8) > 0:
                     pred_grid = cv2.cvtColor(make_grid(pred_imgs_uint8), cv2.COLOR_RGB2BGR)
-                    cv2.imwrite(os.path.join(output_dir, "train", f"{step:08d}_pred.png"), pred_grid)
+                    cv2.imwrite(os.path.join(active["train_dir"], f"{step:08d}_pred.png"), pred_grid)
+            model.train()
+
+        # Release the active scene and autograd outputs before evaluating other scenes.
+        del source_flow_gs, target_flow_gs, loss_target_gs, velocity_variances
+        del query_flow_gs, flow_noise, pred_vel, x1_pred_flow_gs
+        del total_loss, fm_loss, attr_losses, weighted_attr_losses
+        del render_l1, render_lpips, weighted_render_l1, weighted_render_lpips, render_loss
+        if not is_fm_only:
+            del render_gs, train_images, train_cameras
+        if not is_fm_only or step % log_image_interval == 0:
+            del pred_imgs, _
+        if step % log_image_interval == 0:
+            del train_out_gs
 
         is_final_step = step == total_steps - 1
         if step % eval_interval == 0 or is_final_step:
@@ -705,31 +745,49 @@ def training(
             eval_label = "Final eval" if is_final_step else f"Eval step {step}"
             for eval_flow_steps in EVAL_FLOW_STEPS:
                 eval_dir = os.path.join(eval_base_dir, f"flow_steps_{eval_flow_steps:02d}")
-                metrics, metrics_input = evaluate_single_scene(
-                    model=model,
-                    input_gs=source_gs,
-                    source_flow_gs=source_flow_gs,
-                    gt_gs=matching_target_gs,
-                    scene_idx=scene["scene_idx"],
-                    scene_name=scene["scene_name"],
-                    eval_images=target_images,
-                    eval_cameras=target_cameras,
-                    image_names=target_image_names,
-                    output_dir=eval_dir,
-                    flow_steps=int(eval_flow_steps),
-                    eval_chunk_size=eval_chunk_size,
-                    compare_with_input=FLAGS.compare_with_input,
-                    save_viewer=FLAGS.save_viewer,
-                    output_gt=((step == 0 or is_final_step) and eval_flow_steps == EVAL_FLOW_STEPS[0]),
-                )
-                metric_str = " ".join([f"{k}: {v:.4f}" for k, v in metrics.items()])
-                logger.info(f"{eval_label} flow_steps={eval_flow_steps}: {metric_str}")
-                print(f"{eval_label} flow_steps={eval_flow_steps}: {metric_str}")
-                if FLAGS.compare_with_input:
-                    metric_str = " ".join([f"{k}: {v:.4f}" for k, v in metrics_input.items()])
-                    if is_final_step:
-                        logger.info(f"{eval_label} input flow_steps={eval_flow_steps}: {metric_str}")
-                    print(f"{eval_label} input flow_steps={eval_flow_steps}: {metric_str}")
+                scene_metrics = {}
+                input_metrics = {}
+                for evaluated in prepared_scenes:
+                    scene_name = evaluated["scene_name"]
+                    scene_eval_dir = os.path.join(eval_dir, "scenes", scene_name) if many else eval_dir
+                    metrics, metrics_input = evaluate_single_scene(
+                        model=model,
+                        input_gs=gpu_utils.move_to_device(evaluated["source_gs"], device),
+                        source_flow_gs=gpu_utils.move_to_device(evaluated["source_flow_gs"], device),
+                        gt_gs=gpu_utils.move_to_device(evaluated["target_flow_gs"], device),
+                        scene_idx=evaluated["scene_idx"],
+                        scene_name=scene_name,
+                        eval_images=evaluated["target_images"],
+                        eval_cameras=evaluated["target_cameras"],
+                        image_names=evaluated["target_image_names"],
+                        output_dir=scene_eval_dir,
+                        flow_steps=int(eval_flow_steps),
+                        eval_chunk_size=evaluated["eval_chunk_size"],
+                        compare_with_input=FLAGS.compare_with_input,
+                        save_viewer=FLAGS.save_viewer,
+                        output_gt=((step == 0 or is_final_step) and eval_flow_steps == EVAL_FLOW_STEPS[0]),
+                    )
+                    scene_metrics[scene_name] = metrics
+                    input_metrics[scene_name] = metrics_input
+                    message = f"{eval_label} scene={scene_name} flow_steps={eval_flow_steps}: {metrics}"
+                    logger.info(message)
+                    print(message)
+                    if FLAGS.compare_with_input:
+                        logger.info(f"{eval_label} input scene={scene_name} flow_steps={eval_flow_steps}: {metrics_input}")
+                if many:
+                    reports = [("metrics.json", scene_metrics)]
+                    if FLAGS.compare_with_input:
+                        reports.append(("metrics_input.json", input_metrics))
+                    for filename, per_scene in reports:
+                        mean = {
+                            key: sum(values[key] for values in per_scene.values()) / len(per_scene)
+                            for key in next(iter(per_scene.values()))
+                        }
+                        with open(os.path.join(eval_dir, filename), "w") as metric_file:
+                            json.dump({"mean": mean, "scenes": per_scene}, metric_file, indent=2)
+                        message = f"{eval_label} flow_steps={eval_flow_steps} {filename} scene_mean={mean}"
+                        logger.info(message)
+                        print(message)
 
         if (step + 1) % save_interval == 0:
             torch.save(model.state_dict(), os.path.join(output_dir, "checkpoints", f"model_{step:08d}.pth"))
@@ -742,7 +800,7 @@ def main(argv):
     output_dir = FLAGS.output_dir
     os.makedirs(output_dir, exist_ok=True)
     gin.parse_config_files_and_bindings(FLAGS.gin_file, FLAGS.gin_param)
-    set_seed()
+    seed = set_seed()
     logger = ProcessSafeLogger(os.path.join(output_dir, "overfit.log")).get_logger()
     device = torch.device("cuda")
 
@@ -754,11 +812,26 @@ def main(argv):
         dataset.load_tgt_images,
     )):
         raise ValueError("SR dev overfitting requires every source and target payload")
-    scene_idx = dataset.scene_index(FLAGS.scene_name)
-    scene = dataset.load_scene(scene_idx, fit_alignment=FLAGS.alignment)
+    if FLAGS.scene_mode == "one":
+        scene_indices = [dataset.scene_index(FLAGS.scene_name)]
+    else:
+        # Deduplicate scene names while retaining their original dataset indices.
+        unique_scenes = {}
+        for index, entry in enumerate(dataset.folders):
+            unique_scenes.setdefault(entry["scene_name"], index)
+        if not 1 <= FLAGS.scene_count <= len(unique_scenes):
+            raise ValueError(f"scene_count must be between 1 and {len(unique_scenes)}, got {FLAGS.scene_count}")
+        scene_indices = np.random.default_rng(seed).choice(list(unique_scenes.values()), size=FLAGS.scene_count, replace=False).tolist()
+    selection = {
+        "scene_mode": FLAGS.scene_mode, "seed": seed,
+        "scenes": [{"scene_name": dataset.folders[index]["scene_name"], "scene_idx": index} for index in scene_indices],
+    }
+    with open(os.path.join(output_dir, "selected_scenes.json"), "w") as selection_file:
+        json.dump(selection, selection_file, indent=2)
+    logger.info(f"Selected scenes: {selection}")
     training(
         dataset=dataset,
-        scene=scene,
+        scene_indices=scene_indices,
         output_dir=output_dir,
         logger=logger,
         device=device,

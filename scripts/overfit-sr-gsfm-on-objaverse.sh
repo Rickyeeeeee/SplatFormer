@@ -9,11 +9,14 @@ FIT_LR_TO_HR_ROOT=${FIT_LR_TO_HR_ROOT:-${DATASET_ROOT}/test-set-4x-up/objaverse}
 FIT_HR_TO_LR_ROOT=${FIT_HR_TO_LR_ROOT:-${DATASET_ROOT}/test-set-4x-up/objaverse}
 echo "Using GPU: ${GPU_ID}"
 
+# Example: SCENE_MODE=many SCENE_COUNT=4 bash scripts/overfit-sr-gsfm-on-objaverse.sh
+scene_mode=${SCENE_MODE:-one}
+scene_count=${SCENE_COUNT:-1}
 scene_name=${SCENE_NAME:-3e288ee8aced4a0797e66d53536112b1}
-total_steps=${1:-4000}
-save_interval=${2:-4000}
-eval_interval=${3:-400}
-log_image_interval=${4:-400}
+total_steps=${1:-10000}
+save_interval=${2:-10000}
+eval_interval=${3:-1000}
+log_image_interval=${4:-1000}
 alignment=${5:-fit_lr_to_hr}
 attribute_init=${6:-aligned}
 input_resolution=${7:-128}
@@ -25,22 +28,38 @@ flow_noise_std=${12:-${FLOW_NOISE_STD:-0.0}}
 image_l1_loss_weight=${13:-${IMAGE_L1_LOSS_WEIGHT:-1.0}}
 lpips_loss_weight=${14:-${LPIPS_LOSS_WEIGHT:-1.0}}
 velocity_variance_source=${VELOCITY_VARIANCE_SOURCE:-matching}
-gs_statistics_path=${GS_STATISTICS_PATH:-/project/ricky/splatformer-sr-data/test_gs_statistics.json}
+gs_statistics_path=${GS_STATISTICS_PATH:-/project/ricky/splatformer-sr-data-scaled/test_gs_statistics.json}
 flow_t_eps=${FLOW_T_EPS:-1e-4}
 ptv3_drop_path=${PTV3_DROP_PATH:-0.0}
 ptv3_shuffle_orders=${PTV3_SHUFFLE_ORDERS:-True}
 ptv3_shuffle_orders_eval=${PTV3_SHUFFLE_ORDERS_EVAL:-False}
 ptv3_turn_off_bn=${PTV3_TURN_OFF_BN:-True}
-grid_resolution=${GRID_RESOLUTION:-512}
+grid_resolution=${GRID_RESOLUTION:-2048}
 run_date=$(date +%m%d)
 
-out_name=${scene_name}_${alignment}_${attribute_init}_ir${input_resolution}_tr${target_resolution}_gsfm_all_${mix_schedule}_grid${grid_resolution}_input_frame_v1
+scene_label=${scene_name}
+if [[ "${scene_mode}" == "many" ]]; then
+    scene_label=many_${scene_count}
+fi
+
+out_name=${scene_label}_\
+${alignment}_\
+${attribute_init}_\
+ir${input_resolution}_\
+tr${target_resolution}_\
+gsfm_${mix_schedule}_\
+noise${flow_noise_std}_\
+grid${grid_resolution}_\
+scenes${scene_count}
+
 output_root=${OUTPUT_ROOT:-/project2/ricky/experiments/${run_date}/overfit_sr_gsfm_512_input_frame_v1}
 output_dir=${OUTPUT_DIR:-${output_root}/${out_name}}
 
 CUDA_VISIBLE_DEVICES=${GPU_ID} python overfit-sr-gsfm.py \
     --output_dir="${output_dir}" \
     --scene_name="${scene_name}" \
+    --scene_mode="${scene_mode}" \
+    --scene_count="${scene_count}" \
     --alignment="${alignment}" \
     --attribute_init="${attribute_init}" \
     --gin_param="flow_matching.velocity_variance_source='${velocity_variance_source}'" \
