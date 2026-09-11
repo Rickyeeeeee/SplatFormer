@@ -18,7 +18,7 @@ from utils.gpu_utils import seed_everything
 from utils.gs_utils import make_grid
 from utils.log_utils import ProcessSafeLogger
 from utils.loss_utils import SUPPORTED_GS_KEYS
-from utils.metrics import MetricComputer
+from utils.metrics import MetricComputer, render_gs_average_metrics
 from utils.optimizers import build_optimizer, build_scheduler
 
 
@@ -477,7 +477,22 @@ def prepare_overfit_scene(dataset, scene, output_dir, logger, device, flow_cfg):
         f"alignment_info={alignment_info} attribute_init={FLAGS.attribute_init} "
         f"fit_lr_to_hr_root={dataset.fit_lr_to_hr_root} fit_hr_to_lr_root={dataset.fit_hr_to_lr_root}"
     )
+    # Compare fixed Gaussian baselines against the same HR views without changing training RNG state.
+    metric_devices = [device] if torch.device(device).type == "cuda" else []
+    with torch.random.fork_rng(devices=metric_devices):
+        original_source_gs = gpu_utils.move_to_device(input_resolution_entry["gs_params"], device)
+        source_metrics = render_gs_average_metrics(original_source_gs, target_images, target_cameras, eval_chunk_size, device)
+        target_metrics = render_gs_average_metrics(target_gs, target_images, target_cameras, eval_chunk_size, device)
+        matching_metrics = target_metrics if matching_target_gs is target_gs else render_gs_average_metrics(
+            matching_target_gs, target_images, target_cameras, eval_chunk_size, device
+        )
+    baseline_metrics = {
+        "scene_idx": scene["scene_idx"], "view_count": len(target_images),
+        "source_gs": source_metrics, "target_gs": target_metrics, "matching_target_gs": matching_metrics,
+    }
+    logger.info(f"Baseline render metrics scene={scene['scene_name']}: {baseline_metrics}")
     return {
+        "baseline_metrics": baseline_metrics,
         "scene_idx": scene["scene_idx"], "scene_name": scene["scene_name"],
         "source_gs": source_gs, "source_flow_gs": source_flow_gs,
         "target_flow_gs": target_flow_gs, "velocity_variances": velocity_variances,
@@ -625,6 +640,7 @@ def training(
     is_fm_only = mix_cfg["schedule"] == "fm-only"
     many = FLAGS.scene_mode == "many"
     prepared_scenes = []
+    baseline_scene_metrics = {}
     # Cache fixed scene data on CPU; only the active scene needs GPU storage.
     for scene_idx in scene_indices:
         scene_name = dataset.folders[scene_idx]["scene_name"]
@@ -653,8 +669,30 @@ def training(
             f"image_l1_loss_weight={image_l1_loss_weight} lpips_loss_weight={lpips_loss_weight} "
             f"quat_direct_mse={mse_loss_cfg['quat_direct_mse']} loss_weights={flow_loss_weights}"
         )
+        baseline_scene_metrics[scene_name] = prepared.pop("baseline_metrics")
         prepared_scenes.append(gpu_utils.to_cpu(prepared) if many else prepared)
         del scene, prepared
+    # Give every selected scene equal weight, regardless of its view count.
+    baseline_mean = {
+        gs_key: {
+            metric: sum(values[gs_key][metric] for values in baseline_scene_metrics.values()) / len(baseline_scene_metrics)
+            for metric in ("psnr", "ssim", "lpips")
+        }
+        for gs_key in ("source_gs", "target_gs", "matching_target_gs")
+    }
+    baseline_report = {
+        "source_resolution": dataset.src_resolution,
+        "target_resolution": dataset.tgt_resolution,
+        "evaluation_resolution": dataset.tgt_resolution,
+        "alignment": FLAGS.alignment,
+        "scenes": baseline_scene_metrics, "mean": baseline_mean,
+    }
+    baseline_path = os.path.join(output_dir, "baseline_render_metrics.json")
+    with open(baseline_path, "w") as baseline_file:
+        json.dump(baseline_report, baseline_file, indent=2)
+        baseline_file.write("\n")
+    logger.info(f"Baseline render metrics saved to {baseline_path}: mean={baseline_mean}")
+    # exit()
     os.makedirs(os.path.join(output_dir, "checkpoints"), exist_ok=True)
     model = GSFlowPredictor().to(device)
     missing_outputs = sorted(set(SUPPORTED_GS_KEYS) - set(model.output_features))
