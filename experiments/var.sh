@@ -59,16 +59,24 @@
 # 0911
 GPU_ID=0 \
 BATCH_SIZE=4 \
-GRID_RESOLUTION=2048 \
+GRID_RESOLUTION=1024 \
 SCENE_MODE=many \
 SCENE_COUNT=19 \
-VELOCITY_VARIANCE_SOURCE=matching \
+VELOCITY_VARIANCE_SOURCE=precomputed_aggregate \
 bash scripts/overfit-sr-gsfm-on-objaverse.sh 
 
-GPU_ID=0 \
-BATCH_SIZE=1 \
-GRID_RESOLUTION=2048 \
-SCENE_MODE=many \
-SCENE_COUNT=19 \
-VELOCITY_VARIANCE_SOURCE=matching \
-bash scripts/overfit-sr-gsfm-on-objaverse.sh 
+# GPU_ID=0 \
+# BATCH_SIZE=4 \
+# GRID_RESOLUTION=4096 \
+# SCENE_MODE=many \
+# SCENE_COUNT=19 \
+# VELOCITY_VARIANCE_SOURCE=precomputed_aggregate \
+# bash scripts/overfit-sr-gsfm-on-objaverse.sh 
+
+# GPU_ID=0 \
+# BATCH_SIZE=1 \
+# GRID_RESOLUTION=2048 \
+# SCENE_MODE=many \
+# SCENE_COUNT=19 \
+# VELOCITY_VARIANCE_SOURCE=matching \
+# bash scripts/overfit-sr-gsfm-on-objaverse.sh 

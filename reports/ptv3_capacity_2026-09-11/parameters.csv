@@ -1,0 +1,519 @@
+name,shape,parameters,trainable,category
+backbone.backbone.fc_t1.weight,"[12, 3]",36,True,Time conditioning
+backbone.backbone.fc_t1.bias,[12],12,True,Time conditioning
+backbone.backbone.fc_t2.weight,"[3, 12]",36,True,Time conditioning
+backbone.backbone.fc_t2.bias,[3],3,True,Time conditioning
+backbone.backbone.embedding.0.weight,"[64, 23]",1472,True,Stem + pool/unpool
+backbone.backbone.embedding.0.bias,[64],64,True,Stem + pool/unpool
+backbone.backbone.enc.enc0.block0.cpe.0.weight,"[64, 3, 3, 3, 64]",110592,True,3D convolution in CPE
+backbone.backbone.enc.enc0.block0.cpe.0.bias,[64],64,True,3D convolution in CPE
+backbone.backbone.enc.enc0.block0.cpe.1.weight,"[64, 64]",4096,True,CPE linear + norm
+backbone.backbone.enc.enc0.block0.cpe.1.bias,[64],64,True,CPE linear + norm
+backbone.backbone.enc.enc0.block0.cpe.2.weight,[64],64,True,CPE linear + norm
+backbone.backbone.enc.enc0.block0.cpe.2.bias,[64],64,True,CPE linear + norm
+backbone.backbone.enc.enc0.block0.norm1.0.weight,[64],64,True,Attention/MLP norms
+backbone.backbone.enc.enc0.block0.norm1.0.bias,[64],64,True,Attention/MLP norms
+backbone.backbone.enc.enc0.block0.attn.qkv.weight,"[192, 64]",12288,True,Attention QKV + projection
+backbone.backbone.enc.enc0.block0.attn.qkv.bias,[192],192,True,Attention QKV + projection
+backbone.backbone.enc.enc0.block0.attn.proj.weight,"[64, 64]",4096,True,Attention QKV + projection
+backbone.backbone.enc.enc0.block0.attn.proj.bias,[64],64,True,Attention QKV + projection
+backbone.backbone.enc.enc0.block0.norm2.0.weight,[64],64,True,Attention/MLP norms
+backbone.backbone.enc.enc0.block0.norm2.0.bias,[64],64,True,Attention/MLP norms
+backbone.backbone.enc.enc0.block0.mlp.0.fc1.weight,"[256, 64]",16384,True,Block feed-forward MLP
+backbone.backbone.enc.enc0.block0.mlp.0.fc1.bias,[256],256,True,Block feed-forward MLP
+backbone.backbone.enc.enc0.block0.mlp.0.fc2.weight,"[64, 256]",16384,True,Block feed-forward MLP
+backbone.backbone.enc.enc0.block0.mlp.0.fc2.bias,[64],64,True,Block feed-forward MLP
+backbone.backbone.enc.enc0.block0.t_mlp.weight,"[64, 3]",192,True,Time conditioning
+backbone.backbone.enc.enc0.block0.t_mlp.bias,[64],64,True,Time conditioning
+backbone.backbone.enc.enc0.block1.cpe.0.weight,"[64, 3, 3, 3, 64]",110592,True,3D convolution in CPE
+backbone.backbone.enc.enc0.block1.cpe.0.bias,[64],64,True,3D convolution in CPE
+backbone.backbone.enc.enc0.block1.cpe.1.weight,"[64, 64]",4096,True,CPE linear + norm
+backbone.backbone.enc.enc0.block1.cpe.1.bias,[64],64,True,CPE linear + norm
+backbone.backbone.enc.enc0.block1.cpe.2.weight,[64],64,True,CPE linear + norm
+backbone.backbone.enc.enc0.block1.cpe.2.bias,[64],64,True,CPE linear + norm
+backbone.backbone.enc.enc0.block1.norm1.0.weight,[64],64,True,Attention/MLP norms
+backbone.backbone.enc.enc0.block1.norm1.0.bias,[64],64,True,Attention/MLP norms
+backbone.backbone.enc.enc0.block1.attn.qkv.weight,"[192, 64]",12288,True,Attention QKV + projection
+backbone.backbone.enc.enc0.block1.attn.qkv.bias,[192],192,True,Attention QKV + projection
+backbone.backbone.enc.enc0.block1.attn.proj.weight,"[64, 64]",4096,True,Attention QKV + projection
+backbone.backbone.enc.enc0.block1.attn.proj.bias,[64],64,True,Attention QKV + projection
+backbone.backbone.enc.enc0.block1.norm2.0.weight,[64],64,True,Attention/MLP norms
+backbone.backbone.enc.enc0.block1.norm2.0.bias,[64],64,True,Attention/MLP norms
+backbone.backbone.enc.enc0.block1.mlp.0.fc1.weight,"[256, 64]",16384,True,Block feed-forward MLP
+backbone.backbone.enc.enc0.block1.mlp.0.fc1.bias,[256],256,True,Block feed-forward MLP
+backbone.backbone.enc.enc0.block1.mlp.0.fc2.weight,"[64, 256]",16384,True,Block feed-forward MLP
+backbone.backbone.enc.enc0.block1.mlp.0.fc2.bias,[64],64,True,Block feed-forward MLP
+backbone.backbone.enc.enc0.block1.t_mlp.weight,"[64, 3]",192,True,Time conditioning
+backbone.backbone.enc.enc0.block1.t_mlp.bias,[64],64,True,Time conditioning
+backbone.backbone.enc.enc1.down.proj.weight,"[96, 64]",6144,True,Stem + pool/unpool
+backbone.backbone.enc.enc1.down.proj.bias,[96],96,True,Stem + pool/unpool
+backbone.backbone.enc.enc1.block0.cpe.0.weight,"[96, 3, 3, 3, 96]",248832,True,3D convolution in CPE
+backbone.backbone.enc.enc1.block0.cpe.0.bias,[96],96,True,3D convolution in CPE
+backbone.backbone.enc.enc1.block0.cpe.1.weight,"[96, 96]",9216,True,CPE linear + norm
+backbone.backbone.enc.enc1.block0.cpe.1.bias,[96],96,True,CPE linear + norm
+backbone.backbone.enc.enc1.block0.cpe.2.weight,[96],96,True,CPE linear + norm
+backbone.backbone.enc.enc1.block0.cpe.2.bias,[96],96,True,CPE linear + norm
+backbone.backbone.enc.enc1.block0.norm1.0.weight,[96],96,True,Attention/MLP norms
+backbone.backbone.enc.enc1.block0.norm1.0.bias,[96],96,True,Attention/MLP norms
+backbone.backbone.enc.enc1.block0.attn.qkv.weight,"[288, 96]",27648,True,Attention QKV + projection
+backbone.backbone.enc.enc1.block0.attn.qkv.bias,[288],288,True,Attention QKV + projection
+backbone.backbone.enc.enc1.block0.attn.proj.weight,"[96, 96]",9216,True,Attention QKV + projection
+backbone.backbone.enc.enc1.block0.attn.proj.bias,[96],96,True,Attention QKV + projection
+backbone.backbone.enc.enc1.block0.norm2.0.weight,[96],96,True,Attention/MLP norms
+backbone.backbone.enc.enc1.block0.norm2.0.bias,[96],96,True,Attention/MLP norms
+backbone.backbone.enc.enc1.block0.mlp.0.fc1.weight,"[384, 96]",36864,True,Block feed-forward MLP
+backbone.backbone.enc.enc1.block0.mlp.0.fc1.bias,[384],384,True,Block feed-forward MLP
+backbone.backbone.enc.enc1.block0.mlp.0.fc2.weight,"[96, 384]",36864,True,Block feed-forward MLP
+backbone.backbone.enc.enc1.block0.mlp.0.fc2.bias,[96],96,True,Block feed-forward MLP
+backbone.backbone.enc.enc1.block0.t_mlp.weight,"[96, 3]",288,True,Time conditioning
+backbone.backbone.enc.enc1.block0.t_mlp.bias,[96],96,True,Time conditioning
+backbone.backbone.enc.enc1.block1.cpe.0.weight,"[96, 3, 3, 3, 96]",248832,True,3D convolution in CPE
+backbone.backbone.enc.enc1.block1.cpe.0.bias,[96],96,True,3D convolution in CPE
+backbone.backbone.enc.enc1.block1.cpe.1.weight,"[96, 96]",9216,True,CPE linear + norm
+backbone.backbone.enc.enc1.block1.cpe.1.bias,[96],96,True,CPE linear + norm
+backbone.backbone.enc.enc1.block1.cpe.2.weight,[96],96,True,CPE linear + norm
+backbone.backbone.enc.enc1.block1.cpe.2.bias,[96],96,True,CPE linear + norm
+backbone.backbone.enc.enc1.block1.norm1.0.weight,[96],96,True,Attention/MLP norms
+backbone.backbone.enc.enc1.block1.norm1.0.bias,[96],96,True,Attention/MLP norms
+backbone.backbone.enc.enc1.block1.attn.qkv.weight,"[288, 96]",27648,True,Attention QKV + projection
+backbone.backbone.enc.enc1.block1.attn.qkv.bias,[288],288,True,Attention QKV + projection
+backbone.backbone.enc.enc1.block1.attn.proj.weight,"[96, 96]",9216,True,Attention QKV + projection
+backbone.backbone.enc.enc1.block1.attn.proj.bias,[96],96,True,Attention QKV + projection
+backbone.backbone.enc.enc1.block1.norm2.0.weight,[96],96,True,Attention/MLP norms
+backbone.backbone.enc.enc1.block1.norm2.0.bias,[96],96,True,Attention/MLP norms
+backbone.backbone.enc.enc1.block1.mlp.0.fc1.weight,"[384, 96]",36864,True,Block feed-forward MLP
+backbone.backbone.enc.enc1.block1.mlp.0.fc1.bias,[384],384,True,Block feed-forward MLP
+backbone.backbone.enc.enc1.block1.mlp.0.fc2.weight,"[96, 384]",36864,True,Block feed-forward MLP
+backbone.backbone.enc.enc1.block1.mlp.0.fc2.bias,[96],96,True,Block feed-forward MLP
+backbone.backbone.enc.enc1.block1.t_mlp.weight,"[96, 3]",288,True,Time conditioning
+backbone.backbone.enc.enc1.block1.t_mlp.bias,[96],96,True,Time conditioning
+backbone.backbone.enc.enc2.down.proj.weight,"[128, 96]",12288,True,Stem + pool/unpool
+backbone.backbone.enc.enc2.down.proj.bias,[128],128,True,Stem + pool/unpool
+backbone.backbone.enc.enc2.block0.cpe.0.weight,"[128, 3, 3, 3, 128]",442368,True,3D convolution in CPE
+backbone.backbone.enc.enc2.block0.cpe.0.bias,[128],128,True,3D convolution in CPE
+backbone.backbone.enc.enc2.block0.cpe.1.weight,"[128, 128]",16384,True,CPE linear + norm
+backbone.backbone.enc.enc2.block0.cpe.1.bias,[128],128,True,CPE linear + norm
+backbone.backbone.enc.enc2.block0.cpe.2.weight,[128],128,True,CPE linear + norm
+backbone.backbone.enc.enc2.block0.cpe.2.bias,[128],128,True,CPE linear + norm
+backbone.backbone.enc.enc2.block0.norm1.0.weight,[128],128,True,Attention/MLP norms
+backbone.backbone.enc.enc2.block0.norm1.0.bias,[128],128,True,Attention/MLP norms
+backbone.backbone.enc.enc2.block0.attn.qkv.weight,"[384, 128]",49152,True,Attention QKV + projection
+backbone.backbone.enc.enc2.block0.attn.qkv.bias,[384],384,True,Attention QKV + projection
+backbone.backbone.enc.enc2.block0.attn.proj.weight,"[128, 128]",16384,True,Attention QKV + projection
+backbone.backbone.enc.enc2.block0.attn.proj.bias,[128],128,True,Attention QKV + projection
+backbone.backbone.enc.enc2.block0.norm2.0.weight,[128],128,True,Attention/MLP norms
+backbone.backbone.enc.enc2.block0.norm2.0.bias,[128],128,True,Attention/MLP norms
+backbone.backbone.enc.enc2.block0.mlp.0.fc1.weight,"[512, 128]",65536,True,Block feed-forward MLP
+backbone.backbone.enc.enc2.block0.mlp.0.fc1.bias,[512],512,True,Block feed-forward MLP
+backbone.backbone.enc.enc2.block0.mlp.0.fc2.weight,"[128, 512]",65536,True,Block feed-forward MLP
+backbone.backbone.enc.enc2.block0.mlp.0.fc2.bias,[128],128,True,Block feed-forward MLP
+backbone.backbone.enc.enc2.block0.t_mlp.weight,"[128, 3]",384,True,Time conditioning
+backbone.backbone.enc.enc2.block0.t_mlp.bias,[128],128,True,Time conditioning
+backbone.backbone.enc.enc2.block1.cpe.0.weight,"[128, 3, 3, 3, 128]",442368,True,3D convolution in CPE
+backbone.backbone.enc.enc2.block1.cpe.0.bias,[128],128,True,3D convolution in CPE
+backbone.backbone.enc.enc2.block1.cpe.1.weight,"[128, 128]",16384,True,CPE linear + norm
+backbone.backbone.enc.enc2.block1.cpe.1.bias,[128],128,True,CPE linear + norm
+backbone.backbone.enc.enc2.block1.cpe.2.weight,[128],128,True,CPE linear + norm
+backbone.backbone.enc.enc2.block1.cpe.2.bias,[128],128,True,CPE linear + norm
+backbone.backbone.enc.enc2.block1.norm1.0.weight,[128],128,True,Attention/MLP norms
+backbone.backbone.enc.enc2.block1.norm1.0.bias,[128],128,True,Attention/MLP norms
+backbone.backbone.enc.enc2.block1.attn.qkv.weight,"[384, 128]",49152,True,Attention QKV + projection
+backbone.backbone.enc.enc2.block1.attn.qkv.bias,[384],384,True,Attention QKV + projection
+backbone.backbone.enc.enc2.block1.attn.proj.weight,"[128, 128]",16384,True,Attention QKV + projection
+backbone.backbone.enc.enc2.block1.attn.proj.bias,[128],128,True,Attention QKV + projection
+backbone.backbone.enc.enc2.block1.norm2.0.weight,[128],128,True,Attention/MLP norms
+backbone.backbone.enc.enc2.block1.norm2.0.bias,[128],128,True,Attention/MLP norms
+backbone.backbone.enc.enc2.block1.mlp.0.fc1.weight,"[512, 128]",65536,True,Block feed-forward MLP
+backbone.backbone.enc.enc2.block1.mlp.0.fc1.bias,[512],512,True,Block feed-forward MLP
+backbone.backbone.enc.enc2.block1.mlp.0.fc2.weight,"[128, 512]",65536,True,Block feed-forward MLP
+backbone.backbone.enc.enc2.block1.mlp.0.fc2.bias,[128],128,True,Block feed-forward MLP
+backbone.backbone.enc.enc2.block1.t_mlp.weight,"[128, 3]",384,True,Time conditioning
+backbone.backbone.enc.enc2.block1.t_mlp.bias,[128],128,True,Time conditioning
+backbone.backbone.enc.enc3.down.proj.weight,"[256, 128]",32768,True,Stem + pool/unpool
+backbone.backbone.enc.enc3.down.proj.bias,[256],256,True,Stem + pool/unpool
+backbone.backbone.enc.enc3.block0.cpe.0.weight,"[256, 3, 3, 3, 256]",1769472,True,3D convolution in CPE
+backbone.backbone.enc.enc3.block0.cpe.0.bias,[256],256,True,3D convolution in CPE
+backbone.backbone.enc.enc3.block0.cpe.1.weight,"[256, 256]",65536,True,CPE linear + norm
+backbone.backbone.enc.enc3.block0.cpe.1.bias,[256],256,True,CPE linear + norm
+backbone.backbone.enc.enc3.block0.cpe.2.weight,[256],256,True,CPE linear + norm
+backbone.backbone.enc.enc3.block0.cpe.2.bias,[256],256,True,CPE linear + norm
+backbone.backbone.enc.enc3.block0.norm1.0.weight,[256],256,True,Attention/MLP norms
+backbone.backbone.enc.enc3.block0.norm1.0.bias,[256],256,True,Attention/MLP norms
+backbone.backbone.enc.enc3.block0.attn.qkv.weight,"[768, 256]",196608,True,Attention QKV + projection
+backbone.backbone.enc.enc3.block0.attn.qkv.bias,[768],768,True,Attention QKV + projection
+backbone.backbone.enc.enc3.block0.attn.proj.weight,"[256, 256]",65536,True,Attention QKV + projection
+backbone.backbone.enc.enc3.block0.attn.proj.bias,[256],256,True,Attention QKV + projection
+backbone.backbone.enc.enc3.block0.norm2.0.weight,[256],256,True,Attention/MLP norms
+backbone.backbone.enc.enc3.block0.norm2.0.bias,[256],256,True,Attention/MLP norms
+backbone.backbone.enc.enc3.block0.mlp.0.fc1.weight,"[1024, 256]",262144,True,Block feed-forward MLP
+backbone.backbone.enc.enc3.block0.mlp.0.fc1.bias,[1024],1024,True,Block feed-forward MLP
+backbone.backbone.enc.enc3.block0.mlp.0.fc2.weight,"[256, 1024]",262144,True,Block feed-forward MLP
+backbone.backbone.enc.enc3.block0.mlp.0.fc2.bias,[256],256,True,Block feed-forward MLP
+backbone.backbone.enc.enc3.block0.t_mlp.weight,"[256, 3]",768,True,Time conditioning
+backbone.backbone.enc.enc3.block0.t_mlp.bias,[256],256,True,Time conditioning
+backbone.backbone.enc.enc3.block1.cpe.0.weight,"[256, 3, 3, 3, 256]",1769472,True,3D convolution in CPE
+backbone.backbone.enc.enc3.block1.cpe.0.bias,[256],256,True,3D convolution in CPE
+backbone.backbone.enc.enc3.block1.cpe.1.weight,"[256, 256]",65536,True,CPE linear + norm
+backbone.backbone.enc.enc3.block1.cpe.1.bias,[256],256,True,CPE linear + norm
+backbone.backbone.enc.enc3.block1.cpe.2.weight,[256],256,True,CPE linear + norm
+backbone.backbone.enc.enc3.block1.cpe.2.bias,[256],256,True,CPE linear + norm
+backbone.backbone.enc.enc3.block1.norm1.0.weight,[256],256,True,Attention/MLP norms
+backbone.backbone.enc.enc3.block1.norm1.0.bias,[256],256,True,Attention/MLP norms
+backbone.backbone.enc.enc3.block1.attn.qkv.weight,"[768, 256]",196608,True,Attention QKV + projection
+backbone.backbone.enc.enc3.block1.attn.qkv.bias,[768],768,True,Attention QKV + projection
+backbone.backbone.enc.enc3.block1.attn.proj.weight,"[256, 256]",65536,True,Attention QKV + projection
+backbone.backbone.enc.enc3.block1.attn.proj.bias,[256],256,True,Attention QKV + projection
+backbone.backbone.enc.enc3.block1.norm2.0.weight,[256],256,True,Attention/MLP norms
+backbone.backbone.enc.enc3.block1.norm2.0.bias,[256],256,True,Attention/MLP norms
+backbone.backbone.enc.enc3.block1.mlp.0.fc1.weight,"[1024, 256]",262144,True,Block feed-forward MLP
+backbone.backbone.enc.enc3.block1.mlp.0.fc1.bias,[1024],1024,True,Block feed-forward MLP
+backbone.backbone.enc.enc3.block1.mlp.0.fc2.weight,"[256, 1024]",262144,True,Block feed-forward MLP
+backbone.backbone.enc.enc3.block1.mlp.0.fc2.bias,[256],256,True,Block feed-forward MLP
+backbone.backbone.enc.enc3.block1.t_mlp.weight,"[256, 3]",768,True,Time conditioning
+backbone.backbone.enc.enc3.block1.t_mlp.bias,[256],256,True,Time conditioning
+backbone.backbone.enc.enc3.block2.cpe.0.weight,"[256, 3, 3, 3, 256]",1769472,True,3D convolution in CPE
+backbone.backbone.enc.enc3.block2.cpe.0.bias,[256],256,True,3D convolution in CPE
+backbone.backbone.enc.enc3.block2.cpe.1.weight,"[256, 256]",65536,True,CPE linear + norm
+backbone.backbone.enc.enc3.block2.cpe.1.bias,[256],256,True,CPE linear + norm
+backbone.backbone.enc.enc3.block2.cpe.2.weight,[256],256,True,CPE linear + norm
+backbone.backbone.enc.enc3.block2.cpe.2.bias,[256],256,True,CPE linear + norm
+backbone.backbone.enc.enc3.block2.norm1.0.weight,[256],256,True,Attention/MLP norms
+backbone.backbone.enc.enc3.block2.norm1.0.bias,[256],256,True,Attention/MLP norms
+backbone.backbone.enc.enc3.block2.attn.qkv.weight,"[768, 256]",196608,True,Attention QKV + projection
+backbone.backbone.enc.enc3.block2.attn.qkv.bias,[768],768,True,Attention QKV + projection
+backbone.backbone.enc.enc3.block2.attn.proj.weight,"[256, 256]",65536,True,Attention QKV + projection
+backbone.backbone.enc.enc3.block2.attn.proj.bias,[256],256,True,Attention QKV + projection
+backbone.backbone.enc.enc3.block2.norm2.0.weight,[256],256,True,Attention/MLP norms
+backbone.backbone.enc.enc3.block2.norm2.0.bias,[256],256,True,Attention/MLP norms
+backbone.backbone.enc.enc3.block2.mlp.0.fc1.weight,"[1024, 256]",262144,True,Block feed-forward MLP
+backbone.backbone.enc.enc3.block2.mlp.0.fc1.bias,[1024],1024,True,Block feed-forward MLP
+backbone.backbone.enc.enc3.block2.mlp.0.fc2.weight,"[256, 1024]",262144,True,Block feed-forward MLP
+backbone.backbone.enc.enc3.block2.mlp.0.fc2.bias,[256],256,True,Block feed-forward MLP
+backbone.backbone.enc.enc3.block2.t_mlp.weight,"[256, 3]",768,True,Time conditioning
+backbone.backbone.enc.enc3.block2.t_mlp.bias,[256],256,True,Time conditioning
+backbone.backbone.enc.enc3.block3.cpe.0.weight,"[256, 3, 3, 3, 256]",1769472,True,3D convolution in CPE
+backbone.backbone.enc.enc3.block3.cpe.0.bias,[256],256,True,3D convolution in CPE
+backbone.backbone.enc.enc3.block3.cpe.1.weight,"[256, 256]",65536,True,CPE linear + norm
+backbone.backbone.enc.enc3.block3.cpe.1.bias,[256],256,True,CPE linear + norm
+backbone.backbone.enc.enc3.block3.cpe.2.weight,[256],256,True,CPE linear + norm
+backbone.backbone.enc.enc3.block3.cpe.2.bias,[256],256,True,CPE linear + norm
+backbone.backbone.enc.enc3.block3.norm1.0.weight,[256],256,True,Attention/MLP norms
+backbone.backbone.enc.enc3.block3.norm1.0.bias,[256],256,True,Attention/MLP norms
+backbone.backbone.enc.enc3.block3.attn.qkv.weight,"[768, 256]",196608,True,Attention QKV + projection
+backbone.backbone.enc.enc3.block3.attn.qkv.bias,[768],768,True,Attention QKV + projection
+backbone.backbone.enc.enc3.block3.attn.proj.weight,"[256, 256]",65536,True,Attention QKV + projection
+backbone.backbone.enc.enc3.block3.attn.proj.bias,[256],256,True,Attention QKV + projection
+backbone.backbone.enc.enc3.block3.norm2.0.weight,[256],256,True,Attention/MLP norms
+backbone.backbone.enc.enc3.block3.norm2.0.bias,[256],256,True,Attention/MLP norms
+backbone.backbone.enc.enc3.block3.mlp.0.fc1.weight,"[1024, 256]",262144,True,Block feed-forward MLP
+backbone.backbone.enc.enc3.block3.mlp.0.fc1.bias,[1024],1024,True,Block feed-forward MLP
+backbone.backbone.enc.enc3.block3.mlp.0.fc2.weight,"[256, 1024]",262144,True,Block feed-forward MLP
+backbone.backbone.enc.enc3.block3.mlp.0.fc2.bias,[256],256,True,Block feed-forward MLP
+backbone.backbone.enc.enc3.block3.t_mlp.weight,"[256, 3]",768,True,Time conditioning
+backbone.backbone.enc.enc3.block3.t_mlp.bias,[256],256,True,Time conditioning
+backbone.backbone.enc.enc3.block4.cpe.0.weight,"[256, 3, 3, 3, 256]",1769472,True,3D convolution in CPE
+backbone.backbone.enc.enc3.block4.cpe.0.bias,[256],256,True,3D convolution in CPE
+backbone.backbone.enc.enc3.block4.cpe.1.weight,"[256, 256]",65536,True,CPE linear + norm
+backbone.backbone.enc.enc3.block4.cpe.1.bias,[256],256,True,CPE linear + norm
+backbone.backbone.enc.enc3.block4.cpe.2.weight,[256],256,True,CPE linear + norm
+backbone.backbone.enc.enc3.block4.cpe.2.bias,[256],256,True,CPE linear + norm
+backbone.backbone.enc.enc3.block4.norm1.0.weight,[256],256,True,Attention/MLP norms
+backbone.backbone.enc.enc3.block4.norm1.0.bias,[256],256,True,Attention/MLP norms
+backbone.backbone.enc.enc3.block4.attn.qkv.weight,"[768, 256]",196608,True,Attention QKV + projection
+backbone.backbone.enc.enc3.block4.attn.qkv.bias,[768],768,True,Attention QKV + projection
+backbone.backbone.enc.enc3.block4.attn.proj.weight,"[256, 256]",65536,True,Attention QKV + projection
+backbone.backbone.enc.enc3.block4.attn.proj.bias,[256],256,True,Attention QKV + projection
+backbone.backbone.enc.enc3.block4.norm2.0.weight,[256],256,True,Attention/MLP norms
+backbone.backbone.enc.enc3.block4.norm2.0.bias,[256],256,True,Attention/MLP norms
+backbone.backbone.enc.enc3.block4.mlp.0.fc1.weight,"[1024, 256]",262144,True,Block feed-forward MLP
+backbone.backbone.enc.enc3.block4.mlp.0.fc1.bias,[1024],1024,True,Block feed-forward MLP
+backbone.backbone.enc.enc3.block4.mlp.0.fc2.weight,"[256, 1024]",262144,True,Block feed-forward MLP
+backbone.backbone.enc.enc3.block4.mlp.0.fc2.bias,[256],256,True,Block feed-forward MLP
+backbone.backbone.enc.enc3.block4.t_mlp.weight,"[256, 3]",768,True,Time conditioning
+backbone.backbone.enc.enc3.block4.t_mlp.bias,[256],256,True,Time conditioning
+backbone.backbone.enc.enc3.block5.cpe.0.weight,"[256, 3, 3, 3, 256]",1769472,True,3D convolution in CPE
+backbone.backbone.enc.enc3.block5.cpe.0.bias,[256],256,True,3D convolution in CPE
+backbone.backbone.enc.enc3.block5.cpe.1.weight,"[256, 256]",65536,True,CPE linear + norm
+backbone.backbone.enc.enc3.block5.cpe.1.bias,[256],256,True,CPE linear + norm
+backbone.backbone.enc.enc3.block5.cpe.2.weight,[256],256,True,CPE linear + norm
+backbone.backbone.enc.enc3.block5.cpe.2.bias,[256],256,True,CPE linear + norm
+backbone.backbone.enc.enc3.block5.norm1.0.weight,[256],256,True,Attention/MLP norms
+backbone.backbone.enc.enc3.block5.norm1.0.bias,[256],256,True,Attention/MLP norms
+backbone.backbone.enc.enc3.block5.attn.qkv.weight,"[768, 256]",196608,True,Attention QKV + projection
+backbone.backbone.enc.enc3.block5.attn.qkv.bias,[768],768,True,Attention QKV + projection
+backbone.backbone.enc.enc3.block5.attn.proj.weight,"[256, 256]",65536,True,Attention QKV + projection
+backbone.backbone.enc.enc3.block5.attn.proj.bias,[256],256,True,Attention QKV + projection
+backbone.backbone.enc.enc3.block5.norm2.0.weight,[256],256,True,Attention/MLP norms
+backbone.backbone.enc.enc3.block5.norm2.0.bias,[256],256,True,Attention/MLP norms
+backbone.backbone.enc.enc3.block5.mlp.0.fc1.weight,"[1024, 256]",262144,True,Block feed-forward MLP
+backbone.backbone.enc.enc3.block5.mlp.0.fc1.bias,[1024],1024,True,Block feed-forward MLP
+backbone.backbone.enc.enc3.block5.mlp.0.fc2.weight,"[256, 1024]",262144,True,Block feed-forward MLP
+backbone.backbone.enc.enc3.block5.mlp.0.fc2.bias,[256],256,True,Block feed-forward MLP
+backbone.backbone.enc.enc3.block5.t_mlp.weight,"[256, 3]",768,True,Time conditioning
+backbone.backbone.enc.enc3.block5.t_mlp.bias,[256],256,True,Time conditioning
+backbone.backbone.enc.enc4.down.proj.weight,"[512, 256]",131072,True,Stem + pool/unpool
+backbone.backbone.enc.enc4.down.proj.bias,[512],512,True,Stem + pool/unpool
+backbone.backbone.enc.enc4.block0.cpe.0.weight,"[512, 3, 3, 3, 512]",7077888,True,3D convolution in CPE
+backbone.backbone.enc.enc4.block0.cpe.0.bias,[512],512,True,3D convolution in CPE
+backbone.backbone.enc.enc4.block0.cpe.1.weight,"[512, 512]",262144,True,CPE linear + norm
+backbone.backbone.enc.enc4.block0.cpe.1.bias,[512],512,True,CPE linear + norm
+backbone.backbone.enc.enc4.block0.cpe.2.weight,[512],512,True,CPE linear + norm
+backbone.backbone.enc.enc4.block0.cpe.2.bias,[512],512,True,CPE linear + norm
+backbone.backbone.enc.enc4.block0.norm1.0.weight,[512],512,True,Attention/MLP norms
+backbone.backbone.enc.enc4.block0.norm1.0.bias,[512],512,True,Attention/MLP norms
+backbone.backbone.enc.enc4.block0.attn.qkv.weight,"[1536, 512]",786432,True,Attention QKV + projection
+backbone.backbone.enc.enc4.block0.attn.qkv.bias,[1536],1536,True,Attention QKV + projection
+backbone.backbone.enc.enc4.block0.attn.proj.weight,"[512, 512]",262144,True,Attention QKV + projection
+backbone.backbone.enc.enc4.block0.attn.proj.bias,[512],512,True,Attention QKV + projection
+backbone.backbone.enc.enc4.block0.norm2.0.weight,[512],512,True,Attention/MLP norms
+backbone.backbone.enc.enc4.block0.norm2.0.bias,[512],512,True,Attention/MLP norms
+backbone.backbone.enc.enc4.block0.mlp.0.fc1.weight,"[2048, 512]",1048576,True,Block feed-forward MLP
+backbone.backbone.enc.enc4.block0.mlp.0.fc1.bias,[2048],2048,True,Block feed-forward MLP
+backbone.backbone.enc.enc4.block0.mlp.0.fc2.weight,"[512, 2048]",1048576,True,Block feed-forward MLP
+backbone.backbone.enc.enc4.block0.mlp.0.fc2.bias,[512],512,True,Block feed-forward MLP
+backbone.backbone.enc.enc4.block0.t_mlp.weight,"[512, 3]",1536,True,Time conditioning
+backbone.backbone.enc.enc4.block0.t_mlp.bias,[512],512,True,Time conditioning
+backbone.backbone.enc.enc4.block1.cpe.0.weight,"[512, 3, 3, 3, 512]",7077888,True,3D convolution in CPE
+backbone.backbone.enc.enc4.block1.cpe.0.bias,[512],512,True,3D convolution in CPE
+backbone.backbone.enc.enc4.block1.cpe.1.weight,"[512, 512]",262144,True,CPE linear + norm
+backbone.backbone.enc.enc4.block1.cpe.1.bias,[512],512,True,CPE linear + norm
+backbone.backbone.enc.enc4.block1.cpe.2.weight,[512],512,True,CPE linear + norm
+backbone.backbone.enc.enc4.block1.cpe.2.bias,[512],512,True,CPE linear + norm
+backbone.backbone.enc.enc4.block1.norm1.0.weight,[512],512,True,Attention/MLP norms
+backbone.backbone.enc.enc4.block1.norm1.0.bias,[512],512,True,Attention/MLP norms
+backbone.backbone.enc.enc4.block1.attn.qkv.weight,"[1536, 512]",786432,True,Attention QKV + projection
+backbone.backbone.enc.enc4.block1.attn.qkv.bias,[1536],1536,True,Attention QKV + projection
+backbone.backbone.enc.enc4.block1.attn.proj.weight,"[512, 512]",262144,True,Attention QKV + projection
+backbone.backbone.enc.enc4.block1.attn.proj.bias,[512],512,True,Attention QKV + projection
+backbone.backbone.enc.enc4.block1.norm2.0.weight,[512],512,True,Attention/MLP norms
+backbone.backbone.enc.enc4.block1.norm2.0.bias,[512],512,True,Attention/MLP norms
+backbone.backbone.enc.enc4.block1.mlp.0.fc1.weight,"[2048, 512]",1048576,True,Block feed-forward MLP
+backbone.backbone.enc.enc4.block1.mlp.0.fc1.bias,[2048],2048,True,Block feed-forward MLP
+backbone.backbone.enc.enc4.block1.mlp.0.fc2.weight,"[512, 2048]",1048576,True,Block feed-forward MLP
+backbone.backbone.enc.enc4.block1.mlp.0.fc2.bias,[512],512,True,Block feed-forward MLP
+backbone.backbone.enc.enc4.block1.t_mlp.weight,"[512, 3]",1536,True,Time conditioning
+backbone.backbone.enc.enc4.block1.t_mlp.bias,[512],512,True,Time conditioning
+backbone.backbone.dec.dec3.up.proj.0.weight,"[256, 512]",131072,True,Stem + pool/unpool
+backbone.backbone.dec.dec3.up.proj.0.bias,[256],256,True,Stem + pool/unpool
+backbone.backbone.dec.dec3.up.proj_skip.0.weight,"[256, 256]",65536,True,Stem + pool/unpool
+backbone.backbone.dec.dec3.up.proj_skip.0.bias,[256],256,True,Stem + pool/unpool
+backbone.backbone.dec.dec3.block0.cpe.0.weight,"[256, 3, 3, 3, 256]",1769472,True,3D convolution in CPE
+backbone.backbone.dec.dec3.block0.cpe.0.bias,[256],256,True,3D convolution in CPE
+backbone.backbone.dec.dec3.block0.cpe.1.weight,"[256, 256]",65536,True,CPE linear + norm
+backbone.backbone.dec.dec3.block0.cpe.1.bias,[256],256,True,CPE linear + norm
+backbone.backbone.dec.dec3.block0.cpe.2.weight,[256],256,True,CPE linear + norm
+backbone.backbone.dec.dec3.block0.cpe.2.bias,[256],256,True,CPE linear + norm
+backbone.backbone.dec.dec3.block0.norm1.0.weight,[256],256,True,Attention/MLP norms
+backbone.backbone.dec.dec3.block0.norm1.0.bias,[256],256,True,Attention/MLP norms
+backbone.backbone.dec.dec3.block0.attn.qkv.weight,"[768, 256]",196608,True,Attention QKV + projection
+backbone.backbone.dec.dec3.block0.attn.qkv.bias,[768],768,True,Attention QKV + projection
+backbone.backbone.dec.dec3.block0.attn.proj.weight,"[256, 256]",65536,True,Attention QKV + projection
+backbone.backbone.dec.dec3.block0.attn.proj.bias,[256],256,True,Attention QKV + projection
+backbone.backbone.dec.dec3.block0.norm2.0.weight,[256],256,True,Attention/MLP norms
+backbone.backbone.dec.dec3.block0.norm2.0.bias,[256],256,True,Attention/MLP norms
+backbone.backbone.dec.dec3.block0.mlp.0.fc1.weight,"[1024, 256]",262144,True,Block feed-forward MLP
+backbone.backbone.dec.dec3.block0.mlp.0.fc1.bias,[1024],1024,True,Block feed-forward MLP
+backbone.backbone.dec.dec3.block0.mlp.0.fc2.weight,"[256, 1024]",262144,True,Block feed-forward MLP
+backbone.backbone.dec.dec3.block0.mlp.0.fc2.bias,[256],256,True,Block feed-forward MLP
+backbone.backbone.dec.dec3.block0.t_mlp.weight,"[256, 3]",768,True,Time conditioning
+backbone.backbone.dec.dec3.block0.t_mlp.bias,[256],256,True,Time conditioning
+backbone.backbone.dec.dec3.block1.cpe.0.weight,"[256, 3, 3, 3, 256]",1769472,True,3D convolution in CPE
+backbone.backbone.dec.dec3.block1.cpe.0.bias,[256],256,True,3D convolution in CPE
+backbone.backbone.dec.dec3.block1.cpe.1.weight,"[256, 256]",65536,True,CPE linear + norm
+backbone.backbone.dec.dec3.block1.cpe.1.bias,[256],256,True,CPE linear + norm
+backbone.backbone.dec.dec3.block1.cpe.2.weight,[256],256,True,CPE linear + norm
+backbone.backbone.dec.dec3.block1.cpe.2.bias,[256],256,True,CPE linear + norm
+backbone.backbone.dec.dec3.block1.norm1.0.weight,[256],256,True,Attention/MLP norms
+backbone.backbone.dec.dec3.block1.norm1.0.bias,[256],256,True,Attention/MLP norms
+backbone.backbone.dec.dec3.block1.attn.qkv.weight,"[768, 256]",196608,True,Attention QKV + projection
+backbone.backbone.dec.dec3.block1.attn.qkv.bias,[768],768,True,Attention QKV + projection
+backbone.backbone.dec.dec3.block1.attn.proj.weight,"[256, 256]",65536,True,Attention QKV + projection
+backbone.backbone.dec.dec3.block1.attn.proj.bias,[256],256,True,Attention QKV + projection
+backbone.backbone.dec.dec3.block1.norm2.0.weight,[256],256,True,Attention/MLP norms
+backbone.backbone.dec.dec3.block1.norm2.0.bias,[256],256,True,Attention/MLP norms
+backbone.backbone.dec.dec3.block1.mlp.0.fc1.weight,"[1024, 256]",262144,True,Block feed-forward MLP
+backbone.backbone.dec.dec3.block1.mlp.0.fc1.bias,[1024],1024,True,Block feed-forward MLP
+backbone.backbone.dec.dec3.block1.mlp.0.fc2.weight,"[256, 1024]",262144,True,Block feed-forward MLP
+backbone.backbone.dec.dec3.block1.mlp.0.fc2.bias,[256],256,True,Block feed-forward MLP
+backbone.backbone.dec.dec3.block1.t_mlp.weight,"[256, 3]",768,True,Time conditioning
+backbone.backbone.dec.dec3.block1.t_mlp.bias,[256],256,True,Time conditioning
+backbone.backbone.dec.dec2.up.proj.0.weight,"[128, 256]",32768,True,Stem + pool/unpool
+backbone.backbone.dec.dec2.up.proj.0.bias,[128],128,True,Stem + pool/unpool
+backbone.backbone.dec.dec2.up.proj_skip.0.weight,"[128, 128]",16384,True,Stem + pool/unpool
+backbone.backbone.dec.dec2.up.proj_skip.0.bias,[128],128,True,Stem + pool/unpool
+backbone.backbone.dec.dec2.block0.cpe.0.weight,"[128, 3, 3, 3, 128]",442368,True,3D convolution in CPE
+backbone.backbone.dec.dec2.block0.cpe.0.bias,[128],128,True,3D convolution in CPE
+backbone.backbone.dec.dec2.block0.cpe.1.weight,"[128, 128]",16384,True,CPE linear + norm
+backbone.backbone.dec.dec2.block0.cpe.1.bias,[128],128,True,CPE linear + norm
+backbone.backbone.dec.dec2.block0.cpe.2.weight,[128],128,True,CPE linear + norm
+backbone.backbone.dec.dec2.block0.cpe.2.bias,[128],128,True,CPE linear + norm
+backbone.backbone.dec.dec2.block0.norm1.0.weight,[128],128,True,Attention/MLP norms
+backbone.backbone.dec.dec2.block0.norm1.0.bias,[128],128,True,Attention/MLP norms
+backbone.backbone.dec.dec2.block0.attn.qkv.weight,"[384, 128]",49152,True,Attention QKV + projection
+backbone.backbone.dec.dec2.block0.attn.qkv.bias,[384],384,True,Attention QKV + projection
+backbone.backbone.dec.dec2.block0.attn.proj.weight,"[128, 128]",16384,True,Attention QKV + projection
+backbone.backbone.dec.dec2.block0.attn.proj.bias,[128],128,True,Attention QKV + projection
+backbone.backbone.dec.dec2.block0.norm2.0.weight,[128],128,True,Attention/MLP norms
+backbone.backbone.dec.dec2.block0.norm2.0.bias,[128],128,True,Attention/MLP norms
+backbone.backbone.dec.dec2.block0.mlp.0.fc1.weight,"[512, 128]",65536,True,Block feed-forward MLP
+backbone.backbone.dec.dec2.block0.mlp.0.fc1.bias,[512],512,True,Block feed-forward MLP
+backbone.backbone.dec.dec2.block0.mlp.0.fc2.weight,"[128, 512]",65536,True,Block feed-forward MLP
+backbone.backbone.dec.dec2.block0.mlp.0.fc2.bias,[128],128,True,Block feed-forward MLP
+backbone.backbone.dec.dec2.block0.t_mlp.weight,"[128, 3]",384,True,Time conditioning
+backbone.backbone.dec.dec2.block0.t_mlp.bias,[128],128,True,Time conditioning
+backbone.backbone.dec.dec2.block1.cpe.0.weight,"[128, 3, 3, 3, 128]",442368,True,3D convolution in CPE
+backbone.backbone.dec.dec2.block1.cpe.0.bias,[128],128,True,3D convolution in CPE
+backbone.backbone.dec.dec2.block1.cpe.1.weight,"[128, 128]",16384,True,CPE linear + norm
+backbone.backbone.dec.dec2.block1.cpe.1.bias,[128],128,True,CPE linear + norm
+backbone.backbone.dec.dec2.block1.cpe.2.weight,[128],128,True,CPE linear + norm
+backbone.backbone.dec.dec2.block1.cpe.2.bias,[128],128,True,CPE linear + norm
+backbone.backbone.dec.dec2.block1.norm1.0.weight,[128],128,True,Attention/MLP norms
+backbone.backbone.dec.dec2.block1.norm1.0.bias,[128],128,True,Attention/MLP norms
+backbone.backbone.dec.dec2.block1.attn.qkv.weight,"[384, 128]",49152,True,Attention QKV + projection
+backbone.backbone.dec.dec2.block1.attn.qkv.bias,[384],384,True,Attention QKV + projection
+backbone.backbone.dec.dec2.block1.attn.proj.weight,"[128, 128]",16384,True,Attention QKV + projection
+backbone.backbone.dec.dec2.block1.attn.proj.bias,[128],128,True,Attention QKV + projection
+backbone.backbone.dec.dec2.block1.norm2.0.weight,[128],128,True,Attention/MLP norms
+backbone.backbone.dec.dec2.block1.norm2.0.bias,[128],128,True,Attention/MLP norms
+backbone.backbone.dec.dec2.block1.mlp.0.fc1.weight,"[512, 128]",65536,True,Block feed-forward MLP
+backbone.backbone.dec.dec2.block1.mlp.0.fc1.bias,[512],512,True,Block feed-forward MLP
+backbone.backbone.dec.dec2.block1.mlp.0.fc2.weight,"[128, 512]",65536,True,Block feed-forward MLP
+backbone.backbone.dec.dec2.block1.mlp.0.fc2.bias,[128],128,True,Block feed-forward MLP
+backbone.backbone.dec.dec2.block1.t_mlp.weight,"[128, 3]",384,True,Time conditioning
+backbone.backbone.dec.dec2.block1.t_mlp.bias,[128],128,True,Time conditioning
+backbone.backbone.dec.dec1.up.proj.0.weight,"[96, 128]",12288,True,Stem + pool/unpool
+backbone.backbone.dec.dec1.up.proj.0.bias,[96],96,True,Stem + pool/unpool
+backbone.backbone.dec.dec1.up.proj_skip.0.weight,"[96, 96]",9216,True,Stem + pool/unpool
+backbone.backbone.dec.dec1.up.proj_skip.0.bias,[96],96,True,Stem + pool/unpool
+backbone.backbone.dec.dec1.block0.cpe.0.weight,"[96, 3, 3, 3, 96]",248832,True,3D convolution in CPE
+backbone.backbone.dec.dec1.block0.cpe.0.bias,[96],96,True,3D convolution in CPE
+backbone.backbone.dec.dec1.block0.cpe.1.weight,"[96, 96]",9216,True,CPE linear + norm
+backbone.backbone.dec.dec1.block0.cpe.1.bias,[96],96,True,CPE linear + norm
+backbone.backbone.dec.dec1.block0.cpe.2.weight,[96],96,True,CPE linear + norm
+backbone.backbone.dec.dec1.block0.cpe.2.bias,[96],96,True,CPE linear + norm
+backbone.backbone.dec.dec1.block0.norm1.0.weight,[96],96,True,Attention/MLP norms
+backbone.backbone.dec.dec1.block0.norm1.0.bias,[96],96,True,Attention/MLP norms
+backbone.backbone.dec.dec1.block0.attn.qkv.weight,"[288, 96]",27648,True,Attention QKV + projection
+backbone.backbone.dec.dec1.block0.attn.qkv.bias,[288],288,True,Attention QKV + projection
+backbone.backbone.dec.dec1.block0.attn.proj.weight,"[96, 96]",9216,True,Attention QKV + projection
+backbone.backbone.dec.dec1.block0.attn.proj.bias,[96],96,True,Attention QKV + projection
+backbone.backbone.dec.dec1.block0.norm2.0.weight,[96],96,True,Attention/MLP norms
+backbone.backbone.dec.dec1.block0.norm2.0.bias,[96],96,True,Attention/MLP norms
+backbone.backbone.dec.dec1.block0.mlp.0.fc1.weight,"[384, 96]",36864,True,Block feed-forward MLP
+backbone.backbone.dec.dec1.block0.mlp.0.fc1.bias,[384],384,True,Block feed-forward MLP
+backbone.backbone.dec.dec1.block0.mlp.0.fc2.weight,"[96, 384]",36864,True,Block feed-forward MLP
+backbone.backbone.dec.dec1.block0.mlp.0.fc2.bias,[96],96,True,Block feed-forward MLP
+backbone.backbone.dec.dec1.block0.t_mlp.weight,"[96, 3]",288,True,Time conditioning
+backbone.backbone.dec.dec1.block0.t_mlp.bias,[96],96,True,Time conditioning
+backbone.backbone.dec.dec1.block1.cpe.0.weight,"[96, 3, 3, 3, 96]",248832,True,3D convolution in CPE
+backbone.backbone.dec.dec1.block1.cpe.0.bias,[96],96,True,3D convolution in CPE
+backbone.backbone.dec.dec1.block1.cpe.1.weight,"[96, 96]",9216,True,CPE linear + norm
+backbone.backbone.dec.dec1.block1.cpe.1.bias,[96],96,True,CPE linear + norm
+backbone.backbone.dec.dec1.block1.cpe.2.weight,[96],96,True,CPE linear + norm
+backbone.backbone.dec.dec1.block1.cpe.2.bias,[96],96,True,CPE linear + norm
+backbone.backbone.dec.dec1.block1.norm1.0.weight,[96],96,True,Attention/MLP norms
+backbone.backbone.dec.dec1.block1.norm1.0.bias,[96],96,True,Attention/MLP norms
+backbone.backbone.dec.dec1.block1.attn.qkv.weight,"[288, 96]",27648,True,Attention QKV + projection
+backbone.backbone.dec.dec1.block1.attn.qkv.bias,[288],288,True,Attention QKV + projection
+backbone.backbone.dec.dec1.block1.attn.proj.weight,"[96, 96]",9216,True,Attention QKV + projection
+backbone.backbone.dec.dec1.block1.attn.proj.bias,[96],96,True,Attention QKV + projection
+backbone.backbone.dec.dec1.block1.norm2.0.weight,[96],96,True,Attention/MLP norms
+backbone.backbone.dec.dec1.block1.norm2.0.bias,[96],96,True,Attention/MLP norms
+backbone.backbone.dec.dec1.block1.mlp.0.fc1.weight,"[384, 96]",36864,True,Block feed-forward MLP
+backbone.backbone.dec.dec1.block1.mlp.0.fc1.bias,[384],384,True,Block feed-forward MLP
+backbone.backbone.dec.dec1.block1.mlp.0.fc2.weight,"[96, 384]",36864,True,Block feed-forward MLP
+backbone.backbone.dec.dec1.block1.mlp.0.fc2.bias,[96],96,True,Block feed-forward MLP
+backbone.backbone.dec.dec1.block1.t_mlp.weight,"[96, 3]",288,True,Time conditioning
+backbone.backbone.dec.dec1.block1.t_mlp.bias,[96],96,True,Time conditioning
+backbone.backbone.dec.dec0.up.proj.0.weight,"[96, 96]",9216,True,Stem + pool/unpool
+backbone.backbone.dec.dec0.up.proj.0.bias,[96],96,True,Stem + pool/unpool
+backbone.backbone.dec.dec0.up.proj_skip.0.weight,"[96, 64]",6144,True,Stem + pool/unpool
+backbone.backbone.dec.dec0.up.proj_skip.0.bias,[96],96,True,Stem + pool/unpool
+backbone.backbone.dec.dec0.block0.cpe.0.weight,"[96, 3, 3, 3, 96]",248832,True,3D convolution in CPE
+backbone.backbone.dec.dec0.block0.cpe.0.bias,[96],96,True,3D convolution in CPE
+backbone.backbone.dec.dec0.block0.cpe.1.weight,"[96, 96]",9216,True,CPE linear + norm
+backbone.backbone.dec.dec0.block0.cpe.1.bias,[96],96,True,CPE linear + norm
+backbone.backbone.dec.dec0.block0.cpe.2.weight,[96],96,True,CPE linear + norm
+backbone.backbone.dec.dec0.block0.cpe.2.bias,[96],96,True,CPE linear + norm
+backbone.backbone.dec.dec0.block0.norm1.0.weight,[96],96,True,Attention/MLP norms
+backbone.backbone.dec.dec0.block0.norm1.0.bias,[96],96,True,Attention/MLP norms
+backbone.backbone.dec.dec0.block0.attn.qkv.weight,"[288, 96]",27648,True,Attention QKV + projection
+backbone.backbone.dec.dec0.block0.attn.qkv.bias,[288],288,True,Attention QKV + projection
+backbone.backbone.dec.dec0.block0.attn.proj.weight,"[96, 96]",9216,True,Attention QKV + projection
+backbone.backbone.dec.dec0.block0.attn.proj.bias,[96],96,True,Attention QKV + projection
+backbone.backbone.dec.dec0.block0.norm2.0.weight,[96],96,True,Attention/MLP norms
+backbone.backbone.dec.dec0.block0.norm2.0.bias,[96],96,True,Attention/MLP norms
+backbone.backbone.dec.dec0.block0.mlp.0.fc1.weight,"[384, 96]",36864,True,Block feed-forward MLP
+backbone.backbone.dec.dec0.block0.mlp.0.fc1.bias,[384],384,True,Block feed-forward MLP
+backbone.backbone.dec.dec0.block0.mlp.0.fc2.weight,"[96, 384]",36864,True,Block feed-forward MLP
+backbone.backbone.dec.dec0.block0.mlp.0.fc2.bias,[96],96,True,Block feed-forward MLP
+backbone.backbone.dec.dec0.block0.t_mlp.weight,"[96, 3]",288,True,Time conditioning
+backbone.backbone.dec.dec0.block0.t_mlp.bias,[96],96,True,Time conditioning
+backbone.backbone.dec.dec0.block1.cpe.0.weight,"[96, 3, 3, 3, 96]",248832,True,3D convolution in CPE
+backbone.backbone.dec.dec0.block1.cpe.0.bias,[96],96,True,3D convolution in CPE
+backbone.backbone.dec.dec0.block1.cpe.1.weight,"[96, 96]",9216,True,CPE linear + norm
+backbone.backbone.dec.dec0.block1.cpe.1.bias,[96],96,True,CPE linear + norm
+backbone.backbone.dec.dec0.block1.cpe.2.weight,[96],96,True,CPE linear + norm
+backbone.backbone.dec.dec0.block1.cpe.2.bias,[96],96,True,CPE linear + norm
+backbone.backbone.dec.dec0.block1.norm1.0.weight,[96],96,True,Attention/MLP norms
+backbone.backbone.dec.dec0.block1.norm1.0.bias,[96],96,True,Attention/MLP norms
+backbone.backbone.dec.dec0.block1.attn.qkv.weight,"[288, 96]",27648,True,Attention QKV + projection
+backbone.backbone.dec.dec0.block1.attn.qkv.bias,[288],288,True,Attention QKV + projection
+backbone.backbone.dec.dec0.block1.attn.proj.weight,"[96, 96]",9216,True,Attention QKV + projection
+backbone.backbone.dec.dec0.block1.attn.proj.bias,[96],96,True,Attention QKV + projection
+backbone.backbone.dec.dec0.block1.norm2.0.weight,[96],96,True,Attention/MLP norms
+backbone.backbone.dec.dec0.block1.norm2.0.bias,[96],96,True,Attention/MLP norms
+backbone.backbone.dec.dec0.block1.mlp.0.fc1.weight,"[384, 96]",36864,True,Block feed-forward MLP
+backbone.backbone.dec.dec0.block1.mlp.0.fc1.bias,[384],384,True,Block feed-forward MLP
+backbone.backbone.dec.dec0.block1.mlp.0.fc2.weight,"[96, 384]",36864,True,Block feed-forward MLP
+backbone.backbone.dec.dec0.block1.mlp.0.fc2.bias,[96],96,True,Block feed-forward MLP
+backbone.backbone.dec.dec0.block1.t_mlp.weight,"[96, 3]",288,True,Time conditioning
+backbone.backbone.dec.dec0.block1.t_mlp.bias,[96],96,True,Time conditioning
+features_outputhead.means.0.weight,"[128, 119]",15232,True,Output heads
+features_outputhead.means.0.bias,[128],128,True,Output heads
+features_outputhead.means.2.weight,"[128, 128]",16384,True,Output heads
+features_outputhead.means.2.bias,[128],128,True,Output heads
+features_outputhead.means.4.weight,"[128, 128]",16384,True,Output heads
+features_outputhead.means.4.bias,[128],128,True,Output heads
+features_outputhead.means.6.weight,"[3, 128]",384,True,Output heads
+features_outputhead.means.6.bias,[3],3,True,Output heads
+features_outputhead.scales.0.weight,"[128, 119]",15232,True,Output heads
+features_outputhead.scales.0.bias,[128],128,True,Output heads
+features_outputhead.scales.2.weight,"[128, 128]",16384,True,Output heads
+features_outputhead.scales.2.bias,[128],128,True,Output heads
+features_outputhead.scales.4.weight,"[128, 128]",16384,True,Output heads
+features_outputhead.scales.4.bias,[128],128,True,Output heads
+features_outputhead.scales.6.weight,"[3, 128]",384,True,Output heads
+features_outputhead.scales.6.bias,[3],3,True,Output heads
+features_outputhead.opacities.0.weight,"[128, 119]",15232,True,Output heads
+features_outputhead.opacities.0.bias,[128],128,True,Output heads
+features_outputhead.opacities.2.weight,"[128, 128]",16384,True,Output heads
+features_outputhead.opacities.2.bias,[128],128,True,Output heads
+features_outputhead.opacities.4.weight,"[128, 128]",16384,True,Output heads
+features_outputhead.opacities.4.bias,[128],128,True,Output heads
+features_outputhead.opacities.6.weight,"[1, 128]",128,True,Output heads
+features_outputhead.opacities.6.bias,[1],1,True,Output heads
+features_outputhead.quats.0.weight,"[128, 119]",15232,True,Output heads
+features_outputhead.quats.0.bias,[128],128,True,Output heads
+features_outputhead.quats.2.weight,"[128, 128]",16384,True,Output heads
+features_outputhead.quats.2.bias,[128],128,True,Output heads
+features_outputhead.quats.4.weight,"[128, 128]",16384,True,Output heads
+features_outputhead.quats.4.bias,[128],128,True,Output heads
+features_outputhead.quats.6.weight,"[4, 128]",512,True,Output heads
+features_outputhead.quats.6.bias,[4],4,True,Output heads
+features_outputhead.features_dc.0.weight,"[128, 119]",15232,True,Output heads
+features_outputhead.features_dc.0.bias,[128],128,True,Output heads
+features_outputhead.features_dc.2.weight,"[128, 128]",16384,True,Output heads
+features_outputhead.features_dc.2.bias,[128],128,True,Output heads
+features_outputhead.features_dc.4.weight,"[128, 128]",16384,True,Output heads
+features_outputhead.features_dc.4.bias,[128],128,True,Output heads
+features_outputhead.features_dc.6.weight,"[3, 128]",384,True,Output heads
+features_outputhead.features_dc.6.bias,[3],3,True,Output heads
+features_outputhead.features_rest.0.weight,"[128, 119]",15232,True,Output heads
+features_outputhead.features_rest.0.bias,[128],128,True,Output heads
+features_outputhead.features_rest.2.weight,"[128, 128]",16384,True,Output heads
+features_outputhead.features_rest.2.bias,[128],128,True,Output heads
+features_outputhead.features_rest.4.weight,"[128, 128]",16384,True,Output heads
+features_outputhead.features_rest.4.bias,[128],128,True,Output heads
+features_outputhead.features_rest.6.weight,"[9, 128]",1152,True,Output heads
+features_outputhead.features_rest.6.bias,[9],9,True,Output heads
