@@ -27,6 +27,14 @@ flags.DEFINE_string("eval_subdir", "eval_final", "Eval subdirectory")
 flags.DEFINE_string("scene_name", "", "Scene name to overfit in one mode")
 flags.DEFINE_enum("scene_mode", "one", ["one", "many"], "Overfit one scene or a fixed random scene set")
 flags.DEFINE_integer("scene_count", 1, "Number of scenes selected in many mode")
+flags.DEFINE_integer("batch_size", 1, "Total scene samples per optimizer update")
+flags.DEFINE_integer("grad_accum_steps", 1, "Forward/backward passes per batch; splits batch_size into smaller microbatches")
+flags.register_validator("batch_size", lambda value: value >= 1, message="batch_size must be at least 1")
+flags.register_multi_flags_validator(
+    ["batch_size", "grad_accum_steps"],
+    lambda values: 1 <= values["grad_accum_steps"] <= values["batch_size"],
+    message="grad_accum_steps must be between 1 and batch_size",
+)
 flags.DEFINE_boolean("compare_with_input", False, "Compare with input 3DGS")
 flags.DEFINE_boolean("save_viewer", True, "Save viewer point clouds")
 flags.DEFINE_enum("alignment", "emd", ["emd", "random", "fit_lr_to_hr", "fit_hr_to_lr"], "Matching modes")
@@ -37,7 +45,7 @@ flags.DEFINE_multi_string("gin_file", None, "List of paths to the config files."
 flags.DEFINE_multi_string("gin_param", "", "Newline separated list of Gin parameter bindings.")
 
 FLAGS = flags.FLAGS
-EVAL_FLOW_STEPS = [1, 5, 20]
+EVAL_FLOW_STEPS = [10]
 MEANS_LOSS_REDUCTION = "mean"  # Set to "sum" to match PUFM-style summed point loss.
 
 
@@ -478,6 +486,113 @@ def prepare_overfit_scene(dataset, scene, output_dir, logger, device, flow_cfg):
     }
 
 
+def compute_microbatch_loss(model, scenes, device, flow_cfg, mix_cfg, mse_loss_cfg, flow_loss_weights,
+                            image_l1_loss_weight, lpips_loss_weight, lpips_loss_func, enable_amp):
+    """Return summed sample losses; keep temporary GPU state scoped to one microbatch."""
+    is_fm_only = mix_cfg["schedule"] == "fm-only"
+    samples = []
+    for active in scenes:
+        source = gpu_utils.move_to_device(active["source_flow_gs"], device)
+        target = gpu_utils.move_to_device(active["target_flow_gs"], device)
+        t = torch.empty(1, device=device).uniform_(float(flow_cfg["flow_t_eps"]), 1.0 - float(flow_cfg["flow_t_eps"]))
+        train_images, train_cameras = None, None
+        if not is_fm_only:
+            camera_indices = np.random.permutation(len(active["target_images"]))[:active["render_view_count"]]
+            train_images = gpu_utils.move_to_device([active["target_images"][index] for index in camera_indices], device)
+            train_cameras = dict(active["target_cameras"])
+            train_cameras["camera_to_worlds"] = train_cameras["camera_to_worlds"][camera_indices]
+            train_cameras = gpu_utils.move_to_device(train_cameras, device)
+        query, noise, gamma, gamma_dot = flow.sample_stochastic_interpolant(source, target, t, float(flow_cfg["flow_noise_std"]))
+        samples.append({
+            "source": source, "target": target, "t": t, "query": query, "noise": noise,
+            "gamma": gamma, "gamma_dot": gamma_dot,
+            "variances": gpu_utils.move_to_device(active["velocity_variances"], device),
+            "images": train_images, "cameras": train_cameras,
+        })
+
+    summed_loss = None
+    statistics = {}
+    with torch.cuda.amp.autocast(enabled=enable_amp):
+        predictions = model(
+            batch_flow_gs=[sample["query"] for sample in samples],
+            batch_scene_idx=[scene["scene_idx"] for scene in scenes],
+            batch_reference_means=[sample["source"]["means"] for sample in samples],
+            t=torch.cat([sample["t"] for sample in samples]),
+        )
+        for sample, pred_vel in zip(samples, predictions):
+            source_flow_gs, target_flow_gs = sample["source"], sample["target"]
+            loss_target_gs = target_flow_gs
+            query_flow_gs, flow_noise = sample["query"], sample["noise"]
+            t, gamma, gamma_dot = sample["t"], sample["gamma"], sample["gamma_dot"]
+            velocity_variances = sample["variances"]
+            train_images, train_cameras = sample["images"], sample["cameras"]
+            x1_pred_flow_gs = flow.predict_x1_from_velocity(
+                model, source_flow_gs, query_flow_gs, pred_vel, flow_noise, gamma, gamma_dot, t
+            )
+            if flow_cfg["loss_type"] == "velocity":
+                fm_loss, attr_losses, weighted_attr_losses = (
+                    flow.compute_variance_normalized_velocity_loss(
+                        pred_vel=pred_vel,
+                        source_flow_gs=source_flow_gs,
+                        target_flow_gs=target_flow_gs,
+                        flow_noise=flow_noise,
+                        gamma_dot=gamma_dot,
+                        velocity_variances=velocity_variances,
+                        loss_weights=flow_loss_weights,
+                    )
+                )
+            else:
+                fm_loss, attr_losses, weighted_attr_losses = (
+                    compute_all_feature_mse_loss(
+                        out_gs=x1_pred_flow_gs,
+                        target_gs=loss_target_gs,
+                        loss_weights=flow_loss_weights,
+                        quat_direct_mse=mse_loss_cfg["quat_direct_mse"],
+                    )
+                )
+            if is_fm_only:
+                render_l1 = fm_loss.new_zeros(())
+                render_lpips = render_l1
+                weighted_render_l1 = render_l1
+                weighted_render_lpips = render_l1
+                render_loss = render_l1
+            else:
+                render_gs = x1_pred_flow_gs
+                pred_imgs, _ = gs_utils.rasterize_gaussians_to_multiimgs(render_gs, train_cameras)
+                render_l1 = sum(
+                    (pred_img - gt_img[..., :3]).abs().mean()
+                    for pred_img, gt_img in zip(pred_imgs, train_images)
+                ) / len(pred_imgs)
+                render_lpips = 0.0
+                if lpips_loss_func is not None:
+                    render_lpips = sum(
+                        lpips_loss_func(pred_img.unsqueeze(0), gt_img[..., :3].unsqueeze(0)).mean()
+                        for pred_img, gt_img in zip(pred_imgs, train_images)
+                    ) / len(pred_imgs)
+                weighted_render_l1 = image_l1_loss_weight * render_l1
+                weighted_render_lpips = (
+                    lpips_loss_weight * render_lpips if lpips_loss_func is not None else 0.0
+                )
+                render_loss = weighted_render_l1 + weighted_render_lpips
+            fm_mix_weight, render_mix_weight = flow.loss_mix_weights(t, mix_cfg["schedule"])
+            total_loss = fm_mix_weight * fm_loss + render_mix_weight * render_loss
+
+            summed_loss = total_loss if summed_loss is None else summed_loss + total_loss
+            values = {
+                "total": total_loss, "fm_loss": fm_loss, "render_loss": render_loss,
+                "fm_weight": fm_mix_weight, "render_weight": render_mix_weight,
+                "render_l1": render_l1, "weighted_render_l1": weighted_render_l1,
+                "render_lpips": render_lpips, "weighted_render_lpips": weighted_render_lpips,
+                "t": t, "gamma": gamma, "gamma_dot": gamma_dot,
+            }
+            values.update({f"{key}_loss": value for key, value in attr_losses.items()})
+            values.update({f"{key}_weighted": value for key, value in weighted_attr_losses.items()})
+            for key, value in values.items():
+                scalar = value.detach().item() if torch.is_tensor(value) else float(value)
+                statistics[key] = statistics.get(key, 0.0) + scalar
+    return summed_loss, statistics
+
+
 @gin.configurable
 def training(
     dataset,
@@ -568,96 +683,43 @@ def training(
     optimizer.zero_grad(set_to_none=True)
     pbar = tqdm(range(resume_from_step, total_steps))
     flow_t_eps = float(flow_cfg["flow_t_eps"])
-    flow_noise_std = float(flow_cfg["flow_noise_std"])
+    # Split the effective batch without dropping samples or overweighting a short microbatch.
+    batch_size = FLAGS.batch_size
+    grad_accum_steps = FLAGS.grad_accum_steps
+    quotient, remainder = divmod(batch_size, grad_accum_steps)
+    microbatch_sizes = [quotient + (index < remainder) for index in range(grad_accum_steps)]
+    logger.info(f"batch_size={batch_size} grad_accum_steps={grad_accum_steps} microbatch_sizes={microbatch_sizes}")
     for step in pbar:
-        if many:
-            if not scene_order:
-                scene_order = np.random.permutation(len(prepared_scenes)).tolist()
-            active = prepared_scenes[scene_order.pop()]
-        else:
-            active = prepared_scenes[0]
-        scene = active
-        source_flow_gs = gpu_utils.move_to_device(active["source_flow_gs"], device)
-        target_flow_gs = gpu_utils.move_to_device(active["target_flow_gs"], device)
-        loss_target_gs = target_flow_gs
-        velocity_variances = gpu_utils.move_to_device(active["velocity_variances"], device)
-        target_images = active["target_images"]
-        target_cameras = active["target_cameras"]
-        render_view_count = active["render_view_count"]
-        batch_scene_idx = [active["scene_idx"]]
-        t = torch.empty(1, device=device).uniform_(flow_t_eps, 1.0 - flow_t_eps)
-        if not is_fm_only:
-            camera_indices = np.random.permutation(len(target_images))[:render_view_count]
-            train_images = [target_images[index] for index in camera_indices]
-            train_cameras = dict(target_cameras)
-            train_cameras["camera_to_worlds"] = target_cameras["camera_to_worlds"][camera_indices]
-            train_images = gpu_utils.move_to_device(train_images, device)
-            train_cameras = gpu_utils.move_to_device(train_cameras, device)
-        query_flow_gs, flow_noise, gamma, gamma_dot = flow.sample_stochastic_interpolant(
-            source_flow_gs, target_flow_gs, t, flow_noise_std
-        )
-        with torch.cuda.amp.autocast(enabled=enable_amp):
-            pred_vel = model(
-                batch_flow_gs=[query_flow_gs],
-                batch_scene_idx=batch_scene_idx,
-                batch_reference_means=[source_flow_gs["means"]],
-                t=t,
-            )[0]
-            x1_pred_flow_gs = flow.predict_x1_from_velocity(
-                model, source_flow_gs, query_flow_gs, pred_vel, flow_noise, gamma, gamma_dot, t
+        batch_scenes = []
+        for _ in range(batch_size):
+            if many:
+                if not scene_order:
+                    scene_order = np.random.permutation(len(prepared_scenes)).tolist()
+                batch_scenes.append(prepared_scenes[scene_order.pop()])
+            else:
+                batch_scenes.append(prepared_scenes[0])
+
+        batch_statistics = {}
+        offset = 0
+        for microbatch_size in microbatch_sizes:
+            microbatch_loss, statistics = compute_microbatch_loss(
+                model, batch_scenes[offset:offset + microbatch_size], device, flow_cfg, mix_cfg,
+                mse_loss_cfg, flow_loss_weights, image_l1_loss_weight, lpips_loss_weight,
+                lpips_loss_func, enable_amp,
             )
-            if flow_cfg["loss_type"] == "velocity":
-                fm_loss, attr_losses, weighted_attr_losses = (
-                    flow.compute_variance_normalized_velocity_loss(
-                        pred_vel=pred_vel,
-                        source_flow_gs=source_flow_gs,
-                        target_flow_gs=target_flow_gs,
-                        flow_noise=flow_noise,
-                        gamma_dot=gamma_dot,
-                        velocity_variances=velocity_variances,
-                        loss_weights=flow_loss_weights,
-                    )
-                )
+            microbatch_loss = microbatch_loss / batch_size
+            if enable_amp:
+                scaler.scale(microbatch_loss).backward()
             else:
-                fm_loss, attr_losses, weighted_attr_losses = (
-                    compute_all_feature_mse_loss(
-                        out_gs=x1_pred_flow_gs,
-                        target_gs=loss_target_gs,
-                        loss_weights=flow_loss_weights,
-                        quat_direct_mse=mse_loss_cfg["quat_direct_mse"],
-                    )
-                )
-            if is_fm_only:
-                render_l1 = fm_loss.new_zeros(())
-                render_lpips = render_l1
-                weighted_render_l1 = render_l1
-                weighted_render_lpips = render_l1
-                render_loss = render_l1
-            else:
-                render_gs = x1_pred_flow_gs
-                pred_imgs, _ = gs_utils.rasterize_gaussians_to_multiimgs(render_gs, train_cameras)
-                render_l1 = sum(
-                    (pred_img - gt_img[..., :3]).abs().mean()
-                    for pred_img, gt_img in zip(pred_imgs, train_images)
-                ) / len(pred_imgs)
-                render_lpips = 0.0
-                if lpips_loss_func is not None:
-                    render_lpips = sum(
-                        lpips_loss_func(pred_img.unsqueeze(0), gt_img[..., :3].unsqueeze(0)).mean()
-                        for pred_img, gt_img in zip(pred_imgs, train_images)
-                    ) / len(pred_imgs)
-                weighted_render_l1 = image_l1_loss_weight * render_l1
-                weighted_render_lpips = (
-                    lpips_loss_weight * render_lpips if lpips_loss_func is not None else 0.0
-                )
-                render_loss = weighted_render_l1 + weighted_render_lpips
-            fm_mix_weight, render_mix_weight = flow.loss_mix_weights(t, mix_cfg["schedule"])
-            total_loss = fm_mix_weight * fm_loss + render_mix_weight * render_loss
+                microbatch_loss.backward()
+            del microbatch_loss
+            for key, value in statistics.items():
+                batch_statistics[key] = batch_statistics.get(key, 0.0) + value / batch_size
+            offset += microbatch_size
 
         optimizer_stepped = True
         if enable_amp:
             previous_scale = scaler.get_scale()
-            scaler.scale(total_loss).backward()
             if grad_clip_norm > 0:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
@@ -665,7 +727,6 @@ def training(
             scaler.update()
             optimizer_stepped = scaler.get_scale() >= previous_scale
         else:
-            total_loss.backward()
             if grad_clip_norm > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
             optimizer.step()
@@ -674,66 +735,39 @@ def training(
         if optimizer_stepped:
             scheduler.step()
 
-        postfix = {
-            "loss": f"{total_loss.item():.4f}",
-            "fm": f"{fm_loss.item():.4f}",
-            "render": f"{render_loss.item():.4f}",
-            "t": f"{t.item():.3f}",
+        pbar.set_postfix({
+            "loss": f"{batch_statistics['total']:.4f}",
+            "fm": f"{batch_statistics['fm_loss']:.4f}",
+            "render": f"{batch_statistics['render_loss']:.4f}",
+            "t": f"{batch_statistics['t']:.3f}",
             "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
-        }
-        if flow_noise_std > 0.0:
-            postfix["gamma"] = f"{gamma.item():.3e}"
-            postfix["gdot"] = f"{gamma_dot.item():.3e}"
-        pbar.set_postfix(postfix)
-
+        })
         if empty_cache_fre > 0 and (step + 1) % empty_cache_fre == 0:
             torch.cuda.empty_cache()
 
         if step % log_interval == 0:
-            attr_str = " ".join(
-                [
-                    f"{key}_loss={attr_losses[key].item():.6f} "
-                    f"{key}_weighted={weighted_attr_losses[key].item():.6f}"
-                    for key in attr_losses.keys()
-                ]
-            )
+            values = " ".join(f"{key}={value:.6f}" for key, value in batch_statistics.items())
+            identities = [(scene["scene_name"], scene["scene_idx"]) for scene in batch_scenes]
+            sampled_views = sum(scene["render_view_count"] for scene in batch_scenes)
             logger.info(
-                f"step={step} scene={scene['scene_name']} idx={scene['scene_idx']} total={total_loss.item():.6f} "
-                f"mix_schedule={mix_cfg['schedule']} "
-                f"fm_loss={fm_loss.item():.6f} fm_weight={fm_mix_weight.item():.6f} "
-                f"render_loss={render_loss.item():.6f} render_weight={render_mix_weight.item():.6f} "
-                f"render_l1={render_l1.item():.6f} weighted_render_l1={weighted_render_l1.item():.6f} "
-                f"render_lpips={render_lpips.item() if lpips_loss_func is not None else 0.0:.6f} "
-                f"weighted_render_lpips={weighted_render_lpips.item() if lpips_loss_func is not None else 0.0:.6f} "
-                f"sampled_views={render_view_count} loss_type={flow_cfg['loss_type']} "
-                f"attribute_keys={','.join(SUPPORTED_GS_KEYS)} t={t.item():.6f} "
-                f"t_eps={flow_t_eps:.6f} gamma={gamma.item():.8f} gamma_dot={gamma_dot.item():.8f} "
-                f"lr={optimizer.param_groups[0]['lr']:.8f} {attr_str}"
+                f"step={step} scenes={identities} batch_size={batch_size} grad_accum_steps={grad_accum_steps} "
+                f"mix_schedule={mix_cfg['schedule']} loss_type={flow_cfg['loss_type']} "
+                f"sampled_views={sampled_views} t_eps={flow_t_eps:.6f} "
+                f"lr={optimizer.param_groups[0]['lr']:.8f} {values}"
             )
 
         if step % log_image_interval == 0:
+            active = batch_scenes[0]
             with torch.no_grad():
-                train_out_gs = flow.sample_flow_model(
-                    model, source_flow_gs, scene["scene_idx"], int(flow_cfg["flow_steps"])
-                )
-                pred_imgs, _ = gs_utils.rasterize_gaussians_to_multiimgs(train_out_gs, gpu_utils.move_to_device(target_cameras, device))
+                source_flow_gs = gpu_utils.move_to_device(active["source_flow_gs"], device)
+                train_out_gs = flow.sample_flow_model(model, source_flow_gs, active["scene_idx"], int(flow_cfg["flow_steps"]))
+                pred_imgs, _ = gs_utils.rasterize_gaussians_to_multiimgs(train_out_gs, gpu_utils.move_to_device(active["target_cameras"], device))
                 pred_imgs_uint8 = [(im * 255).detach().cpu().numpy().astype(np.uint8) for im in pred_imgs[:9]]
                 if len(pred_imgs_uint8) > 0:
                     pred_grid = cv2.cvtColor(make_grid(pred_imgs_uint8), cv2.COLOR_RGB2BGR)
                     cv2.imwrite(os.path.join(active["train_dir"], f"{step:08d}_pred.png"), pred_grid)
             model.train()
-
-        # Release the active scene and autograd outputs before evaluating other scenes.
-        del source_flow_gs, target_flow_gs, loss_target_gs, velocity_variances
-        del query_flow_gs, flow_noise, pred_vel, x1_pred_flow_gs
-        del total_loss, fm_loss, attr_losses, weighted_attr_losses
-        del render_l1, render_lpips, weighted_render_l1, weighted_render_lpips, render_loss
-        if not is_fm_only:
-            del render_gs, train_images, train_cameras
-        if not is_fm_only or step % log_image_interval == 0:
-            del pred_imgs, _
-        if step % log_image_interval == 0:
-            del train_out_gs
+            del source_flow_gs, train_out_gs, pred_imgs, _
 
         is_final_step = step == total_steps - 1
         if step % eval_interval == 0 or is_final_step:
@@ -805,13 +839,13 @@ def main(argv):
     device = torch.device("cuda")
 
     dataset = SplatFactoSRDataset.from_gin_scope("test_dataset")
-    if not all((
-        dataset.load_src_gs,
-        dataset.load_tgt_gs,
-        dataset.load_src_images,
-        dataset.load_tgt_images,
-    )):
-        raise ValueError("SR dev overfitting requires every source and target payload")
+    # if not all((
+    #     dataset.load_src_gs,
+    #     dataset.load_tgt_gs,
+    #     dataset.load_src_images,
+    #     dataset.load_tgt_images,
+    # )):
+    #     raise ValueError("SR dev overfitting requires every source and target payload")
     if FLAGS.scene_mode == "one":
         scene_indices = [dataset.scene_index(FLAGS.scene_name)]
     else:

@@ -9,14 +9,16 @@ FIT_LR_TO_HR_ROOT=${FIT_LR_TO_HR_ROOT:-${DATASET_ROOT}/test-set-4x-up/objaverse}
 FIT_HR_TO_LR_ROOT=${FIT_HR_TO_LR_ROOT:-${DATASET_ROOT}/test-set-4x-up/objaverse}
 echo "Using GPU: ${GPU_ID}"
 
-# Example: SCENE_MODE=many SCENE_COUNT=4 bash scripts/overfit-sr-gsfm-on-objaverse.sh
+# Example: SCENE_MODE=many SCENE_COUNT=4 BATCH_SIZE=8 GRAD_ACCUM_STEPS=4 bash scripts/overfit-sr-gsfm-on-objaverse.sh
 scene_mode=${SCENE_MODE:-one}
 scene_count=${SCENE_COUNT:-1}
+batch_size=${BATCH_SIZE:-1}
+grad_accum_steps=${GRAD_ACCUM_STEPS:-1}
 scene_name=${SCENE_NAME:-3e288ee8aced4a0797e66d53536112b1}
-total_steps=${1:-10000}
-save_interval=${2:-10000}
-eval_interval=${3:-1000}
-log_image_interval=${4:-1000}
+total_steps=${1:-20000}
+save_interval=${2:-20000}
+eval_interval=${3:-4000}
+log_image_interval=${4:-4000}
 alignment=${5:-fit_lr_to_hr}
 attribute_init=${6:-aligned}
 input_resolution=${7:-128}
@@ -50,9 +52,9 @@ tr${target_resolution}_\
 gsfm_${mix_schedule}_\
 noise${flow_noise_std}_\
 grid${grid_resolution}_\
-scenes${scene_count}
+batch_size${batch_size}
 
-output_root=${OUTPUT_ROOT:-/project2/ricky/experiments/${run_date}/overfit_sr_gsfm_512_input_frame_v1}
+output_root=${OUTPUT_ROOT:-/project2/ricky/experiments/${run_date}/overfit_sr_gsfm_512}
 output_dir=${OUTPUT_DIR:-${output_root}/${out_name}}
 
 CUDA_VISIBLE_DEVICES=${GPU_ID} python overfit-sr-gsfm.py \
@@ -60,6 +62,8 @@ CUDA_VISIBLE_DEVICES=${GPU_ID} python overfit-sr-gsfm.py \
     --scene_name="${scene_name}" \
     --scene_mode="${scene_mode}" \
     --scene_count="${scene_count}" \
+    --batch_size="${batch_size}" \
+    --grad_accum_steps="${grad_accum_steps}" \
     --alignment="${alignment}" \
     --attribute_init="${attribute_init}" \
     --gin_param="flow_matching.velocity_variance_source='${velocity_variance_source}'" \
