@@ -1,10 +1,16 @@
 #!/bin/bash
 set -euo pipefail
 
+# Example: GPU_IDS=0,1 NGPUS=2 BATCH_SIZE=8 GRAD_ACCUM_STEPS=4 bash scripts/train-sr-gsfm-on-objaverse.sh
 GPU_ID=${GPU_ID:-8}
+GPU_IDS=${GPU_IDS:-${GPU_ID}}
+NGPUS=${NGPUS:-1}
+MASTER_PORT=${MASTER_PORT:-29519}
+BATCH_SIZE=${BATCH_SIZE:-1}
+GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS:-1}
 TOTAL_STEPS=${1:-1000000}
-SAVE_INTERVAL=${2:-10000}
-EVAL_INTERVAL=${3:-10000}
+SAVE_INTERVAL=${2:-5000}
+EVAL_INTERVAL=${3:-5000}
 LOG_IMAGE_INTERVAL=${4:-1000}
 ALIGNMENT=${5:-${ALIGNMENT:-fit_lr_to_hr}}
 ATTRIBUTE_INIT=${6:-${ATTRIBUTE_INIT:-aligned}}
@@ -12,23 +18,28 @@ INPUT_RESOLUTION=${7:-${INPUT_RESOLUTION:-128}}
 TARGET_RESOLUTION=${8:-${TARGET_RESOLUTION:-512}}
 MIX_SCHEDULE=${9:-${MIX_SCHEDULE:-fm-only}}
 FLOW_LOSS_TYPE=${10:-${FLOW_LOSS_TYPE:-velocity}}
-FLOW_STEPS=${11:-${FLOW_STEPS:-5}}
+FLOW_STEPS=${11:-${FLOW_STEPS:-10}}
 FLOW_NOISE_STD=${12:-${FLOW_NOISE_STD:-0.0}}
 IMAGE_L1_LOSS_WEIGHT=${13:-${IMAGE_L1_LOSS_WEIGHT:-1.0}}
 LPIPS_LOSS_WEIGHT=${14:-${LPIPS_LOSS_WEIGHT:-1.0}}
 
-DATASET_ROOT=${DATASET_ROOT:-/project/ricky/splatformer-sr-data}
+run_date=$(date +%m%d)
+DATASET_ROOT=${DATASET_ROOT:-/project/ricky/splatformer-sr-data-scaled}
 TRAIN_SCENE_LIST=${TRAIN_SCENE_LIST:-${DATASET_ROOT}/psnr_filtered_scenes.csv}
 TEST_SCENE_LIST=${TEST_SCENE_LIST:-${DATASET_ROOT}/test_psnr_filtered_scenes.csv}
 GS_STATISTICS_PATH=${GS_STATISTICS_PATH:-${DATASET_ROOT}/gs_statistics.json}
-OUTPUT_DIR=${OUTPUT_DIR:-/project2/ricky/outputs/0905-gpu11/objaverse_splatformer_sr_gsfm_${INPUT_RESOLUTION}to${TARGET_RESOLUTION}_${ALIGNMENT}_${MIX_SCHEDULE}}
+OUTPUT_DIR=${OUTPUT_DIR:-/project2/ricky/outputs/${run_date}-gpu7/objaverse_sr_gsfm_${INPUT_RESOLUTION}to${TARGET_RESOLUTION}_${ALIGNMENT}_${MIX_SCHEDULE}}
 
 case "${MIX_SCHEDULE}" in
     linear|free-range-gs|fm-only) ;;
     *) echo "Unsupported MIX_SCHEDULE=${MIX_SCHEDULE}" >&2; exit 1 ;;
 esac
 
-CUDA_VISIBLE_DEVICES=${GPU_ID} python train-sr-gsfm.py \
+export CUDA_VISIBLE_DEVICES="${GPU_IDS}"
+torchrun --nnodes=1 --nproc_per_node="${NGPUS}" --rdzv-endpoint="localhost:${MASTER_PORT}" \
+    train-sr-gsfm.py \
+    --batch_size="${BATCH_SIZE}" \
+    --grad_accum_steps="${GRAD_ACCUM_STEPS}" \
     --output_dir="${OUTPUT_DIR}" \
     --alignment="${ALIGNMENT}" \
     --attribute_init="${ATTRIBUTE_INIT}" \

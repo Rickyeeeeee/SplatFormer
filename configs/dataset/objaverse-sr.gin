@@ -1,10 +1,10 @@
-dataset_root = '/project/ricky/splatformer-sr-data'
-train_scene_list = '/project/ricky/splatformer-sr-data/psnr_filtered_scenes.csv'
-test_scene_list = '/project/ricky/splatformer-sr-data/test_psnr_filtered_scenes.csv'
-train_fit_lr_to_hr_root = '/project/ricky/splatformer-sr-data/train-set-4x-up/objaverse'
-train_fit_hr_to_lr_root = '/project/ricky/splatformer-sr-data/train-set-4x-up/objaverse'
-test_fit_lr_to_hr_root = '/project/ricky/splatformer-sr-data/test-set-4x-up/objaverse'
-test_fit_hr_to_lr_root = '/project/ricky/splatformer-sr-data/test-set-4x-up/objaverse'
+dataset_root = '/project/ricky/splatformer-sr-data-scaled'
+train_scene_list = '/project/ricky/splatformer-sr-data-scaled/psnr_filtered_scenes.csv'
+test_scene_list = '/project/ricky/splatformer-sr-data-scaled/test_psnr_filtered_scenes.csv'
+train_fit_lr_to_hr_root = '/project/ricky/splatformer-sr-data-scaled/train-set-4x-up/objaverse'
+train_fit_hr_to_lr_root = '/project/ricky/splatformer-sr-data-scaled/train-set-4x-up/objaverse'
+test_fit_lr_to_hr_root = '/project/ricky/splatformer-sr-data-scaled/test-set-4x-up/objaverse'
+test_fit_hr_to_lr_root = '/project/ricky/splatformer-sr-data-scaled/test-set-4x-up/objaverse'
 
 SplatFactoSRDataset.dataset_root = %dataset_root
 SplatFactoSRDataset.fit_lr_to_hr_root = %train_fit_lr_to_hr_root

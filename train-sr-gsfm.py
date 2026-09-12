@@ -1,12 +1,15 @@
 import json
 import os
+from contextlib import nullcontext
 from pathlib import Path
 
 import cv2
 import gin
 import numpy as np
 import torch
+import torch.distributed as dist
 from absl import app, flags
+from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
 
 try:
@@ -29,6 +32,14 @@ from utils.optimizers import build_optimizer, build_scheduler
 
 
 flags.DEFINE_string("output_dir", "output_sr_gsfm", "Output directory")
+flags.DEFINE_integer("batch_size", 1, "Scene samples per GPU per optimizer update")
+flags.DEFINE_integer("grad_accum_steps", 1, "Forward/backward passes splitting each GPU's batch")
+flags.register_validator("batch_size", lambda value: value >= 1, message="batch_size must be at least 1")
+flags.register_multi_flags_validator(
+    ["batch_size", "grad_accum_steps"],
+    lambda values: 1 <= values["grad_accum_steps"] <= values["batch_size"],
+    message="grad_accum_steps must be between 1 and batch_size",
+)
 flags.DEFINE_boolean("only_eval", False, "Only run evaluation")
 flags.DEFINE_boolean("save_residuals", False, "Accepted for trainer compatibility")
 flags.DEFINE_boolean("use_wandb", True, "Log metrics to Weights & Biases")
@@ -52,8 +63,8 @@ MEANS_LOSS_REDUCTION = "mean"  # Set to "sum" to match PUFM-style summed point l
 torch.set_num_threads(8)
 
 @gin.configurable
-def set_seed(seed):
-    seed_everything(seed)
+def set_seed(seed, rank=0):
+    seed_everything(seed + rank)
 
 
 @gin.configurable
@@ -189,6 +200,7 @@ def evaluate_single_scene(
     save_viewer=True,
     output_gt=True,
 ):
+    was_training = model.training
     metric_computer = MetricComputer()
     metric_computer_input = MetricComputer() if compare_with_input else None
     device = next(model.parameters()).device
@@ -297,13 +309,13 @@ def evaluate_single_scene(
     else:
         metrics_input = {}
 
-    model.train()
+    model.train(was_training)
     return metrics, metrics_input
 
 
 
 def init_wandb(output_dir):
-    if not FLAGS.use_wandb:
+    if not FLAGS.use_wandb or (dist.is_initialized() and dist.get_rank() != 0):
         return None
     if wandb is None:
         raise ImportError("wandb is not installed")
@@ -311,6 +323,8 @@ def init_wandb(output_dir):
 
 
 def wandb_log(values, step=None):
+    if dist.is_initialized() and dist.get_rank() != 0:
+        return
     if wandb is not None and wandb.run is not None:
         wandb.log(values, step=step)
 
@@ -322,10 +336,11 @@ def build_dataset(scope, alignment=None, **kwargs):
 def build_gaussian_pair(dataset, scene, device):
     input_data = scene["data"][dataset.src_resolution]
     target_data = scene["data"][dataset.tgt_resolution]
-    target_gs = gpu_utils.move_to_device(target_data["gs_params"], device)
+    # Select the fitted target before transferring to avoid an unused HR allocation.
+    target_params = scene["fit_lr_to_hr"]["tgt_gs"] if FLAGS.alignment == "fit_lr_to_hr" else target_data["gs_params"]
+    target_gs = gpu_utils.move_to_device(target_params, device)
     if FLAGS.alignment == "fit_lr_to_hr":
         source_gs = gpu_utils.move_to_device(input_data["gs_params"], device)
-        target_gs = gpu_utils.move_to_device(scene[FLAGS.alignment]["tgt_gs"], device)
     elif FLAGS.alignment == "fit_hr_to_lr":
         source_gs = gpu_utils.move_to_device(scene[FLAGS.alignment]["tgt_gs"], device)
     else:
@@ -342,31 +357,114 @@ def build_gaussian_pair(dataset, scene, device):
 
 
 def evaluate_dataset(model, dataset, output_dir):
+    # Uneven evaluation shards must not run forwards through DDP.
+    model = model.module if isinstance(model, DDP) else model
+    was_training = model.training
+    model.eval()
+    os.makedirs(output_dir, exist_ok=True)
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
     device = next(model.parameters()).device
     results = {flow_steps: [] for flow_steps in EVAL_FLOW_STEPS}
-    for scene_idx in tqdm(range(len(dataset.folders)), desc="Evaluating"):
+    for scene_idx in tqdm(range(rank, len(dataset.folders), world_size), desc="Evaluating", disable=rank != 0):
         scene = dataset.load_scene(scene_idx, fit_alignment=FLAGS.alignment)
         target_data, source_gs, target_gs = build_gaussian_pair(dataset, scene, device)
-        source_flow_gs = gs_utils.clone_gaussians(source_gs)
+        eval_chunk_size = dataset.image_per_scene or len(target_data["images"])
+        if eval_chunk_size <= 0:
+            eval_chunk_size = len(target_data["images"])
         for flow_steps in EVAL_FLOW_STEPS:
             metrics, _ = evaluate_single_scene(
-                model=model, input_gs=source_gs, source_flow_gs=source_flow_gs,
+                model=model, input_gs=source_gs, source_flow_gs=source_gs,
                 scene_idx=scene["scene_idx"], scene_name=scene["scene_name"],
                 eval_images=target_data["images"], eval_cameras=target_data["cameras"],
                 image_names=target_data["images_name"],
                 output_dir=os.path.join(output_dir, f"flow_steps_{flow_steps:02d}", scene["scene_name"]),
-                flow_steps=flow_steps, eval_chunk_size=len(target_data["images"]),
+                flow_steps=flow_steps, eval_chunk_size=eval_chunk_size,
                 gt_gs=target_gs, compare_with_input=FLAGS.compare_with_input,
                 save_viewer=FLAGS.save_viewer, output_gt=True,
             )
-            results[flow_steps].append(metrics)
+            results[flow_steps].append((scene_idx, metrics))
+    if dist.is_initialized():
+        gathered = [None for _ in range(world_size)]
+        dist.all_gather_object(gathered, results)
+        results = {flow_steps: [item for payload in gathered for item in payload[flow_steps]] for flow_steps in EVAL_FLOW_STEPS}
+    results = {flow_steps: [metrics for _, metrics in sorted(values)] for flow_steps, values in results.items()}
     reduced = {
         flow_steps: {key: float(np.mean([metrics[key] for metrics in values])) for key in values[0]}
         for flow_steps, values in results.items() if values
     }
-    with open(os.path.join(output_dir, "metrics.json"), "w") as output_file:
-        json.dump(reduced, output_file, indent=2)
+    if rank == 0:
+        with open(os.path.join(output_dir, "metrics.json"), "w") as output_file:
+            json.dump(reduced, output_file, indent=2)
+    model.train(was_training)
     return reduced
+
+
+def compute_microbatch_loss(model, dataset, scenes, device, flow_config, mix_config, mse_config,
+                            config, velocity_variances, lpips_function):
+    """Return summed scene losses and detached statistics for one microbatch."""
+    model_module = model.module if isinstance(model, DDP) else model
+    needs_target_images = mix_config["schedule"] != "fm-only"
+    samples = []
+    for scene in scenes:
+        # Interpolation and losses read the pair without modifying its tensors.
+        target_data, source_flow_gs, target_flow_gs = build_gaussian_pair(dataset, scene, device)
+        time_value = torch.empty(1, device=device).uniform_(float(flow_config["flow_t_eps"]), 1.0 - float(flow_config["flow_t_eps"]))
+        train_images, train_cameras = None, None
+        if needs_target_images:
+            view_count = min(dataset.image_per_scene or len(target_data["images"]), len(target_data["images"]))
+            indices = np.random.permutation(len(target_data["images"]))[:view_count]
+            train_images = gpu_utils.move_to_device([target_data["images"][index] for index in indices], device)
+            train_cameras = dict(target_data["cameras"])
+            train_cameras["camera_to_worlds"] = target_data["cameras"]["camera_to_worlds"][indices]
+            train_cameras = gpu_utils.move_to_device(train_cameras, device)
+        query_gs, flow_noise, gamma, gamma_dot = flow.sample_stochastic_interpolant(source_flow_gs, target_flow_gs, time_value, float(flow_config["flow_noise_std"]))
+        samples.append({
+            "source": source_flow_gs, "target": target_flow_gs, "query": query_gs,
+            "noise": flow_noise, "gamma": gamma, "gamma_dot": gamma_dot, "time": time_value,
+            "images": train_images, "cameras": train_cameras,
+        })
+
+    summed_loss = None
+    statistics = {}
+    with torch.cuda.amp.autocast(enabled=config["enable_amp"]):
+        predictions = model(
+            batch_flow_gs=[sample["query"] for sample in samples],
+            batch_scene_idx=[scene["scene_idx"] for scene in scenes],
+            batch_reference_means=[sample["source"]["means"] for sample in samples],
+            t=torch.cat([sample["time"] for sample in samples]),
+        )
+        for sample, predicted_velocity in zip(samples, predictions):
+            source_flow_gs, target_flow_gs = sample["source"], sample["target"]
+            query_gs, flow_noise = sample["query"], sample["noise"]
+            gamma, gamma_dot, time_value = sample["gamma"], sample["gamma_dot"], sample["time"]
+            predicted_x1 = flow.predict_x1_from_velocity(model_module, source_flow_gs, query_gs, predicted_velocity, flow_noise, gamma, gamma_dot, time_value)
+            if flow_config["loss_type"] == "velocity":
+                flow_loss, attribute_losses, weighted_attribute_losses = flow.compute_variance_normalized_velocity_loss(
+                    pred_vel=predicted_velocity, source_flow_gs=source_flow_gs,
+                    target_flow_gs=target_flow_gs, flow_noise=flow_noise,
+                    gamma_dot=gamma_dot, velocity_variances=velocity_variances,
+                    loss_weights={key: 1.0 for key in SUPPORTED_GS_KEYS},
+                )
+            else:
+                flow_loss, attribute_losses, weighted_attribute_losses = compute_all_feature_mse_loss(predicted_x1, target_flow_gs, mse_config["loss_weights"], mse_config["quat_direct_mse"])
+            if needs_target_images:
+                train_images = sample["images"]
+                predicted_images, _ = gs_utils.rasterize_gaussians_to_multiimgs(predicted_x1, sample["cameras"])
+                render_l1 = sum((prediction - target[..., :3]).abs().mean() for prediction, target in zip(predicted_images, train_images)) / len(predicted_images)
+                render_lpips = render_l1.new_zeros(()) if lpips_function is None else sum(lpips_function(prediction.unsqueeze(0), target[..., :3].unsqueeze(0)).mean() for prediction, target in zip(predicted_images, train_images)) / len(predicted_images)
+                render_loss = config["image_l1_loss_weight"] * render_l1 + config["lpips_loss_weight"] * render_lpips
+            else:
+                render_loss = flow_loss.new_zeros(())
+            flow_weight, render_weight = flow.loss_mix_weights(time_value, mix_config["schedule"])
+            total_loss = flow_weight * flow_loss + render_weight * render_loss
+            summed_loss = total_loss if summed_loss is None else summed_loss + total_loss
+            values = {"total_loss": total_loss, "flow_loss": flow_loss, "render_loss": render_loss, "time": time_value}
+            values.update({f"{key}_loss": value for key, value in attribute_losses.items()})
+            values.update({f"{key}_weighted": value for key, value in weighted_attribute_losses.items()})
+            for key, value in values.items():
+                statistics[key] = statistics.get(key, 0.0) + value.detach().item()
+    return summed_loss, statistics
 
 
 @gin.configurable("training")
@@ -381,16 +479,23 @@ def training_config(
 
 
 def training():
+    distributed = int(os.environ.get("WORLD_SIZE", "1")) > 1
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
+    if distributed:
+        dist.init_process_group(backend="nccl")
+    rank = dist.get_rank() if distributed else 0
+    world_size = dist.get_world_size() if distributed else 1
     os.makedirs(FLAGS.output_dir, exist_ok=True)
     config = training_config(output_dir=FLAGS.output_dir)
     flow_config = flow_matching()
     mix_config = loss_mixing()
     mse_config = feature_mse_loss()
     needs_target_images = mix_config["schedule"] != "fm-only"
-    set_seed()
-    device = torch.device("cuda")
-    logger = ProcessSafeLogger(os.path.join(FLAGS.output_dir, "train.log")).get_logger()
-    wandb_run = init_wandb(FLAGS.output_dir)
+    set_seed(rank=rank)
+    logger = ProcessSafeLogger(os.path.join(FLAGS.output_dir, "train.log")).get_logger() if rank == 0 else None
+    init_wandb(FLAGS.output_dir)
     train_dataset = build_dataset(
         "train_dataset", alignment=FLAGS.alignment, load_src_gs=True,
         load_tgt_gs=True, load_src_images=False,
@@ -400,11 +505,18 @@ def training():
         "test_dataset", load_src_gs=True, load_tgt_gs=True,
         load_src_images=True, load_tgt_images=True,
     )
-    model = GSFlowPredictor().to(device)
+    model = GSFlowPredictor()
+    if distributed:
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
     if model.resume_ckpt is not None:
         model.load_state_dict(torch.load(model.resume_ckpt, map_location="cpu"))
+    model = model.to(device)
+    if distributed:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank, broadcast_buffers=False)
+    model_module = model.module if isinstance(model, DDP) else model
+    model.train(not FLAGS.only_eval)
     with gin.config_scope("train2D"):
-        optimizer = build_optimizer(model)
+        optimizer = build_optimizer(model_module)
         scheduler = build_scheduler(optimizer)
     velocity_variances = None
     variance_report = {}
@@ -418,108 +530,126 @@ def training():
                   "effective_variance": velocity_variances[key].detach().cpu().tolist()}
             for key in SUPPORTED_GS_KEYS
         }
+    batch_size = FLAGS.batch_size
+    quotient, remainder = divmod(batch_size, FLAGS.grad_accum_steps)
+    microbatch_sizes = [quotient + (index < remainder) for index in range(FLAGS.grad_accum_steps)]
     brief = (
+        f"world_size={world_size} batch_size={batch_size} global_batch_size={batch_size * world_size} "
+        f"grad_accum_steps={FLAGS.grad_accum_steps} microbatch_sizes={microbatch_sizes}\n"
         f"Train SR GSFM scenes={len(train_dataset.folders)} test_scenes={len(test_dataset.folders)}\n"
         f"alignment={FLAGS.alignment} mix_schedule={mix_config['schedule']} target_training_images={needs_target_images}\n"
         f"flow_config={flow_config}\nvelocity_variances={json.dumps(variance_report)}"
     )
-    print(brief)
-    logger.info(brief)
-    with open(os.path.join(FLAGS.output_dir, "config.gin"), "w") as output_file:
-        output_file.write(gin.operative_config_str())
-    os.makedirs(os.path.join(FLAGS.output_dir, "checkpoints"), exist_ok=True)
+    if rank == 0:
+        print(brief)
+        logger.info(brief)
+        with open(os.path.join(FLAGS.output_dir, "config.gin"), "w") as output_file:
+            output_file.write(gin.operative_config_str())
+        os.makedirs(os.path.join(FLAGS.output_dir, "checkpoints"), exist_ok=True)
+    if distributed:
+        dist.barrier()
     scaler = torch.cuda.amp.GradScaler(enabled=config["enable_amp"])
     lpips_function = loss_utils.lpips_loss_fn() if needs_target_images and config["lpips_loss_weight"] > 0 else None
     if not FLAGS.only_eval:
         optimizer.zero_grad(set_to_none=True)
         train_iter = iter(train_dataset)
-        progress = tqdm(range(config["resume_from_step"], config["total_steps"]), desc="Training")
+        progress = tqdm(range(config["resume_from_step"], config["total_steps"]), desc="Training", disable=rank != 0)
         for train_step in progress:
-            scene = next(train_iter)
-            target_data, source_gs, target_gs = build_gaussian_pair(train_dataset, scene, device)
-            source_flow_gs = gs_utils.clone_gaussians(source_gs)
-            target_flow_gs = gs_utils.clone_gaussians(target_gs)
-            time_value = torch.empty(1, device=device).uniform_(float(flow_config["flow_t_eps"]), 1.0 - float(flow_config["flow_t_eps"]))
-            if needs_target_images:
-                view_count = min(train_dataset.image_per_scene or len(target_data["images"]), len(target_data["images"]))
-                indices = np.random.permutation(len(target_data["images"]))[:view_count]
-                train_images = gpu_utils.move_to_device([target_data["images"][index] for index in indices], device)
-                train_cameras = dict(target_data["cameras"])
-                train_cameras["camera_to_worlds"] = target_data["cameras"]["camera_to_worlds"][indices]
-                train_cameras = gpu_utils.move_to_device(train_cameras, device)
-            query_gs, flow_noise, gamma, gamma_dot = flow.sample_stochastic_interpolant(source_flow_gs, target_flow_gs, time_value, float(flow_config["flow_noise_std"]))
-            with torch.cuda.amp.autocast(enabled=config["enable_amp"]):
-                predicted_velocity = model(
-                    batch_flow_gs=[query_gs], 
-                    batch_scene_idx=[scene["scene_idx"]], 
-                    batch_reference_means=[source_flow_gs["means"]], 
-                    t=time_value)[0]
-                predicted_x1 = flow.predict_x1_from_velocity(model, source_flow_gs, query_gs, predicted_velocity, flow_noise, gamma, gamma_dot, time_value)
-                if flow_config["loss_type"] == "velocity":
-                    flow_loss, attribute_losses, weighted_attribute_losses = flow.compute_variance_normalized_velocity_loss(
-                        pred_vel=predicted_velocity, source_flow_gs=source_flow_gs,
-                        target_flow_gs=target_flow_gs, flow_noise=flow_noise,
-                        gamma_dot=gamma_dot, velocity_variances=velocity_variances,
-                        loss_weights={key: 1.0 for key in SUPPORTED_GS_KEYS},
+            batch_statistics = {}
+            scene_identities = []
+            for microbatch_index, microbatch_size in enumerate(microbatch_sizes):
+                scenes = []
+                for _ in range(microbatch_size):
+                    try:
+                        scenes.append(next(train_iter))
+                    except StopIteration:
+                        train_iter = iter(train_dataset)
+                        scenes.append(next(train_iter))
+                scene_identities.extend((scene["scene_name"], scene["scene_idx"]) for scene in scenes)
+                # Synchronize accumulated gradients only on the last backward pass.
+                sync_context = model.no_sync() if distributed and microbatch_index < len(microbatch_sizes) - 1 else nullcontext()
+                with sync_context:
+                    microbatch_loss, statistics = compute_microbatch_loss(
+                        model, train_dataset, scenes, device, flow_config, mix_config, mse_config,
+                        config, velocity_variances, lpips_function,
                     )
-                else:
-                    flow_loss, attribute_losses, weighted_attribute_losses = compute_all_feature_mse_loss(predicted_x1, target_gs, mse_config["loss_weights"], mse_config["quat_direct_mse"])
-                if needs_target_images:
-                    predicted_images, _ = gs_utils.rasterize_gaussians_to_multiimgs(predicted_x1, train_cameras)
-                    render_l1 = sum((prediction - target[..., :3]).abs().mean() for prediction, target in zip(predicted_images, train_images)) / len(predicted_images)
-                    render_lpips = render_l1.new_zeros() if lpips_function is None else sum(lpips_function(prediction.unsqueeze(0), target[..., :3].unsqueeze(0)).mean() for prediction, target in zip(predicted_images, train_images)) / len(predicted_images)
-                    render_loss = config["image_l1_loss_weight"] * render_l1 + config["lpips_loss_weight"] * render_lpips
-                else:
-                    render_loss = flow_loss.new_zeros(())
-                flow_weight, render_weight = flow.loss_mix_weights(time_value, mix_config["schedule"])
-                total_loss = flow_weight * flow_loss + render_weight * render_loss
+                    microbatch_loss = microbatch_loss / batch_size
+                    if config["enable_amp"]:
+                        scaler.scale(microbatch_loss).backward()
+                    else:
+                        microbatch_loss.backward()
+                del microbatch_loss, scenes
+                for key, value in statistics.items():
+                    batch_statistics[key] = batch_statistics.get(key, 0.0) + value / batch_size
+
+            optimizer_stepped = True
             if config["enable_amp"]:
-                scaler.scale(total_loss).backward()
+                previous_scale = scaler.get_scale()
                 if config["grad_clip_norm"] > 0:
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), config["grad_clip_norm"])
                 scaler.step(optimizer)
                 scaler.update()
+                optimizer_stepped = scaler.get_scale() >= previous_scale
             else:
-                total_loss.backward()
                 if config["grad_clip_norm"] > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), config["grad_clip_norm"])
                 optimizer.step()
             optimizer.zero_grad(set_to_none=True)
-            scheduler.step()
-            progress.set_postfix(loss=f"{total_loss.item():.4f}", scene=scene["scene_name"], lr=f"{optimizer.param_groups[0]['lr']:.2e}")
+            if optimizer_stepped:
+                scheduler.step()
+            if rank == 0:
+                progress.set_postfix(loss=f"{batch_statistics['total_loss']:.4f}", scene=scene_identities[0][0], lr=f"{optimizer.param_groups[0]['lr']:.2e}")
             if train_step % config["log_interval"] == 0:
-                values = {
-                    "train/total_loss": total_loss.item(), "train/flow_loss": flow_loss.item(),
-                    "train/render_loss": render_loss.item(), "train/time": time_value.item(),
-                    "train/lr": optimizer.param_groups[0]["lr"], "train/scene_idx": scene["scene_idx"],
-                }
-                for key, value in attribute_losses.items():
-                    values[f"train/{key}_loss"] = value.item()
-                    values[f"train/{key}_weighted"] = weighted_attribute_losses[key].item()
-                wandb_log(values, step=train_step)
-                logger.info("step=%d scene=%s total=%.6f flow=%.6f render=%.6f", train_step, scene["scene_name"], total_loss.item(), flow_loss.item(), render_loss.item())
+                keys = sorted(batch_statistics)
+                reduced = torch.tensor([batch_statistics[key] for key in keys], device=device, dtype=torch.float64)
+                if distributed:
+                    dist.all_reduce(reduced)
+                    reduced /= world_size
+                values = {f"train/{key}": value for key, value in zip(keys, reduced.tolist())}
+                if rank == 0:
+                    values.update({
+                        "train/lr": optimizer.param_groups[0]["lr"], "train/scene_idx": scene_identities[0][1],
+                        "train/batch_size": batch_size, "train/global_batch_size": batch_size * world_size,
+                        "train/grad_accum_steps": FLAGS.grad_accum_steps,
+                    })
+                    wandb_log(values, step=train_step)
+                    logger.info("step=%d scenes=%s total=%.6f flow=%.6f render=%.6f", train_step, scene_identities, values["train/total_loss"], values["train/flow_loss"], values["train/render_loss"])
             if config["empty_cache_fre"] > 0 and (train_step + 1) % config["empty_cache_fre"] == 0:
                 torch.cuda.empty_cache()
             final_step = train_step == config["total_steps"] - 1
             if train_step % config["eval_interval"] == 0 or final_step:
                 eval_dir = os.path.join(FLAGS.output_dir, FLAGS.eval_subdir if final_step else "eval", "" if final_step else f"{train_step:08d}")
                 metrics = evaluate_dataset(model, test_dataset, eval_dir)
-                for flow_steps, step_metrics in metrics.items():
-                    wandb_log({f"eval/{flow_steps}/{key}": value for key, value in step_metrics.items()}, step=train_step)
+                if rank == 0:
+                    for flow_steps, step_metrics in metrics.items():
+                        wandb_log({f"eval/{flow_steps}/{key}": value for key, value in step_metrics.items()}, step=train_step)
+                if distributed:
+                    dist.barrier()
+                model.train()
             if (train_step + 1) % config["save_interval"] == 0:
-                torch.save(model.state_dict(), os.path.join(FLAGS.output_dir, "checkpoints", f"model_{train_step:08d}.pth"))
+                if rank == 0:
+                    torch.save(model_module.state_dict(), os.path.join(FLAGS.output_dir, "checkpoints", f"model_{train_step:08d}.pth"))
+                if distributed:
+                    dist.barrier()
     if FLAGS.only_eval:
         evaluate_dataset(model, test_dataset, os.path.join(FLAGS.output_dir, FLAGS.eval_subdir))
-    torch.save(model.state_dict(), os.path.join(FLAGS.output_dir, "checkpoints", "model_last.pth"))
-    if wandb_run is not None:
-        wandb_run.finish()
+    if rank == 0:
+        torch.save(model_module.state_dict(), os.path.join(FLAGS.output_dir, "checkpoints", "model_last.pth"))
+    if distributed:
+        dist.barrier()
 
 
 def main(argv):
     del argv
     gin.parse_config_files_and_bindings(FLAGS.gin_file, FLAGS.gin_param)
-    training()
+    try:
+        training()
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        if wandb is not None and wandb.run is not None:
+            wandb.run.finish()
 
 
 if __name__ == "__main__":
