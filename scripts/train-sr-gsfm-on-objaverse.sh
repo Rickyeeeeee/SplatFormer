@@ -6,6 +6,10 @@ GPU_ID=${GPU_ID:-8}
 GPU_IDS=${GPU_IDS:-${GPU_ID}}
 NGPUS=${NGPUS:-1}
 MASTER_PORT=${MASTER_PORT:-29519}
+# Workers are per GPU; prefetch factor counts microbatches per worker.
+NUM_WORKERS=${NUM_WORKERS:-2}
+PREFETCH_FACTOR=${PREFETCH_FACTOR:-2}
+PIN_MEMORY=${PIN_MEMORY:-true}
 BATCH_SIZE=${BATCH_SIZE:-1}
 GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS:-1}
 TOTAL_STEPS=${1:-1000000}
@@ -38,6 +42,9 @@ esac
 export CUDA_VISIBLE_DEVICES="${GPU_IDS}"
 torchrun --nnodes=1 --nproc_per_node="${NGPUS}" --rdzv-endpoint="localhost:${MASTER_PORT}" \
     train-sr-gsfm.py \
+    --num_workers="${NUM_WORKERS}" \
+    --prefetch_factor="${PREFETCH_FACTOR}" \
+    --pin_memory="${PIN_MEMORY}" \
     --batch_size="${BATCH_SIZE}" \
     --grad_accum_steps="${GRAD_ACCUM_STEPS}" \
     --output_dir="${OUTPUT_DIR}" \

@@ -38,6 +38,7 @@ ptv3_shuffle_orders_eval=${PTV3_SHUFFLE_ORDERS_EVAL:-False}
 ptv3_turn_off_bn=${PTV3_TURN_OFF_BN:-True}
 grid_resolution=${GRID_RESOLUTION:-2048}
 run_date=$(date +%m%d)
+custom_postfix=${CUSTOM_POSFIX:-run}
 
 scene_label=${scene_name}
 if [[ "${scene_mode}" == "many" ]]; then
@@ -52,10 +53,48 @@ tr${target_resolution}_\
 gsfm_${mix_schedule}_\
 noise${flow_noise_std}_\
 grid${grid_resolution}_\
-batch_size${batch_size}
+batch_size${batch_size}_\
+${custom_postfix}
 
 output_root=${OUTPUT_ROOT:-/project2/ricky/experiments/${run_date}/overfit_sr_gsfm_512}
 output_dir=${OUTPUT_DIR:-${output_root}/${out_name}}
+
+# Optional architecture overrides retain Gin/model defaults when unset or empty.
+# Use Gin literals for tuples/dicts and True/False for booleans; strings need no inner quotes.
+# Keep stage counts, channel widths, and head counts compatible; input channels are derived.
+# The current output head supports mlp-relu; the predictor supplies a 3-component time embedding.
+# Example: PTV3_ENC_CHANNELS='(32, 64, 128, 256, 512)' PTV3_DEC_CHANNELS='(64, 64, 128, 256)' GS_OUTPUT_HEAD_WIDTH=64 GS_OUTPUT_HEAD_NLAYER=2 CUSTOM_POSFIX=small bash scripts/overfit-sr-gsfm-on-objaverse.sh
+network_gin_args=()
+for network in PointTransformerV3FlowModel GSFlowPredictor; do
+    case "${network}" in
+        PointTransformerV3FlowModel)
+            prefix=PTV3
+            parameters=(enc_dim output_dim enc_channels dec_channels enc_depths dec_depths enc_num_head dec_num_head stride embedding_type T_dim enable_flash pdnorm_bn pdnorm_ln pretrained_ckpt)
+            ;;
+        GSFlowPredictor)
+            prefix=GS
+            parameters=(output_head_nlayer output_head_width output_head_type input_feat_to_mlp zeroinit res_feature_activation quat_residual_mode)
+            ;;
+    esac
+    for parameter in "${parameters[@]}"; do
+        env_name=${prefix}_${parameter^^}
+        value=${!env_name:-}
+        if [[ -n "${value}" ]]; then
+            case "${parameter}" in
+                embedding_type|pretrained_ckpt|output_head_type|quat_residual_mode)
+                    # Escape ordinary strings as Gin string literals, including checkpoint paths.
+                    value=${value//\\/\\\\}
+                    value=${value//\'/\\\'}
+                    value=${value//$'\n'/\\n}
+                    value=${value//$'\r'/\\r}
+                    value=${value//$'\t'/\\t}
+                    value="'${value}'"
+                    ;;
+            esac
+            network_gin_args+=("--gin_param=${network}.${parameter}=${value}")
+        fi
+    done
+done
 
 CUDA_VISIBLE_DEVICES=${GPU_ID} python overfit-sr-gsfm.py \
     --output_dir="${output_dir}" \
@@ -98,4 +137,5 @@ CUDA_VISIBLE_DEVICES=${GPU_ID} python overfit-sr-gsfm.py \
     --gin_param="training.log_image_interval=${log_image_interval}" \
     --gin_param="training.image_l1_loss_weight=${image_l1_loss_weight}" \
     --gin_param="training.lpips_loss_weight=${lpips_loss_weight}" \
-    --gin_param="loss_mixing.schedule='${mix_schedule}'"
+    --gin_param="loss_mixing.schedule='${mix_schedule}'" \
+    "${network_gin_args[@]}"

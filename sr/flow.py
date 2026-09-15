@@ -177,7 +177,7 @@ def compute_variance_normalized_velocity_loss(
             weighted_loss if total_loss is None else total_loss + weighted_loss
         )
 
-    if not total_loss.requires_grad:
+    if torch.is_grad_enabled() and not total_loss.requires_grad:
         raise ValueError(
             "GSFlowPredictor outputs do not receive gradients for the "
             "all-attribute velocity loss"
