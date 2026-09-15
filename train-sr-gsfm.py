@@ -1,8 +1,10 @@
+import csv
 import hashlib
 import json
 import os
 import random
 import time
+from collections import deque
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
@@ -43,6 +45,9 @@ flags.register_multi_flags_validator(
     lambda values: 1 <= values["grad_accum_steps"] <= values["batch_size"],
     message="grad_accum_steps must be between 1 and batch_size",
 )
+flags.DEFINE_enum("scene_sampling", "random", ["random", "big_small", "avoid_big"], "Training scene-size sampling mode")
+flags.DEFINE_integer("big_scene_threshold", 25000, "Scenes above this capped Gaussian count are big")
+flags.register_validator("big_scene_threshold", lambda value: value > 0, message="big_scene_threshold must be positive")
 flags.DEFINE_integer("num_workers", 2, "CPU DataLoader workers per GPU; 0 loads synchronously")
 flags.DEFINE_integer("prefetch_factor", 2, "Microbatches prefetched per worker")
 flags.DEFINE_boolean("pin_memory", True, "Pin training tensors for asynchronous GPU transfer")
@@ -363,7 +368,8 @@ class SRSceneDataset(torch.utils.data.Dataset):
 class SceneMicrobatchSampler(torch.utils.data.Sampler):
     """Generate rank-local microbatches continuously, including across epoch boundaries."""
 
-    def __init__(self, scene_count, microbatch_sizes, rank=0, world_size=1, split_across_gpus=True, seed=0):
+    def __init__(self, scene_count, microbatch_sizes, rank=0, world_size=1, split_across_gpus=True, seed=0,
+                 scene_sampling="random", scene_counts=None, big_scene_threshold=25000):
         if scene_count < 1:
             raise ValueError("Training dataset contains no scenes")
         if not microbatch_sizes or min(microbatch_sizes) < 1:
@@ -376,29 +382,63 @@ class SceneMicrobatchSampler(torch.utils.data.Sampler):
         self.world_size = world_size
         self.split_across_gpus = split_across_gpus
         self.seed = seed
+        if scene_sampling not in {"random", "big_small", "avoid_big"}:
+            raise ValueError(f"Unknown scene_sampling: {scene_sampling}")
+        self.scene_sampling = scene_sampling
+        self.big_indices = set()
+        self.small_count = self.big_count = None
+        if scene_sampling != "random":
+            if scene_counts is None or len(scene_counts) != scene_count or min(scene_counts) < 1:
+                raise ValueError("Size-aware sampling requires a positive Gaussian count for every scene")
+            if big_scene_threshold <= 0:
+                raise ValueError("big_scene_threshold must be positive")
+            self.big_indices = {index for index, count in enumerate(scene_counts) if count > big_scene_threshold}
+            self.big_count = len(self.big_indices)
+            self.small_count = scene_count - self.big_count
+        self.scene_indices = [index for index in range(scene_count)
+                              if scene_sampling != "avoid_big" or index not in self.big_indices]
+        if not self.scene_indices:
+            raise ValueError("avoid_big leaves no eligible training scenes; increase big_scene_threshold")
 
     def __iter__(self):
         epoch = 0
-        remaining = iter(())
+        remaining, small, big = deque(), deque(), deque()
         rng = random.Random(self.seed)
         while True:
             for size in self.microbatch_sizes:
                 batch = []
+                has_big = False
                 while len(batch) < size:
-                    scene_idx = next(remaining, None)
-                    if scene_idx is None:
+                    if not remaining and not small and not big:
                         if self.split_across_gpus:
-                            order = np.random.RandomState(epoch).permutation(self.scene_count)
-                            per_rank = (self.scene_count + self.world_size - 1) // self.world_size
+                            order = np.asarray(self.scene_indices)[np.random.RandomState(epoch).permutation(len(self.scene_indices))]
+                            per_rank = (len(order) + self.world_size - 1) // self.world_size
                             order = np.resize(order, per_rank * self.world_size)
                             order = order[self.rank * per_rank:(self.rank + 1) * per_rank].tolist()
                         else:
-                            order = list(range(self.scene_count))
+                            order = self.scene_indices.copy()
                             rng.shuffle(order)
-                        remaining = iter(order)
+                        if self.scene_sampling == "big_small":
+                            small.extend(index for index in order if index not in self.big_indices)
+                            big.extend(index for index in order if index in self.big_indices)
+                        else:
+                            remaining.extend(order)
                         epoch += 1
-                        scene_idx = next(remaining)
+                    if self.scene_sampling != "big_small":
+                        scene_idx = remaining.popleft()
+                    elif size == 1:
+                        scene_idx = big.popleft() if rng.randrange(len(small) + len(big)) < len(big) else small.popleft()
+                    elif big and not has_big:
+                        scene_idx = big.popleft()
+                        has_big = True
+                    elif small:
+                        scene_idx = small.popleft()
+                    else:
+                        raise ValueError(f"big_small cannot fill microbatch size {size} on rank {self.rank}: insufficient small scenes; use singleton microbatches (grad_accum_steps=batch_size)")
                     batch.append(scene_idx)
+                # Keep the big scene last, including when a microbatch crosses epochs.
+                if self.scene_sampling == "big_small":
+                    batch.sort(key=lambda index: index in self.big_indices)
                 yield batch
 
 
@@ -419,7 +459,28 @@ def seed_loader_worker(worker_id):
 
 
 def build_train_loader(dataset, microbatch_sizes, seed, rank=0, world_size=1):
-    sampler = SceneMicrobatchSampler(len(dataset.folders), microbatch_sizes, rank, world_size, dataset.split_across_gpus, seed)
+    scene_counts = None
+    if FLAGS.scene_sampling != "random":
+        # CSV counts are upper estimates after finite/outlier filtering; never load checkpoints here.
+        resolution = dataset.src_resolution if dataset.alignment == "fit_lr_to_hr" else dataset.tgt_resolution
+        column = f"res_{resolution}_num_gs"
+        with open(dataset.scene_list, newline="") as source:
+            reader = csv.DictReader(source)
+            if not reader.fieldnames or not {"scene_id", column}.issubset(reader.fieldnames):
+                raise ValueError(f"Size-aware sampling requires scene_id and {column} in {dataset.scene_list}")
+            counts_by_name = {row["scene_id"].strip(): row.get(column) for row in reader}
+        scene_counts = []
+        for scene in dataset.folders:
+            name = scene["scene_name"]
+            try:
+                count = int(counts_by_name[name])
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError(f"Missing or invalid {column} for scene {name} in {dataset.scene_list}") from error
+            if count < 1:
+                raise ValueError(f"Invalid {column}={count} for scene {name}; expected a positive count")
+            scene_counts.append(min(count, dataset.max_gs_num))
+    sampler = SceneMicrobatchSampler(len(dataset.folders), microbatch_sizes, rank, world_size, dataset.split_across_gpus, seed,
+                                    FLAGS.scene_sampling, scene_counts, FLAGS.big_scene_threshold)
     worker_options = {}
     if FLAGS.num_workers > 0:
         worker_options = dict(multiprocessing_context="spawn", persistent_workers=True, prefetch_factor=FLAGS.prefetch_factor)
@@ -762,9 +823,18 @@ def training():
     batch_size = FLAGS.batch_size
     quotient, remainder = divmod(batch_size, FLAGS.grad_accum_steps)
     microbatch_sizes = [quotient + (index < remainder) for index in range(FLAGS.grad_accum_steps)]
+    loader = None if FLAGS.only_eval else build_train_loader(train_dataset, microbatch_sizes, loader_seed, rank, world_size)
+    sampling_summary = f"scene_sampling={FLAGS.scene_sampling} big_scene_threshold={FLAGS.big_scene_threshold}"
+    if loader is not None:
+        sampler = loader.batch_sampler
+        sampling_summary += f" eligible_scenes={len(sampler.scene_indices)}"
+        if sampler.small_count is not None:
+            eligible_big = 0 if FLAGS.scene_sampling == "avoid_big" else sampler.big_count
+            sampling_summary += f" eligible_small={sampler.small_count} eligible_big={eligible_big} excluded_big={sampler.big_count - eligible_big}"
     brief = (
         f"world_size={world_size} batch_size={batch_size} global_batch_size={batch_size * world_size} "
         f"grad_accum_steps={FLAGS.grad_accum_steps} microbatch_sizes={microbatch_sizes}\n"
+        f"{sampling_summary}\n"
         f"optimizer={type(optimizer).__name__} state_sharding={getattr(optimizer, 'world_size', 1) > 1}\n"
         f"num_workers={FLAGS.num_workers} prefetch_factor={FLAGS.prefetch_factor if FLAGS.num_workers else 0} pin_memory={FLAGS.pin_memory}\n"
         f"Train SR GSFM scenes={len(train_dataset.folders)} test_scenes={len(test_dataset.folders)}\n"
@@ -783,7 +853,6 @@ def training():
     lpips_function = loss_utils.lpips_loss_fn() if needs_target_images and config["lpips_loss_weight"] > 0 else None
     if not FLAGS.only_eval:
         optimizer.zero_grad(set_to_none=True)
-        loader = build_train_loader(train_dataset, microbatch_sizes, loader_seed, rank, world_size)
         with training_microbatches(loader) as train_iter:
             progress = tqdm(range(config["resume_from_step"], config["total_steps"]), desc="Training", disable=rank != 0)
             timing_start = None

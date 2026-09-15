@@ -12,7 +12,8 @@ training.image_l1_loss_weight = 1.0
 training.lpips_loss_weight = 1.0
 training.resume_from_step = 0
 training.enable_amp = True
-training.empty_cache_fre = 50
+training.empty_cache_fre = 500
+# training.empty_cache_fre = 100
 
 flow_matching.flow_steps = 5
 flow_matching.flow_noise_std = 0.0
@@ -48,7 +49,8 @@ train2D/build_optimizer.lr_dict = {
 train2D/build_optimizer.optimizer_type = 'adam'
 train2D/build_optimizer.optimizer_params = {'eps': 1e-15}
 train2D/build_scheduler.total_step = %total_steps
-train2D/build_scheduler.schedule = 'linear'
+# train2D/build_scheduler.schedule = 'linear'
+train2D/build_scheduler.schedule = 'cosine'
 
 
 flow_matching.gs_statistics_path = '/project/ricky/splatformer-sr-data/gs_statistics.json'

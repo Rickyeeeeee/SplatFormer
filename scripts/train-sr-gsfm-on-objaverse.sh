@@ -12,6 +12,13 @@ PREFETCH_FACTOR=${PREFETCH_FACTOR:-1}
 PIN_MEMORY=${PIN_MEMORY:-true}
 BATCH_SIZE=${BATCH_SIZE:-1}
 GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS:-1}
+# Classify scenes by capped CSV Gaussian counts before constructing microbatches.
+SCENE_SAMPLING=${SCENE_SAMPLING:-big_small}
+BIG_SCENE_THRESHOLD=${BIG_SCENE_THRESHOLD:-25000}
+case "${SCENE_SAMPLING}" in
+    random|big_small|avoid_big) ;;
+    *) echo "Unsupported SCENE_SAMPLING=${SCENE_SAMPLING}" >&2; exit 1 ;;
+esac
 # Opt in to optimizer-state sharding; single-GPU runs retain the ordinary optimizer.
 ZERO_OPTIMIZER=${ZERO_OPTIMIZER:-false}
 case "${ZERO_OPTIMIZER,,}" in
@@ -53,6 +60,8 @@ torchrun --nnodes=1 --nproc_per_node="${NGPUS}" --rdzv-endpoint="localhost:${MAS
     --prefetch_factor="${PREFETCH_FACTOR}" \
     --pin_memory="${PIN_MEMORY}" \
     --batch_size="${BATCH_SIZE}" \
+    --scene_sampling="${SCENE_SAMPLING}" \
+    --big_scene_threshold="${BIG_SCENE_THRESHOLD}" \
     --grad_accum_steps="${GRAD_ACCUM_STEPS}" \
     --output_dir="${OUTPUT_DIR}" \
     --alignment="${ALIGNMENT}" \
