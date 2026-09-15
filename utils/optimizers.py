@@ -20,30 +20,37 @@ def build_3DGSoptimizer(gs_params, lr_dict, optimizer_type, optimizer_params):
 def build_optimizer(model, 
                     lr_dict: gin.REQUIRED, 
                     optimizer_type: gin.REQUIRED,
-                    optimizer_params):  
+                    optimizer_params, use_zero=False):
+    # ZeRO inspects groups before optimizer initialization, so parameters must be reusable lists.
     params_lr = []
     if hasattr(model, 'backbone') and hasattr(model, 'features_outputhead'):
         if getattr(model, 'backbone_type', None) != 'empty':
-            params_lr.append({'params': model.backbone.parameters(), 'lr': lr_dict['backbone']})
+            params_lr.append({'params': list(model.backbone.parameters()), 'lr': lr_dict['backbone']})
         for feature in model.features_outputhead.keys():
             lr = lr_dict.get(feature, lr_dict['base'])
-            params_lr.append({'params': model.features_outputhead[feature].parameters(), 'lr': lr})
+            params_lr.append({'params': list(model.features_outputhead[feature].parameters()), 'lr': lr})
     else:
         for param in model.parameters():
             lr = lr_dict.get(param, lr_dict['base'])
-            params_lr.append({'params': param, 'lr': lr})
+            params_lr.append({'params': [param], 'lr': lr})
 
     if optimizer_type.lower() == 'adam':
-        optimizer = torch.optim.Adam(params_lr, 
-                                     lr = lr_dict['base'],
-                                     **optimizer_params)
+        optimizer_class = torch.optim.Adam
+        defaults = dict(lr=lr_dict['base'], **optimizer_params)
     elif optimizer_type.lower() == 'sgd':
-        optimizer = torch.optim.SGD(params_lr, 
-                                    lr = lr_dict['base'])
-    # elif optimizer_type.lower() == 'muan':
-    #     optimizer = torch.optim.
+        optimizer_class = torch.optim.SGD
+        defaults = dict(lr=lr_dict['base'])
     else:
         raise NotImplementedError
+
+    # Shard optimizer state only for explicitly enabled multi-rank runs.
+    if use_zero and torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+        from torch.distributed.optim import ZeroRedundancyOptimizer
+
+        optimizer = ZeroRedundancyOptimizer(params_lr, optimizer_class=optimizer_class,
+                                            overlap_with_ddp=False, parameters_as_bucket_view=False, **defaults)
+    else:
+        optimizer = optimizer_class(params_lr, **defaults)
     return optimizer
 
 @gin.configurable

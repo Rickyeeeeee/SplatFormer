@@ -128,30 +128,45 @@
 # CUSTOM_POSFIX=both_deep \
 # bash scripts/overfit-sr-gsfm-on-objaverse.sh 20000 20000 4000 4000 fit_lr_to_hr aligned 32 128
 
-GPU_ID=6 \
-BATCH_SIZE=6 \
+# GPU_ID=6 \
+# BATCH_SIZE=6 \
+# GRAD_ACCUM_STEPS=1 \
+# GRID_RESOLUTION=1536 \
+# SCENE_MODE=many \
+# SCENE_COUNT=18 \
+# VELOCITY_VARIANCE_SOURCE=precomputed_aggregate \
+# PTV3_ENC_DEPTHS='(2,2,2,6,2)' \
+# PTV3_DEC_DEPTHS='(2,2,2,2)' \
+# PTV3_ENC_CHANNELS='(96,144,192,384,768)' \
+# PTV3_DEC_CHANNELS='(128,192,384,384)' \
+# CUSTOM_POSFIX=larger \
+# bash scripts/overfit-sr-gsfm-on-objaverse.sh 20000 20000 4000 4000 fit_lr_to_hr aligned 32 128
+
+# GPU_ID=6 \
+# BATCH_SIZE=6 \
+# GRAD_ACCUM_STEPS=1 \
+# GRID_RESOLUTION=1024 \
+# SCENE_MODE=many \
+# SCENE_COUNT=18 \
+# VELOCITY_VARIANCE_SOURCE=precomputed_aggregate \
+# PTV3_ENC_DEPTHS='(2,2,2,6,2)' \
+# PTV3_DEC_DEPTHS='(2,2,2,2)' \
+# PTV3_ENC_CHANNELS='(96,144,192,384,768)' \
+# PTV3_DEC_CHANNELS='(128,192,384,384)' \
+# CUSTOM_POSFIX=larger \
+# bash scripts/overfit-sr-gsfm-on-objaverse.sh 20000 20000 4000 4000 fit_lr_to_hr aligned 32 128
+
+GPU_ID=2 \
+BATCH_SIZE=4 \
 GRAD_ACCUM_STEPS=1 \
 GRID_RESOLUTION=1536 \
 SCENE_MODE=many \
 SCENE_COUNT=18 \
 VELOCITY_VARIANCE_SOURCE=precomputed_aggregate \
-PTV3_ENC_DEPTHS='(2,2,2,6,2)' \
-PTV3_DEC_DEPTHS='(2,2,2,2)' \
-PTV3_ENC_CHANNELS='(96,144,192,384,768)' \
-PTV3_DEC_CHANNELS='(128,192,384,384)' \
-CUSTOM_POSFIX=larger \
+PTV3_ENC_DEPTHS='(3,3,3,6,3)' \
+PTV3_DEC_DEPTHS='(3,3,3,3)' \
+PTV3_ENC_CHANNELS='(128,192,256,512,1024)' \
+PTV3_DEC_CHANNELS='(192,192,512,512)' \
+CUSTOM_POSFIX=wider_and_larger \
 bash scripts/overfit-sr-gsfm-on-objaverse.sh 20000 20000 4000 4000 fit_lr_to_hr aligned 32 128
 
-GPU_ID=6 \
-BATCH_SIZE=6 \
-GRAD_ACCUM_STEPS=1 \
-GRID_RESOLUTION=1024 \
-SCENE_MODE=many \
-SCENE_COUNT=18 \
-VELOCITY_VARIANCE_SOURCE=precomputed_aggregate \
-PTV3_ENC_DEPTHS='(2,2,2,6,2)' \
-PTV3_DEC_DEPTHS='(2,2,2,2)' \
-PTV3_ENC_CHANNELS='(96,144,192,384,768)' \
-PTV3_DEC_CHANNELS='(128,192,384,384)' \
-CUSTOM_POSFIX=larger \
-bash scripts/overfit-sr-gsfm-on-objaverse.sh 20000 20000 4000 4000 fit_lr_to_hr aligned 32 128

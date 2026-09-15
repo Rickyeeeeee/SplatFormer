@@ -7,19 +7,26 @@ GPU_IDS=${GPU_IDS:-${GPU_ID}}
 NGPUS=${NGPUS:-1}
 MASTER_PORT=${MASTER_PORT:-29519}
 # Workers are per GPU; prefetch factor counts microbatches per worker.
-NUM_WORKERS=${NUM_WORKERS:-2}
-PREFETCH_FACTOR=${PREFETCH_FACTOR:-2}
+NUM_WORKERS=${NUM_WORKERS:-1}
+PREFETCH_FACTOR=${PREFETCH_FACTOR:-1}
 PIN_MEMORY=${PIN_MEMORY:-true}
 BATCH_SIZE=${BATCH_SIZE:-1}
 GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS:-1}
+# Opt in to optimizer-state sharding; single-GPU runs retain the ordinary optimizer.
+ZERO_OPTIMIZER=${ZERO_OPTIMIZER:-false}
+case "${ZERO_OPTIMIZER,,}" in
+    true) ZERO_OPTIMIZER_GIN=True ;;
+    false) ZERO_OPTIMIZER_GIN=False ;;
+    *) echo "Unsupported ZERO_OPTIMIZER=${ZERO_OPTIMIZER}; expected true or false" >&2; exit 1 ;;
+esac
 TOTAL_STEPS=${1:-1000000}
 SAVE_INTERVAL=${2:-5000}
 EVAL_INTERVAL=${3:-5000}
 LOG_IMAGE_INTERVAL=${4:-1000}
 ALIGNMENT=${5:-${ALIGNMENT:-fit_lr_to_hr}}
 ATTRIBUTE_INIT=${6:-${ATTRIBUTE_INIT:-aligned}}
-INPUT_RESOLUTION=${7:-${INPUT_RESOLUTION:-128}}
-TARGET_RESOLUTION=${8:-${TARGET_RESOLUTION:-512}}
+INPUT_RESOLUTION=${7:-${INPUT_RESOLUTION:-32}}
+TARGET_RESOLUTION=${8:-${TARGET_RESOLUTION:-128}}
 MIX_SCHEDULE=${9:-${MIX_SCHEDULE:-fm-only}}
 FLOW_LOSS_TYPE=${10:-${FLOW_LOSS_TYPE:-velocity}}
 FLOW_STEPS=${11:-${FLOW_STEPS:-10}}
@@ -53,7 +60,7 @@ torchrun --nnodes=1 --nproc_per_node="${NGPUS}" --rdzv-endpoint="localhost:${MAS
     --gin_file=configs/model/ptv3_flow.gin \
     --gin_file=configs/dataset/objaverse-sr.gin \
     --gin_file=configs/train/sr_gsfm.gin \
-    --gin_param="GSFlowPredictor.grid_resolution=2048" \
+    --gin_param="GSFlowPredictor.grid_resolution=1536" \
     --gin_param="dataset_root='${DATASET_ROOT}'" \
     --gin_param="train_scene_list='${TRAIN_SCENE_LIST}'" \
     --gin_param="test_scene_list='${TEST_SCENE_LIST}'" \
@@ -70,4 +77,5 @@ torchrun --nnodes=1 --nproc_per_node="${NGPUS}" --rdzv-endpoint="localhost:${MAS
     --gin_param="training.log_image_interval=${LOG_IMAGE_INTERVAL}" \
     --gin_param="training.image_l1_loss_weight=${IMAGE_L1_LOSS_WEIGHT}" \
     --gin_param="training.lpips_loss_weight=${LPIPS_LOSS_WEIGHT}" \
+    --gin_param="train2D/build_optimizer.use_zero=${ZERO_OPTIMIZER_GIN}" \
     --gin_param="train2D/build_scheduler.total_step=${TOTAL_STEPS}"

@@ -80,6 +80,8 @@ class PointTransformerV3FlowModel(nn.Module):
                 self.dec_channels = (128, 128, 256, 256)
             elif output_dim == 96:
                 self.dec_channels = (96, 96, 128, 256)
+            elif output_dim == 160:
+                self.dec_channels = (160, 160, 256, 256)
             else:
                 raise ValueError("Unsupported output_dim")
         else:
@@ -90,6 +92,10 @@ class PointTransformerV3FlowModel(nn.Module):
                 enc_channels = (32, 64, 128, 256, 512)
             elif enc_dim == 64:
                 enc_channels = (64, 96, 128, 256, 512)
+            elif enc_dim == 96:
+                enc_channels = (96, 144, 192, 384, 768)
+            elif enc_dim == 128:
+                enc_channels = (128, 192, 256, 512, 1024)
             else:
                 raise ValueError("Unsupported enc_dim")
 

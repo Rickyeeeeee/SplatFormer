@@ -650,7 +650,8 @@ def compute_microbatch_loss(model, samples, flow_config, mix_config, mse_config,
     needs_target_images = mix_config["schedule"] != "fm-only"
     summed_loss = None
     statistics = {}
-    with torch.cuda.amp.autocast(enabled=config["enable_amp"]):
+    # spconv inference bypasses AMP casting, so evaluate losses in full precision.
+    with torch.cuda.amp.autocast(enabled=config["enable_amp"] and model_module.training):
         predictions = model(
             batch_flow_gs=[sample["query"] for sample in samples],
             batch_scene_idx=[sample["scene_idx"] for sample in samples],
@@ -764,6 +765,7 @@ def training():
     brief = (
         f"world_size={world_size} batch_size={batch_size} global_batch_size={batch_size * world_size} "
         f"grad_accum_steps={FLAGS.grad_accum_steps} microbatch_sizes={microbatch_sizes}\n"
+        f"optimizer={type(optimizer).__name__} state_sharding={getattr(optimizer, 'world_size', 1) > 1}\n"
         f"num_workers={FLAGS.num_workers} prefetch_factor={FLAGS.prefetch_factor if FLAGS.num_workers else 0} pin_memory={FLAGS.pin_memory}\n"
         f"Train SR GSFM scenes={len(train_dataset.folders)} test_scenes={len(test_dataset.folders)}\n"
         f"alignment={FLAGS.alignment} mix_schedule={mix_config['schedule']} target_training_images={needs_target_images}\n"
