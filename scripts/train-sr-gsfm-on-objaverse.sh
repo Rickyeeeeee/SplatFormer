@@ -69,7 +69,7 @@ torchrun --nnodes=1 --nproc_per_node="${NGPUS}" --rdzv-endpoint="localhost:${MAS
     --gin_file=configs/model/ptv3_flow.gin \
     --gin_file=configs/dataset/objaverse-sr.gin \
     --gin_file=configs/train/sr_gsfm.gin \
-    --gin_param="GSFlowPredictor.grid_resolution=1536" \
+    --gin_param="GSFlowPredictor.grid_resolution=1024" \
     --gin_param="dataset_root='${DATASET_ROOT}'" \
     --gin_param="train_scene_list='${TRAIN_SCENE_LIST}'" \
     --gin_param="test_scene_list='${TEST_SCENE_LIST}'" \
