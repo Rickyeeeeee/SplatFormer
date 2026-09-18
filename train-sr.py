@@ -1,5 +1,6 @@
 import json
 import os
+from contextlib import nullcontext
 from pathlib import Path
 
 import cv2
@@ -17,15 +18,33 @@ except ImportError:
     wandb = None
 
 from dataset.GS_SR import SplatFactoSRDataset
+from dataset.scene_loader import build_train_loader, training_microbatches
 from models.feature_predictor import FeaturePredictor
 from utils import gpu_utils, gs_utils, loss_utils
-from utils.gpu_utils import seed_everything
+from utils.gpu_utils import move_training_data, seed_everything
 from utils.log_utils import ProcessSafeLogger
-from utils.metrics import MetricComputer, psnr
+from utils.metrics import (MetricComputer, psnr, TestBaselineReports, scene_metric_report, write_metric_json,
+                           metric_scene_summary, dataset_metric_report, preserve_metric_rng, log_test_baselines)
 from utils.optimizers import build_optimizer, build_scheduler
 
 
 flags.DEFINE_string("output_dir", "output_sr", "Output directory")
+flags.DEFINE_integer("batch_size", 1, "Scene samples per GPU per optimizer update")
+flags.DEFINE_integer("grad_accum_steps", 1, "Forward/backward passes splitting each GPU's batch")
+flags.register_validator("batch_size", lambda value: value >= 1, message="batch_size must be at least 1")
+flags.register_multi_flags_validator(
+    ["batch_size", "grad_accum_steps"],
+    lambda values: 1 <= values["grad_accum_steps"] <= values["batch_size"],
+    message="grad_accum_steps must be between 1 and batch_size",
+)
+flags.DEFINE_enum("scene_sampling", "random", ["random", "big_small", "avoid_big"], "Training scene-size sampling mode")
+flags.DEFINE_integer("big_scene_threshold", 25000, "Scenes above this capped Gaussian count are big")
+flags.register_validator("big_scene_threshold", lambda value: value > 0, message="big_scene_threshold must be positive")
+flags.DEFINE_integer("num_workers", 2, "CPU DataLoader workers per GPU; 0 loads synchronously")
+flags.DEFINE_integer("prefetch_factor", 2, "Microbatches prefetched per worker")
+flags.DEFINE_boolean("pin_memory", True, "Pin training tensors for asynchronous GPU transfer")
+flags.register_validator("num_workers", lambda value: value >= 0, message="num_workers must be nonnegative")
+flags.register_validator("prefetch_factor", lambda value: value >= 1, message="prefetch_factor must be positive")
 flags.DEFINE_string("eval_subdir", "eval_final", "Eval subdirectory")
 flags.DEFINE_boolean("only_eval", False, "Only run evaluation")
 flags.DEFINE_boolean("compare_with_input", True, "Compare predictions with input 3DGS")
@@ -48,6 +67,7 @@ WANDB_EVAL_IMAGE_SCENE = "3e288ee8aced4a0797e66d53536112b1"
 @gin.configurable
 def set_seed(seed, rank=0):
     seed_everything(seed + rank)
+    return seed + rank
 
 
 def reduce_mean(value):
@@ -184,6 +204,33 @@ def compute_render_loss(pred_imgs, batch_images, lpips_loss_func, image_l1_loss_
     return total_loss, image_l1, lpips_loss, train_psnr
 
 
+def compute_microbatch_loss(model, scenes, dataset, device, config, lpips_loss_func, *, non_blocking=False, capture_preview=False):
+    # Load only source Gaussians and target views onto the current GPU.
+    inputs = [move_training_data(scene["data"][dataset.src_resolution]["gs_params"], device, non_blocking) for scene in scenes]
+    statistics = {}
+    preview = None
+    with torch.cuda.amp.autocast(enabled=config["enable_amp"]):
+        outputs = model(batch_normalized_gs=inputs, batch_scene_idx=[scene["scene_idx"] for scene in scenes])
+        total_loss = 0
+        for scene, input_gs, output_gs in zip(scenes, inputs, outputs):
+            target = scene["data"][dataset.tgt_resolution]
+            cameras = move_training_data(target["cameras"], device, non_blocking)
+            images = move_training_data(target["images"], device, non_blocking)
+            predictions, _ = gs_utils.rasterize_gaussians_to_multiimgs(output_gs, cameras)
+            loss, image_l1, lpips_loss, train_psnr = compute_render_loss(
+                predictions, images, lpips_loss_func, config["image_l1_loss_weight"], config["lpips_loss_weight"],
+            )
+            total_loss = total_loss + loss
+            values = {"total_loss": loss, "image_l1": image_l1, "lpips": lpips_loss, "psnr": train_psnr,
+                      "input_gaussians": input_gs["means"].shape[0], "views": len(images)}
+            for key, value in values.items():
+                value = value.detach() if torch.is_tensor(value) else loss.new_tensor(value)
+                statistics[key] = statistics.get(key, 0.0) + value
+            if capture_preview and preview is None:
+                preview = (to_cpu(predictions), to_cpu(images))
+    return total_loss, statistics, preview
+
+
 def image_png_name(image_names, image_id):
     if image_id < len(image_names):
         image_name = os.path.basename(str(image_names[image_id]))
@@ -233,6 +280,7 @@ def evaluate_single_scene(
     save_residuals=False,
     output_gt=True,
     wandb_step=None,
+    test_report=False,
 ):
     model.eval()
     model_module = model.module if isinstance(model, DDP) else model
@@ -256,7 +304,7 @@ def evaluate_single_scene(
     os.makedirs(pred_single_dir, exist_ok=True)
 
     compare_dir = None
-    if compare_with_input and evaluate_baselines:
+    if compare_with_input and (evaluate_baselines or test_report):
         compare_dir = os.path.join(output_dir, "compare")
         os.makedirs(compare_dir, exist_ok=True)
 
@@ -278,7 +326,8 @@ def evaluate_single_scene(
         low_res_gt_gs_device = (
             gpu_utils.move_to_device(low_res_gt_gs, device) if evaluate_baselines else None
         )
-        out_gs = model(batch_normalized_gs=[input_gs_device], batch_scene_idx=[scene_idx])[0]
+        # Evaluation shards can be uneven, so bypass DDP forward collectives.
+        out_gs = model_module(batch_normalized_gs=[input_gs_device], batch_scene_idx=[scene_idx])[0]
 
         pred_preview = []
         gt_preview = []
@@ -369,7 +418,14 @@ def evaluate_single_scene(
                     pred_img[:, :, ::-1],
                 )
 
-            if compare_with_input and evaluate_baselines:
+            if test_report and compare_with_input and not evaluate_baselines:
+                input_imgs, _ = gs_utils.rasterize_gaussians_to_multiimgs(input_gs_device, chunk_cameras)
+                input_imgs = torch.stack(input_imgs)
+                if masks is not None:
+                    input_imgs = input_imgs * masks
+                input_imgs = (input_imgs * 255).to(torch.uint8)
+
+            if compare_with_input and (evaluate_baselines or test_report):
                 for global_idx, (gt_img, input_img, pred_img) in enumerate(
                     zip(gt_imgs, input_imgs, pred_imgs), start=start
                 ):
@@ -435,8 +491,13 @@ def evaluate_single_scene(
                 )
 
     metrics = metric_computer.finalize()
-    with open(os.path.join(output_dir, "metrics.json"), "w") as f:
-        json.dump(image_metrics, f, indent=2)
+    if test_report:
+        report = scene_metric_report("prediction", scene_idx, scene_name, image_names, metric_computer)
+        write_metric_json(os.path.join(output_dir, "metrics.json"), report)
+        metrics = report["mean"] or {}
+    else:
+        with open(os.path.join(output_dir, "metrics.json"), "w") as f:
+            json.dump(image_metrics, f, indent=2)
     if evaluate_baselines:
         metrics_input = metric_computer_input.finalize()
         with open(os.path.join(output_dir, "metrics_input.json"), "w") as f:
@@ -466,6 +527,7 @@ def evaluate_dataset(
     output_gt=False,
     wandb_step=None,
     evaluate_baselines=False,
+    test_baseline_dir=None,
 ):
     os.makedirs(output_dir, exist_ok=True)
     rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
@@ -479,12 +541,23 @@ def evaluate_dataset(
     logger_name = "eval.log" if rank == 0 else f"eval.rank{rank}.log"
     logger = ProcessSafeLogger(os.path.join(output_dir, logger_name)).get_logger()
 
+    baselines = None
+    if test_baseline_dir is not None:
+        baselines = TestBaselineReports(test_baseline_dir, dataset, list(range(len(dataset.folders))),
+                                        {"trainer": "sr", "eval_seed": 0}, ("input", "target_high_res"))
+        evaluate_baselines = True
     scene_indices = range(rank, len(dataset.folders), world_size)
     for scene_idx in tqdm(scene_indices, desc=f"Evaluating rank {rank}", disable=rank != 0):
         scene_info = dataset.folders[scene_idx]
         scene_name = scene_info["scene_name"]
         try:
-            scene = dataset.load_scene(scene_idx)
+            if baselines is not None:
+                # A fixed scene background makes cached baselines comparable at every step.
+                with preserve_metric_rng(next(model.parameters()).device):
+                    torch.random.default_generator.manual_seed(scene_idx)
+                    scene = dataset.load_scene(scene_idx)
+            else:
+                scene = dataset.load_scene(scene_idx)
             input_resolution_entry = scene["data"][dataset.src_resolution]
             target_resolution_entry = scene["data"][dataset.tgt_resolution]
             eval_images = target_resolution_entry["images"]
@@ -493,25 +566,35 @@ def evaluate_dataset(
             input_gs = input_resolution_entry["gs_params"]
 
             scene_output_dir = os.path.join(output_dir, scene["scene_name"])
-            metrics, metrics_input, metrics_gt_low_res, metrics_gt_high_res = evaluate_single_scene(
-                model=model,
-                input_gs=input_gs,
-                gt_gs=target_resolution_entry["gs_params"],
-                low_res_gt_gs=input_gs,
-                evaluate_baselines=evaluate_baselines,
-                scene_idx=scene["scene_idx"],
-                scene_name=scene["scene_name"],
-                eval_images=eval_images,
-                eval_cameras=eval_cameras,
-                image_names=image_names,
-                output_dir=scene_output_dir,
-                eval_chunk_size=len(eval_images),
-                compare_with_input=compare_with_input,
-                save_viewer=save_viewer,
-                save_residuals=save_residuals,
-                output_gt=output_gt,
-                wandb_step=wandb_step,
-            )
+            with preserve_metric_rng(next(model.parameters()).device) if baselines is not None else nullcontext():
+                metrics, metrics_input, metrics_gt_low_res, metrics_gt_high_res = evaluate_single_scene(
+                    model=model,
+                    input_gs=input_gs,
+                    gt_gs=target_resolution_entry["gs_params"],
+                    low_res_gt_gs=input_gs,
+                    evaluate_baselines=evaluate_baselines and baselines is None,
+                    scene_idx=scene["scene_idx"],
+                    scene_name=scene["scene_name"],
+                    eval_images=eval_images,
+                    eval_cameras=eval_cameras,
+                    image_names=image_names,
+                    output_dir=scene_output_dir,
+                    eval_chunk_size=len(eval_images),
+                    compare_with_input=compare_with_input,
+                    save_viewer=save_viewer,
+                    save_residuals=save_residuals,
+                    output_gt=output_gt,
+                    wandb_step=wandb_step,
+                    test_report=baselines is not None,
+                )
+            if baselines is not None:
+                report_path = Path(scene_output_dir) / "metrics.json"
+                prediction_summary = metric_scene_summary(json.loads(report_path.read_text()), report_path, output_dir)
+                means = baselines.scene(scene, target_resolution_entry,
+                                        {"input": input_gs, "target_high_res": target_resolution_entry["gs_params"]},
+                                        dataset.image_per_scene, next(model.parameters()).device)
+                metrics_input = metrics_gt_low_res = means["input"]
+                metrics_gt_high_res = means["target_high_res"]
         except Exception as exc:
             model.train()
             filtered_scene = normalize_filtered_scene(
@@ -550,6 +633,8 @@ def evaluate_dataset(
                 "input_gs": metrics_input,
                 "gt_high_res_gs": metrics_gt_high_res,
             })
+        if baselines is not None:
+            scene_metrics["report"] = prediction_summary
         scene_average_metrics.append(scene_metrics)
         logger.info(
             f"Scene {scene['scene_name']}: "
@@ -617,20 +702,39 @@ def evaluate_dataset(
                 [metrics[key] for metrics in all_metrics_gt_high_res]
             ))
 
-    if rank == 0:
-        write_filtered_scenes(output_dir, {"test": dataset}, eval_filtered_scenes)
-        with open(os.path.join(output_dir, "scene_average_metrics.json"), "w") as f:
-            json.dump(scene_average_metrics, f, indent=2)
+    if baselines is not None:
+        baseline_reports = baselines.finish(eval_filtered_scenes)
+        report = dataset_metric_report("prediction", [item["report"] for item in scene_average_metrics], eval_filtered_scenes)
+        report["baselines"] = baselines.links(output_dir)
+        reduced_metrics = report["mean"] or {}
+        reduced_metrics_input = reduced_metrics_gt_low_res = baseline_reports["input"]["mean"] or {}
+        reduced_metrics_gt_high_res = baseline_reports["target_high_res"]["mean"] or {}
+        if rank == 0:
+            write_filtered_scenes(output_dir, {"test": dataset}, eval_filtered_scenes)
+            write_metric_json(Path(output_dir) / "metrics.json", report)
+            write_metric_json(Path(output_dir) / "scene_average_metrics.json", report["scenes"])
+            # Keep the original SR baseline filenames as aliases in the fixed baseline folder.
+            for alias, source in (("gt_low_res", "input"), ("gt_high_res", "target_high_res")):
+                write_metric_json(baselines.root / f"metrics_{alias}.json", baseline_reports[source])
+                for item in baseline_reports[source]["scenes"]:
+                    detail = json.loads((baselines.root / item["metrics_file"]).read_text())
+                    write_metric_json(baselines.root / "scenes" / item["scene_name"] / f"metrics_{alias}.json", detail)
+        log_test_baselines(wandb, baselines.root, baseline_reports)
+    else:
+        if rank == 0:
+            write_filtered_scenes(output_dir, {"test": dataset}, eval_filtered_scenes)
+            with open(os.path.join(output_dir, "scene_average_metrics.json"), "w") as f:
+                json.dump(scene_average_metrics, f, indent=2)
 
-        with open(os.path.join(output_dir, "metrics.json"), "w") as f:
-            json.dump(reduced_metrics, f, indent=2)
-        if evaluate_baselines:
-            with open(os.path.join(output_dir, "metrics_input.json"), "w") as f:
-                json.dump(reduced_metrics_input, f, indent=2)
-            with open(os.path.join(output_dir, "metrics_gt_low_res.json"), "w") as f:
-                json.dump(reduced_metrics_gt_low_res, f, indent=2)
-            with open(os.path.join(output_dir, "metrics_gt_high_res.json"), "w") as f:
-                json.dump(reduced_metrics_gt_high_res, f, indent=2)
+            with open(os.path.join(output_dir, "metrics.json"), "w") as f:
+                json.dump(reduced_metrics, f, indent=2)
+            if evaluate_baselines:
+                with open(os.path.join(output_dir, "metrics_input.json"), "w") as f:
+                    json.dump(reduced_metrics_input, f, indent=2)
+                with open(os.path.join(output_dir, "metrics_gt_low_res.json"), "w") as f:
+                    json.dump(reduced_metrics_gt_low_res, f, indent=2)
+                with open(os.path.join(output_dir, "metrics_gt_high_res.json"), "w") as f:
+                    json.dump(reduced_metrics_gt_high_res, f, indent=2)
 
     return (
         reduced_metrics, reduced_metrics_input,
@@ -651,7 +755,7 @@ def training():
     os.makedirs(FLAGS.output_dir, exist_ok=True)
 
     train_cfg = training_config(output_dir=FLAGS.output_dir)
-    set_seed(rank=rank)
+    loader_seed = set_seed(rank=rank)
 
     logger = (
         ProcessSafeLogger(os.path.join(FLAGS.output_dir, "train.log")).get_logger()
@@ -672,7 +776,8 @@ def training():
         logger.info(f"Saved {len(filtered_scenes)} filtered scenes to filtered_scenes.json")
 
     model = FeaturePredictor()
-    model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+    if distributed:
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
     if model.resume_ckpt is not None:
         model.load_state_dict(torch.load(model.resume_ckpt, map_location="cpu"))
         if rank == 0:
@@ -700,10 +805,22 @@ def training():
         with open(os.path.join(FLAGS.output_dir, "config.gin"), "w") as f:
             f.writelines(gin.operative_config_str())
 
+    batch_size = FLAGS.batch_size
+    quotient, remainder = divmod(batch_size, FLAGS.grad_accum_steps)
+    microbatch_sizes = [quotient + (index < remainder) for index in range(FLAGS.grad_accum_steps)]
+    loader = None if FLAGS.only_eval else build_train_loader(
+        train_dataset, microbatch_sizes, loader_seed, rank, world_size, count_resolution=train_dataset.src_resolution,
+        scene_sampling=FLAGS.scene_sampling, big_scene_threshold=FLAGS.big_scene_threshold,
+        num_workers=FLAGS.num_workers, prefetch_factor=FLAGS.prefetch_factor, pin_memory=FLAGS.pin_memory,
+    )
+
     training_brief = (
         f"Train SR input_resolution={FLAGS.input_resolution} target_resolution={FLAGS.target_resolution}\n"
         f"train_scenes={len(train_dataset.folders)} test_scenes={len(test_dataset.folders)}\n"
-        f"world_size={world_size}\n"
+        f"world_size={world_size} batch_size={batch_size} global_batch_size={batch_size * world_size}\n"
+        f"grad_accum_steps={FLAGS.grad_accum_steps} microbatch_sizes={microbatch_sizes}\n"
+        f"scene_sampling={FLAGS.scene_sampling} big_scene_threshold={FLAGS.big_scene_threshold}\n"
+        f"num_workers={FLAGS.num_workers} prefetch_factor={FLAGS.prefetch_factor if FLAGS.num_workers else 0} pin_memory={FLAGS.pin_memory}\n"
         f"model_input_features={','.join(model_module.input_features)}\n"
         f"model_output_features={','.join(model_module.output_features)}"
     )
@@ -720,7 +837,6 @@ def training():
     resume_from_step = train_cfg["resume_from_step"]
     enable_amp = train_cfg["enable_amp"]
     empty_cache_fre = train_cfg["empty_cache_fre"]
-    image_l1_loss_weight = train_cfg["image_l1_loss_weight"]
     lpips_loss_weight = train_cfg["lpips_loss_weight"]
 
     scaler = torch.cuda.amp.GradScaler(enabled=enable_amp)
@@ -734,165 +850,148 @@ def training():
 
     if not FLAGS.only_eval:
         optimizer.zero_grad(set_to_none=True)
-        train_iter = iter(train_dataset)
-        pbar = tqdm(
-            range(resume_from_step, total_steps),
-            desc="Training",
-            disable=rank != 0,
-        )
-        for step in pbar:
-            try:
-                batch = next(train_iter)
-            except StopIteration:
-                train_iter = iter(train_dataset)
-                batch = next(train_iter)
-            input_resolution_entry = batch["data"][train_dataset.src_resolution]
-            target_resolution_entry = batch["data"][train_dataset.tgt_resolution]
+        with training_microbatches(loader) as train_iter:
+            pbar = tqdm(
+                range(resume_from_step, total_steps),
+                desc="Training",
+                disable=rank != 0,
+            )
+            for step in pbar:
+                batch_statistics = {}
+                preview = None
+                for microbatch_index in range(len(microbatch_sizes)):
+                    scenes = next(train_iter)
+                    scene_name = scenes[-1]["scene_name"]
+                    # Accumulate locally until the final forward/backward pair.
+                    sync_context = model.no_sync() if distributed and microbatch_index < len(microbatch_sizes) - 1 else nullcontext()
+                    with sync_context:
+                        loss, statistics, current_preview = compute_microbatch_loss(
+                            model, scenes, train_dataset, device, train_cfg, lpips_loss_func,
+                            non_blocking=FLAGS.pin_memory,
+                            capture_preview=rank == 0 and step % log_image_interval == 0 and preview is None,
+                        )
+                        loss = loss / batch_size
+                        if enable_amp:
+                            scaler.scale(loss).backward()
+                        else:
+                            loss.backward()
+                    if current_preview is not None:
+                        preview = current_preview
+                    for key, value in statistics.items():
+                        batch_statistics[key] = batch_statistics.get(key, 0.0) + value / batch_size
+                    del loss, scenes
 
-            input_gs = gpu_utils.move_to_device(input_resolution_entry["gs_params"], device)
-            batch_scene_idx = [batch["scene_idx"]]
-            batch_cameras = gpu_utils.move_to_device(target_resolution_entry["cameras"], device)
-            batch_images = gpu_utils.move_to_device(target_resolution_entry["images"], device)
+                optimizer_stepped = True
+                if enable_amp:
+                    previous_scale = scaler.get_scale()
+                    if grad_clip_norm > 0:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer_stepped = scaler.get_scale() >= previous_scale
+                else:
+                    if grad_clip_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+                    optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                if optimizer_stepped:
+                    scheduler.step()
 
-            with torch.cuda.amp.autocast(enabled=enable_amp):
-                out_gs = model(batch_normalized_gs=[input_gs], batch_scene_idx=batch_scene_idx)[0]
-                pred_imgs, _ = gs_utils.rasterize_gaussians_to_multiimgs(out_gs, batch_cameras)
-                total_loss, image_l1, lpips_loss, train_psnr = compute_render_loss(
-                    pred_imgs,
-                    batch_images,
-                    lpips_loss_func,
-                    image_l1_loss_weight,
-                    lpips_loss_weight,
-                )
-
-            if enable_amp:
-                scaler.scale(total_loss).backward()
-                if grad_clip_norm > 0:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                total_loss.backward()
-                if grad_clip_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
-                optimizer.step()
-
-            optimizer.zero_grad(set_to_none=True)
-            scheduler.step()
-
-            lpips_value = lpips_loss.item() if lpips_loss_func is not None else 0.0
-            if rank == 0:
-                pbar.set_postfix(
-                    {
-                        "scene": batch["scene_name"],
-                        "loss": f"{total_loss.item():.4f}",
-                        "l1": f"{image_l1.item():.4f}",
-                        "lpips": f"{lpips_value:.4f}",
-                        "psnr": f"{train_psnr.item():.2f}",
-                        "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
-                    }
-                )
-
-            if empty_cache_fre > 0 and (step + 1) % empty_cache_fre == 0:
-                torch.cuda.empty_cache()
-
-            if step % log_interval == 0:
-                lpips_tensor = lpips_loss if torch.is_tensor(lpips_loss) else total_loss.new_tensor(0.0)
-                reduced_values = {
-                    "total_loss": reduce_mean(total_loss),
-                    "image_l1": reduce_mean(image_l1),
-                    "lpips": reduce_mean(lpips_tensor),
-                    "psnr": reduce_mean(train_psnr),
-                    "input_gaussians": reduce_mean(
-                        total_loss.new_tensor(input_resolution_entry["gs_params"]["means"].shape[0])
-                    ),
-                    "views": reduce_mean(total_loss.new_tensor(len(batch_images))),
-                }
                 if rank == 0:
-                    train_log = {
-                        f"train/{key}": value.item() for key, value in reduced_values.items()
-                    }
-                    train_log["train/lr"] = optimizer.param_groups[0]["lr"]
+                    pbar.set_postfix(scene=scene_name, loss=f"{batch_statistics['total_loss'].item():.4f}",
+                                     psnr=f"{batch_statistics['psnr'].item():.2f}", lr=f"{optimizer.param_groups[0]['lr']:.2e}")
+
+                if empty_cache_fre > 0 and (step + 1) % empty_cache_fre == 0:
+                    torch.cuda.empty_cache()
+
+                if step % log_interval == 0:
+                    reduced_values = {key: reduce_mean(value) for key, value in batch_statistics.items()}
+                    if rank == 0:
+                        train_log = {
+                            f"train/{key}": value.item() for key, value in reduced_values.items()
+                        }
+                        train_log.update({"train/lr": optimizer.param_groups[0]["lr"], "train/batch_size": batch_size,
+                                          "train/global_batch_size": batch_size * world_size, "train/grad_accum_steps": FLAGS.grad_accum_steps})
+                        if wandb is not None and wandb.run is not None:
+                            wandb.log(train_log, step=step)
+                        logger.info(
+                            f"step={step} total={reduced_values['total_loss'].item():.6f} "
+                            f"l1={reduced_values['image_l1'].item():.6f} "
+                            f"lpips={reduced_values['lpips'].item():.6f} "
+                            f"psnr={reduced_values['psnr'].item():.4f} "
+                            f"lr={optimizer.param_groups[0]['lr']:.8f}"
+                        )
+
+                if step % log_image_interval == 0 and rank == 0:
+                    log_pred_imgs, batch_images = preview
+
+                    pred_imgs_uint8 = [(im * 255).detach().cpu().numpy().astype(np.uint8) for im in log_pred_imgs]
+                    pred_grid_rgb = gs_utils.make_grid(pred_imgs_uint8)
+                    pred_grid = cv2.cvtColor(pred_grid_rgb, cv2.COLOR_RGB2BGR)
+                    pred_path = os.path.join(FLAGS.output_dir, "train", f"{step:08d}_pred.png")
+                    cv2.imwrite(pred_path, pred_grid)
+
+                    gt_imgs_uint8 = [
+                        (img[..., :3] * 255).detach().cpu().numpy().astype(np.uint8) for img in batch_images
+                    ]
+                    gt_grid_rgb = gs_utils.make_grid(gt_imgs_uint8)
+                    gt_grid = cv2.cvtColor(gt_grid_rgb, cv2.COLOR_RGB2BGR)
+                    gt_path = os.path.join(FLAGS.output_dir, "train", f"{step:08d}_gt.png")
+                    cv2.imwrite(gt_path, gt_grid)
+
                     if wandb is not None and wandb.run is not None:
-                        wandb.log(train_log, step=step)
-                    logger.info(
-                        f"step={step} total={reduced_values['total_loss'].item():.6f} "
-                        f"l1={reduced_values['image_l1'].item():.6f} "
-                        f"lpips={reduced_values['lpips'].item():.6f} "
-                        f"psnr={reduced_values['psnr'].item():.4f} "
-                        f"lr={optimizer.param_groups[0]['lr']:.8f}"
+                        wandb.log(
+                            {
+                                "train/pred_grid": wandb.Image(pred_grid_rgb, caption=f"step={step} pred"),
+                                "train/gt_grid": wandb.Image(gt_grid_rgb, caption=f"step={step} gt"),
+                            },
+                            step=step,
+                        )
+
+                if step % eval_interval == 0:
+                    eval_dir = os.path.join(FLAGS.output_dir, "eval", f"{step:08d}")
+                    metrics, metrics_input, metrics_gt_low_res, metrics_gt_high_res = evaluate_dataset(
+                        model=model,
+                        dataset=test_dataset,
+                        output_dir=eval_dir,
+                        compare_with_input=FLAGS.compare_with_input,
+                        save_viewer=FLAGS.save_viewer,
+                        save_residuals=FLAGS.save_residuals,
+                        output_gt=(step == 0),
+                        wandb_step=step,
+                        evaluate_baselines=(step == 0),
+                        test_baseline_dir=os.path.join(FLAGS.output_dir, "eval_baselines", "test"),
                     )
-
-            if step % log_image_interval == 0 and rank == 0:
-                with torch.no_grad():
-                    log_pred_imgs, _ = gs_utils.rasterize_gaussians_to_multiimgs(out_gs, batch_cameras)
-
-                pred_imgs_uint8 = [(im * 255).detach().cpu().numpy().astype(np.uint8) for im in log_pred_imgs]
-                pred_grid_rgb = gs_utils.make_grid(pred_imgs_uint8)
-                pred_grid = cv2.cvtColor(pred_grid_rgb, cv2.COLOR_RGB2BGR)
-                pred_path = os.path.join(FLAGS.output_dir, "train", f"{step:08d}_pred.png")
-                cv2.imwrite(pred_path, pred_grid)
-
-                gt_imgs_uint8 = [
-                    (img[..., :3] * 255).detach().cpu().numpy().astype(np.uint8) for img in batch_images
-                ]
-                gt_grid_rgb = gs_utils.make_grid(gt_imgs_uint8)
-                gt_grid = cv2.cvtColor(gt_grid_rgb, cv2.COLOR_RGB2BGR)
-                gt_path = os.path.join(FLAGS.output_dir, "train", f"{step:08d}_gt.png")
-                cv2.imwrite(gt_path, gt_grid)
-
-                if wandb is not None and wandb.run is not None:
-                    wandb.log(
-                        {
-                            "train/pred_grid": wandb.Image(pred_grid_rgb, caption=f"step={step} pred"),
-                            "train/gt_grid": wandb.Image(gt_grid_rgb, caption=f"step={step} gt"),
-                        },
-                        step=step,
-                    )
-
-            if step % eval_interval == 0:
-                eval_dir = os.path.join(FLAGS.output_dir, "eval", f"{step:08d}")
-                metrics, metrics_input, metrics_gt_low_res, metrics_gt_high_res = evaluate_dataset(
-                    model=model,
-                    dataset=test_dataset,
-                    output_dir=eval_dir,
-                    compare_with_input=FLAGS.compare_with_input,
-                    save_viewer=FLAGS.save_viewer,
-                    save_residuals=FLAGS.save_residuals,
-                    output_gt=(step == 0),
-                    wandb_step=step,
-                    evaluate_baselines=(step == 0),
-                )
-                if rank == 0:
-                    metric_str = " ".join([f"{key}: {value:.4f}" for key, value in metrics.items()])
-                    logger.info(f"Eval step {step}: {metric_str}")
-                    if wandb is not None and wandb.run is not None:
-                        wandb.log({f"eval/{key}": value for key, value in metrics.items()}, step=step)
-                    if step == 0:
-                        metric_str = " ".join([f"{key}: {value:.4f}" for key, value in metrics_input.items()])
-                        logger.info(f"Eval step {step} input: {metric_str}")
+                    if rank == 0:
+                        metric_str = " ".join([f"{key}: {value:.4f}" for key, value in metrics.items()])
+                        logger.info(f"Eval step {step}: {metric_str}")
                         if wandb is not None and wandb.run is not None:
-                            wandb.log({f"eval_input/{key}": value for key, value in metrics_input.items()}, step=step)
-                        metric_str = " ".join([f"{key}: {value:.4f}" for key, value in metrics_gt_low_res.items()])
-                        logger.info(f"Eval step {step} GT low-res GS: {metric_str}")
-                        if wandb is not None and wandb.run is not None:
-                            wandb.log({f"eval_gt_low_res/{key}": value for key, value in metrics_gt_low_res.items()}, step=step)
-                        metric_str = " ".join([f"{key}: {value:.4f}" for key, value in metrics_gt_high_res.items()])
-                        logger.info(f"Eval step {step} GT high-res GS: {metric_str}")
-                        if wandb is not None and wandb.run is not None:
-                            wandb.log({f"eval_gt_high_res/{key}": value for key, value in metrics_gt_high_res.items()}, step=step)
-                if distributed:
-                    dist.barrier()
-                model.train()
+                            wandb.log({f"eval/{key}": value for key, value in metrics.items()}, step=step)
+                        if step == 0:
+                            metric_str = " ".join([f"{key}: {value:.4f}" for key, value in metrics_input.items()])
+                            logger.info(f"Eval step {step} input: {metric_str}")
+                            if wandb is not None and wandb.run is not None:
+                                wandb.log({f"eval_input/{key}": value for key, value in metrics_input.items()}, step=step)
+                            metric_str = " ".join([f"{key}: {value:.4f}" for key, value in metrics_gt_low_res.items()])
+                            logger.info(f"Eval step {step} GT low-res GS: {metric_str}")
+                            if wandb is not None and wandb.run is not None:
+                                wandb.log({f"eval_gt_low_res/{key}": value for key, value in metrics_gt_low_res.items()}, step=step)
+                            metric_str = " ".join([f"{key}: {value:.4f}" for key, value in metrics_gt_high_res.items()])
+                            logger.info(f"Eval step {step} GT high-res GS: {metric_str}")
+                            if wandb is not None and wandb.run is not None:
+                                wandb.log({f"eval_gt_high_res/{key}": value for key, value in metrics_gt_high_res.items()}, step=step)
+                    if distributed:
+                        dist.barrier()
+                    model.train()
 
-            if (step + 1) % save_interval == 0:
-                if rank == 0:
-                    ckpt_path = os.path.join(FLAGS.output_dir, "checkpoints", f"model_{step:08d}.pth")
-                    torch.save(model_module.state_dict(), ckpt_path)
-                    logger.info(f"Saved model checkpoint to {ckpt_path}")
-                if distributed:
-                    dist.barrier()
+                if (step + 1) % save_interval == 0:
+                    if rank == 0:
+                        ckpt_path = os.path.join(FLAGS.output_dir, "checkpoints", f"model_{step:08d}.pth")
+                        torch.save(model_module.state_dict(), ckpt_path)
+                        logger.info(f"Saved model checkpoint to {ckpt_path}")
+                    if distributed:
+                        dist.barrier()
 
         if rank == 0:
             last_ckpt_path = os.path.join(FLAGS.output_dir, "checkpoints", "model_last.pth")
@@ -911,6 +1010,7 @@ def training():
         save_residuals=FLAGS.save_residuals,
         output_gt=True,
         evaluate_baselines=True,
+        test_baseline_dir=os.path.join(FLAGS.output_dir, "eval_baselines", "test"),
     )
     if rank == 0:
         metric_str = " ".join([f"{key}: {value:.4f}" for key, value in metrics.items()])

@@ -1,10 +1,8 @@
-import csv
 import hashlib
 import json
 import os
 import random
 import time
-from collections import deque
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
@@ -23,16 +21,19 @@ except ImportError:
     wandb = None
 
 from dataset.GS_SR import SplatFactoSRDataset
+from dataset.scene_loader import SRSceneDataset, SceneMicrobatchSampler, build_train_loader as build_scene_loader, collate_scenes, seed_loader_worker, training_microbatches
 from models.feature_flow_predictor import GSFlowPredictor
 from models.feature_predictor import FeaturePredictor  # Registers legacy Gin keys.
 from sr import flow
 from sr.alignment import prepare_alignment
 from utils import gpu_utils, gs_utils, loss_utils
-from utils.gpu_utils import seed_everything
+from utils.gpu_utils import move_training_data, seed_everything
 from utils.gs_utils import make_grid
 from utils.log_utils import ProcessSafeLogger
 from utils.loss_utils import SUPPORTED_GS_KEYS
-from utils.metrics import MetricComputer
+from utils.metrics import (MetricComputer, TestBaselineReports, scene_metric_report, write_metric_json,
+                           metric_scene_summary, dataset_metric_report, gather_metric_records,
+                           preserve_metric_rng, log_test_baselines)
 from utils.optimizers import build_optimizer, build_scheduler
 
 
@@ -214,10 +215,13 @@ def evaluate_single_scene(
     compare_with_input=False,
     save_viewer=True,
     output_gt=True,
+    wandb_images=None,
+    image_prefix=None,
+    test_report=False,
 ):
     was_training = model.training
     metric_computer = MetricComputer()
-    metric_computer_input = MetricComputer() if compare_with_input else None
+    metric_computer_input = MetricComputer() if compare_with_input and not test_report else None
     device = next(model.parameters()).device
     num_views = len(eval_images)
     if num_views == 0:
@@ -241,6 +245,7 @@ def evaluate_single_scene(
         out_gs = flow.sample_flow_model(model, source_flow_gs, scene_idx, flow_steps)
         pred_preview = []
         gt_preview = []
+        compare_preview = []
 
         for start in range(0, num_views, eval_chunk_size):
             end = min(start + eval_chunk_size, num_views)
@@ -287,7 +292,8 @@ def evaluate_single_scene(
                     input_imgs = (input_imgs * 255).to(torch.uint8)
                 else:
                     input_imgs = (input_imgs * 255).to(torch.uint8)
-                metric_computer_input.update(input_imgs, gt_imgs, name=chunk_name)
+                if metric_computer_input is not None:
+                    metric_computer_input.update(input_imgs, gt_imgs, name=chunk_name)
 
                 for global_idx, (gt_img, input_img, pred_img) in enumerate(
                     zip(gt_imgs, input_imgs, pred_imgs), start=start
@@ -296,6 +302,8 @@ def evaluate_single_scene(
                     input_img = input_img.cpu().numpy().astype(np.uint8)
                     pred_img = pred_img.cpu().numpy().astype(np.uint8)
                     cmp_img = np.concatenate([gt_img, input_img, pred_img], axis=1)
+                    if wandb_images is not None and len(compare_preview) < 9:
+                        compare_preview.append(cmp_img)
                     cv2.imwrite(os.path.join(compare_dir, f"{global_idx:04d}.png"), cmp_img[:, :, ::-1])
 
         if len(pred_preview) > 0:
@@ -305,6 +313,11 @@ def evaluate_single_scene(
         if output_gt and len(gt_preview) > 0:
             gt_grid = cv2.cvtColor(make_grid(gt_preview), cv2.COLOR_RGB2BGR)
             cv2.imwrite(os.path.join(output_dir, f"scene{scene_idx}_gt.png"), gt_grid)
+
+        if wandb_images is not None:
+            for label, images in (("pred", pred_preview), ("gt", gt_preview), ("compare", compare_preview)):
+                if images:
+                    wandb_images[f"{image_prefix}/{label}_grid"] = wandb.Image(make_grid(images), caption=f"{scene_name} {label}, flow_steps={flow_steps}")
 
         if save_viewer:
             viewerdir = os.path.join(output_dir, f"viewer/{scene_name}")
@@ -316,9 +329,14 @@ def evaluate_single_scene(
                 gs_utils.export_ply_forviewer(gt_gs, os.path.join(viewerdir, "point_cloud/gt.ply"))
 
     metrics = metric_computer.finalize()
-    metric_computer.write_to_file(os.path.join(output_dir, "metrics.json"))
+    if test_report:
+        report = scene_metric_report("prediction", scene_idx, scene_name, image_names, metric_computer)
+        write_metric_json(os.path.join(output_dir, "metrics.json"), report)
+        metrics = report["mean"] or {}
+    else:
+        metric_computer.write_to_file(os.path.join(output_dir, "metrics.json"))
 
-    if compare_with_input:
+    if metric_computer_input is not None:
         metrics_input = metric_computer_input.finalize()
         metric_computer_input.write_to_file(os.path.join(output_dir, "metrics_input.json"))
     else:
@@ -334,182 +352,36 @@ def init_wandb(output_dir):
         return None
     if wandb is None:
         raise ImportError("wandb is not installed")
-    return wandb.init(project=FLAGS.wandb_project, dir=FLAGS.wandb_dir, name=FLAGS.wandb_name)
+    output_dir_parts = Path(output_dir.rstrip("/")).parts
+    return wandb.init(
+        project=FLAGS.wandb_project, dir=FLAGS.wandb_dir,
+        name=FLAGS.wandb_name or "/".join(output_dir_parts[-2:]),
+        config={**FLAGS.flag_values_dict(), "output_dir": output_dir,
+                "gin_config": gin.operative_config_str(), "eval_flow_steps": EVAL_FLOW_STEPS},
+    )
 
 
 def wandb_log(values, step=None):
     if dist.is_initialized() and dist.get_rank() != 0:
         return
     if wandb is not None and wandb.run is not None:
-        wandb.log(values, step=step)
+        # Keep metrics and images at the same explicit training step.
+        wandb.log(values, step=step, commit=False)
 
 
 def build_dataset(scope, alignment=None, **kwargs):
     return SplatFactoSRDataset.from_gin_scope(scope, alignment=alignment, **kwargs)
 
 
-class SRSceneDataset(torch.utils.data.Dataset):
-    """Load explicitly assigned scenes without invoking the iterable dataset's sharding."""
-
-    def __init__(self, dataset):
-        self.dataset = dataset
-        self.gin_config = gin.config_str()
-
-    def __len__(self):
-        return len(self.dataset.folders)
-
-    def __getitem__(self, scene_idx):
-        try:
-            return self.dataset.load_scene(scene_idx, sample_views=True, fit_alignment=self.dataset.alignment)
-        except Exception as error:
-            raise RuntimeError(f"Failed to load scene {scene_idx}: {self.dataset.folders[scene_idx]}") from error
-
-
-class SceneMicrobatchSampler(torch.utils.data.Sampler):
-    """Generate rank-local microbatches continuously, including across epoch boundaries."""
-
-    def __init__(self, scene_count, microbatch_sizes, rank=0, world_size=1, split_across_gpus=True, seed=0,
-                 scene_sampling="random", scene_counts=None, big_scene_threshold=25000):
-        if scene_count < 1:
-            raise ValueError("Training dataset contains no scenes")
-        if not microbatch_sizes or min(microbatch_sizes) < 1:
-            raise ValueError("Microbatch sizes must be positive")
-        if not 0 <= rank < world_size:
-            raise ValueError("Invalid rank/world_size")
-        self.scene_count = scene_count
-        self.microbatch_sizes = microbatch_sizes
-        self.rank = rank
-        self.world_size = world_size
-        self.split_across_gpus = split_across_gpus
-        self.seed = seed
-        if scene_sampling not in {"random", "big_small", "avoid_big"}:
-            raise ValueError(f"Unknown scene_sampling: {scene_sampling}")
-        self.scene_sampling = scene_sampling
-        self.big_indices = set()
-        self.small_count = self.big_count = None
-        if scene_sampling != "random":
-            if scene_counts is None or len(scene_counts) != scene_count or min(scene_counts) < 1:
-                raise ValueError("Size-aware sampling requires a positive Gaussian count for every scene")
-            if big_scene_threshold <= 0:
-                raise ValueError("big_scene_threshold must be positive")
-            self.big_indices = {index for index, count in enumerate(scene_counts) if count > big_scene_threshold}
-            self.big_count = len(self.big_indices)
-            self.small_count = scene_count - self.big_count
-        self.scene_indices = [index for index in range(scene_count)
-                              if scene_sampling != "avoid_big" or index not in self.big_indices]
-        if not self.scene_indices:
-            raise ValueError("avoid_big leaves no eligible training scenes; increase big_scene_threshold")
-
-    def __iter__(self):
-        epoch = 0
-        remaining, small, big = deque(), deque(), deque()
-        rng = random.Random(self.seed)
-        while True:
-            for size in self.microbatch_sizes:
-                batch = []
-                has_big = False
-                while len(batch) < size:
-                    if not remaining and not small and not big:
-                        if self.split_across_gpus:
-                            order = np.asarray(self.scene_indices)[np.random.RandomState(epoch).permutation(len(self.scene_indices))]
-                            per_rank = (len(order) + self.world_size - 1) // self.world_size
-                            order = np.resize(order, per_rank * self.world_size)
-                            order = order[self.rank * per_rank:(self.rank + 1) * per_rank].tolist()
-                        else:
-                            order = self.scene_indices.copy()
-                            rng.shuffle(order)
-                        if self.scene_sampling == "big_small":
-                            small.extend(index for index in order if index not in self.big_indices)
-                            big.extend(index for index in order if index in self.big_indices)
-                        else:
-                            remaining.extend(order)
-                        epoch += 1
-                    if self.scene_sampling != "big_small":
-                        scene_idx = remaining.popleft()
-                    elif size == 1:
-                        scene_idx = big.popleft() if rng.randrange(len(small) + len(big)) < len(big) else small.popleft()
-                    elif big and not has_big:
-                        scene_idx = big.popleft()
-                        has_big = True
-                    elif small:
-                        scene_idx = small.popleft()
-                    else:
-                        raise ValueError(f"big_small cannot fill microbatch size {size} on rank {self.rank}: insufficient small scenes; use singleton microbatches (grad_accum_steps=batch_size)")
-                    batch.append(scene_idx)
-                # Keep the big scene last, including when a microbatch crosses epochs.
-                if self.scene_sampling == "big_small":
-                    batch.sort(key=lambda index: index in self.big_indices)
-                yield batch
-
-
-def collate_scenes(scenes):
-    # Scenes have variable Gaussian counts, so retain a list instead of stacking.
-    return scenes
-
-
-def seed_loader_worker(worker_id):
-    del worker_id
-    # Spawned workers need bindings used inside load_scene, such as MinMaxScaler.
-    with gin.unlock_config():
-        gin.parse_config(torch.utils.data.get_worker_info().dataset.gin_config)
-    seed = torch.initial_seed() % (2 ** 32)
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.set_num_threads(1)
-
-
 def build_train_loader(dataset, microbatch_sizes, seed, rank=0, world_size=1):
-    scene_counts = None
+    resolution = None
     if FLAGS.scene_sampling != "random":
-        # CSV counts are upper estimates after finite/outlier filtering; never load checkpoints here.
         resolution = dataset.src_resolution if dataset.alignment == "fit_lr_to_hr" else dataset.tgt_resolution
-        column = f"res_{resolution}_num_gs"
-        with open(dataset.scene_list, newline="") as source:
-            reader = csv.DictReader(source)
-            if not reader.fieldnames or not {"scene_id", column}.issubset(reader.fieldnames):
-                raise ValueError(f"Size-aware sampling requires scene_id and {column} in {dataset.scene_list}")
-            counts_by_name = {row["scene_id"].strip(): row.get(column) for row in reader}
-        scene_counts = []
-        for scene in dataset.folders:
-            name = scene["scene_name"]
-            try:
-                count = int(counts_by_name[name])
-            except (KeyError, TypeError, ValueError) as error:
-                raise ValueError(f"Missing or invalid {column} for scene {name} in {dataset.scene_list}") from error
-            if count < 1:
-                raise ValueError(f"Invalid {column}={count} for scene {name}; expected a positive count")
-            scene_counts.append(min(count, dataset.max_gs_num))
-    sampler = SceneMicrobatchSampler(len(dataset.folders), microbatch_sizes, rank, world_size, dataset.split_across_gpus, seed,
-                                    FLAGS.scene_sampling, scene_counts, FLAGS.big_scene_threshold)
-    worker_options = {}
-    if FLAGS.num_workers > 0:
-        worker_options = dict(multiprocessing_context="spawn", persistent_workers=True, prefetch_factor=FLAGS.prefetch_factor)
-    return torch.utils.data.DataLoader(
-        SRSceneDataset(dataset), batch_sampler=sampler, collate_fn=collate_scenes,
-        num_workers=FLAGS.num_workers, pin_memory=FLAGS.pin_memory, worker_init_fn=seed_loader_worker,
-        generator=torch.Generator().manual_seed(seed), **worker_options,
+    return build_scene_loader(
+        dataset, microbatch_sizes, seed, rank, world_size, count_resolution=resolution,
+        scene_sampling=FLAGS.scene_sampling, big_scene_threshold=FLAGS.big_scene_threshold,
+        num_workers=FLAGS.num_workers, prefetch_factor=FLAGS.prefetch_factor, pin_memory=FLAGS.pin_memory,
     )
-
-
-@contextmanager
-def training_microbatches(loader):
-    iterator = iter(loader)
-    try:
-        yield iterator
-    finally:
-        if loader.num_workers > 0:
-            # DataLoader has no public close API for persistent worker iterators.
-            iterator._shutdown_workers()
-
-
-def move_training_data(data, device, non_blocking=False):
-    if torch.is_tensor(data):
-        return data.to(device, non_blocking=non_blocking)
-    if isinstance(data, dict):
-        return {key: move_training_data(value, device, non_blocking) for key, value in data.items()}
-    if isinstance(data, (list, tuple)):
-        return type(data)(move_training_data(value, device, non_blocking) for value in data)
-    return data
 
 
 def build_gaussian_pair(dataset, scene, device, non_blocking=False):
@@ -584,9 +456,31 @@ def evaluation_rng(device, split, scene_name):
         np.random.set_state(numpy_state)
 
 
+def log_training_images(model, dataset, scene_idx, scene_name, step, flow_steps):
+    device = next(model.parameters()).device
+    was_training = model.training
+    with evaluation_rng(device, "train_preview", scene_name), torch.no_grad():
+        model.eval()
+        try:
+            scene = dataset.load_scene(scene_idx, sample_views=True, fit_alignment=FLAGS.alignment)
+            target_data, source_gs, target_gs = build_gaussian_pair(dataset, scene, device)
+            del target_gs
+            preview_gs = flow.sample_flow_model(model, source_gs, scene_idx, flow_steps)
+            cameras = {key: value[:9] if key == "camera_to_worlds" else value for key, value in target_data["cameras"].items()}
+            cameras = gpu_utils.move_to_device(cameras, device)
+            predictions, _ = gs_utils.rasterize_gaussians_to_multiimgs(preview_gs, cameras)
+            images = {}
+            for label, views in (("pred", predictions), ("gt", target_data["images"][:9])):
+                grid = make_grid([(view[..., :3].clamp(0, 1) * 255).to(torch.uint8).cpu().numpy() for view in views])
+                images[f"train/{label}_grid"] = wandb.Image(grid, caption=f"step={step} {scene_name} {label}, flow_steps={flow_steps}")
+            wandb_log(images, step=step)
+        finally:
+            model.train(was_training)
+
+
 def evaluate_dataset(model, dataset, output_dir, *, scene_indices=None, split="test",
                      flow_config=None, mix_config=None, mse_config=None, config=None,
-                     velocity_variances=None, lpips_function=None, loss_view_count=None):
+                     velocity_variances=None, lpips_function=None, loss_view_count=None, wandb_images=None, test_baseline_dir=None):
     # Uneven evaluation shards must not run forwards through DDP.
     model = model.module if isinstance(model, DDP) else model
     was_training = model.training
@@ -597,6 +491,13 @@ def evaluate_dataset(model, dataset, output_dir, *, scene_indices=None, split="t
     indices = list(range(len(dataset.folders))) if scene_indices is None else list(scene_indices)
     results = {flow_steps: [] for flow_steps in EVAL_FLOW_STEPS}
     losses = []
+    prediction_summaries = []
+    baselines = None
+    if split == "test" and test_baseline_dir is not None:
+        baselines = TestBaselineReports(test_baseline_dir, dataset, indices,
+                                        {"alignment": FLAGS.alignment, "attribute_init": FLAGS.attribute_init,
+                                         "emd_eps": FLAGS.emd_eps, "emd_iters": FLAGS.emd_iters, "eval_seed": FLAGS.eval_seed},
+                                        ("input", "target_fit_lr_to_hr", "target_high_res"))
     try:
         os.makedirs(output_dir, exist_ok=True)
         if dist.is_initialized():
@@ -611,6 +512,18 @@ def evaluate_dataset(model, dataset, output_dir, *, scene_indices=None, split="t
                     eval_chunk_size = dataset.image_per_scene or len(target_data["images"])
                     if eval_chunk_size <= 0:
                         eval_chunk_size = len(target_data["images"])
+                    if baselines is not None:
+                        # Extra fitted-target loading is confined to test baseline generation.
+                        with preserve_metric_rng(device):
+                            gaussian_sets = {}
+                            if not baselines.reuse:
+                                fitted_scene = scene if "fit_lr_to_hr" in scene else dataset.load_scene(scene_idx, sample_views=False, fit_alignment="fit_lr_to_hr")
+                                gaussian_sets = {"input": source_gs, "target_fit_lr_to_hr": fitted_scene["fit_lr_to_hr"]["tgt_gs"],
+                                                 "target_high_res": target_data["gs_params"]}
+                            baselines.scene(scene, target_data, gaussian_sets, eval_chunk_size, device)
+                            if not baselines.reuse:
+                                del fitted_scene
+                            del gaussian_sets
                     if flow_config is not None:
                         sample = prepare_scene_sample(source_gs, target_gs, target_data, scene_idx, loss_view_count,
                                                       device, flow_config, mix_config)
@@ -629,8 +542,16 @@ def evaluate_dataset(model, dataset, output_dir, *, scene_indices=None, split="t
                             flow_steps=flow_steps, eval_chunk_size=eval_chunk_size,
                             gt_gs=target_gs, compare_with_input=FLAGS.compare_with_input,
                             save_viewer=FLAGS.save_viewer, output_gt=True,
+                            wandb_images=wandb_images if rank == 0 and scene_idx == indices[0] else None,
+                            image_prefix=f"eval_images/{split}/{flow_steps}/{scene_name}",
+                            test_report=baselines is not None,
                         )
                         results[flow_steps].append((scene_idx, metrics))
+                        if baselines is not None:
+                            report_root = Path(output_dir) / f"flow_steps_{flow_steps:02d}"
+                            report_path = report_root / scene["scene_name"] / "metrics.json"
+                            report = json.loads(report_path.read_text())
+                            prediction_summaries.append((flow_steps, metric_scene_summary(report, report_path, report_root)))
                     del scene, target_data, source_gs, target_gs
         if dist.is_initialized():
             gathered = [None for _ in range(world_size)]
@@ -644,9 +565,27 @@ def evaluate_dataset(model, dataset, output_dir, *, scene_indices=None, split="t
         }
         losses.sort(key=lambda item: item[0])
         reduced_losses = {key: float(np.mean([values[key] for _, _, values in losses])) for key in losses[0][2]} if losses else {}
+        if baselines is not None:
+            baseline_reports = baselines.finish()
+            summaries = gather_metric_records(prediction_summaries)
+            flow_reports = []
+            for flow_steps in EVAL_FLOW_STEPS:
+                report = dataset_metric_report("prediction", [item for steps, item in summaries if steps == flow_steps])
+                report_root = Path(output_dir) / f"flow_steps_{flow_steps:02d}"
+                report["baselines"] = baselines.links(report_root)
+                reduced[flow_steps] = report["mean"] or {}
+                if rank == 0:
+                    write_metric_json(report_root / "metrics.json", report)
+                flow_reports.append({"steps": flow_steps, **{key: report[key] for key in ("num_scenes", "num_images", "mean")},
+                                     "metrics_file": f"flow_steps_{flow_steps:02d}/metrics.json"})
+            if rank == 0:
+                write_metric_json(Path(output_dir) / "metrics.json", {"source": "prediction", "averaging": "mean_of_scene_means",
+                                  "baselines": baselines.links(output_dir), "flow_steps": flow_reports})
+            log_test_baselines(wandb, baselines.root, baseline_reports)
         if rank == 0:
-            with open(os.path.join(output_dir, "metrics.json"), "w") as output_file:
-                json.dump(reduced, output_file, indent=2)
+            if baselines is None:
+                with open(os.path.join(output_dir, "metrics.json"), "w") as output_file:
+                    json.dump(reduced, output_file, indent=2)
             if flow_config is not None:
                 with open(os.path.join(output_dir, "losses.json"), "w") as output_file:
                     json.dump({"mean": reduced_losses, "scenes": [{"scene_idx": index, "scene_name": name, **values} for index, name, values in losses]}, output_file, indent=2)
@@ -667,6 +606,8 @@ def evaluate_sets(model, test_dataset, train_eval_dataset, train_eval_indices, o
             flow_config=flow_config, mix_config=mix_config, mse_config=mse_config, config=config,
             velocity_variances=velocity_variances, lpips_function=lpips_function,
             loss_view_count=train_eval_dataset.image_per_scene,
+            wandb_images=values if wandb is not None and wandb.run is not None else None,
+            test_baseline_dir=os.path.join(FLAGS.output_dir, "eval_baselines", "test") if split == "test" else None,
         )
         for flow_steps, step_metrics in metrics.items():
             values.update({f"{prefix}/{flow_steps}/{key}": value for key, value in step_metrics.items()})
@@ -780,7 +721,6 @@ def training():
     needs_target_images = mix_config["schedule"] != "fm-only"
     loader_seed = set_seed(rank=rank)
     logger = ProcessSafeLogger(os.path.join(FLAGS.output_dir, "train.log")).get_logger() if rank == 0 else None
-    init_wandb(FLAGS.output_dir)
     train_dataset = build_dataset(
         "train_dataset", alignment=FLAGS.alignment, load_src_gs=True,
         load_tgt_gs=True, load_src_images=False,
@@ -841,6 +781,7 @@ def training():
         f"alignment={FLAGS.alignment} mix_schedule={mix_config['schedule']} target_training_images={needs_target_images}\n"
         f"flow_config={flow_config}\nvelocity_variances={json.dumps(variance_report)}"
     )
+    init_wandb(FLAGS.output_dir)
     if rank == 0:
         print(brief)
         logger.info(brief)
@@ -932,6 +873,11 @@ def training():
                         logger.info("step=%d scenes=%s total=%.6f flow=%.6f render=%.6f", train_step, scene_identities, values["train/total_loss"], values["train/flow_loss"], values["train/render_loss"])
                         if timed_steps:
                             logger.info("seconds_per_update=%.4f scenes_per_second=%.4f data_wait_seconds=%.4f", values["train/seconds_per_update"], values["train/scenes_per_second"], values["train/data_wait_seconds"])
+                    timing_start = None
+                # Render a sampled training scene without changing the objective or training RNG.
+                if rank == 0 and wandb is not None and wandb.run is not None and config["log_image_interval"] > 0 and train_step % config["log_image_interval"] == 0:
+                    scene_name, scene_idx = scene_identities[0]
+                    log_training_images(model_module, train_eval_dataset, scene_idx, scene_name, train_step, flow_config["flow_steps"])
                     timing_start = None
                 if config["empty_cache_fre"] > 0 and (train_step + 1) % config["empty_cache_fre"] == 0:
                     torch.cuda.empty_cache()

@@ -244,7 +244,6 @@ class FeaturePredictor(nn.Module):
                 for out_gs, in_gs in zip(out_batch_normalized_gs, batch_normalized_gs):
                     out_gs[key] = in_gs[key]
 
-        assert len(out_batch_normalized_gs) == 1, 'Now only support batch size 1'
         return out_batch_normalized_gs
 
 

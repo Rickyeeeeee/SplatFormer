@@ -67,7 +67,7 @@ class PointTransformerV3FlowModel(nn.Module):
         pdnorm_ln=False,
         pretrained_ckpt=None,
         T_dim=-1,
-        drop_path=0.0,
+        drop_path=0.3,
         shuffle_orders=True,
         shuffle_orders_eval=False,
     ):

@@ -10,7 +10,7 @@ MASTER_PORT=${MASTER_PORT:-29519}
 NUM_WORKERS=${NUM_WORKERS:-1}
 PREFETCH_FACTOR=${PREFETCH_FACTOR:-1}
 PIN_MEMORY=${PIN_MEMORY:-true}
-BATCH_SIZE=${BATCH_SIZE:-1}
+BATCH_SIZE=${BATCH_SIZE:-6}
 GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS:-1}
 # Classify scenes by capped CSV Gaussian counts before constructing microbatches.
 SCENE_SAMPLING=${SCENE_SAMPLING:-big_small}
@@ -26,15 +26,15 @@ case "${ZERO_OPTIMIZER,,}" in
     false) ZERO_OPTIMIZER_GIN=False ;;
     *) echo "Unsupported ZERO_OPTIMIZER=${ZERO_OPTIMIZER}; expected true or false" >&2; exit 1 ;;
 esac
-TOTAL_STEPS=${1:-1000000}
-SAVE_INTERVAL=${2:-5000}
-EVAL_INTERVAL=${3:-5000}
+TOTAL_STEPS=${1:-500000}
+SAVE_INTERVAL=${2:-1000}
+EVAL_INTERVAL=${3:-1000}
 LOG_IMAGE_INTERVAL=${4:-1000}
 ALIGNMENT=${5:-${ALIGNMENT:-fit_lr_to_hr}}
 ATTRIBUTE_INIT=${6:-${ATTRIBUTE_INIT:-aligned}}
 INPUT_RESOLUTION=${7:-${INPUT_RESOLUTION:-32}}
 TARGET_RESOLUTION=${8:-${TARGET_RESOLUTION:-128}}
-MIX_SCHEDULE=${9:-${MIX_SCHEDULE:-fm-only}}
+MIX_SCHEDULE=${9:-${MIX_SCHEDULE:-linear}}
 FLOW_LOSS_TYPE=${10:-${FLOW_LOSS_TYPE:-velocity}}
 FLOW_STEPS=${11:-${FLOW_STEPS:-10}}
 FLOW_NOISE_STD=${12:-${FLOW_NOISE_STD:-0.0}}
@@ -46,7 +46,7 @@ DATASET_ROOT=${DATASET_ROOT:-/project/ricky/splatformer-sr-data-scaled}
 TRAIN_SCENE_LIST=${TRAIN_SCENE_LIST:-${DATASET_ROOT}/psnr_filtered_scenes.csv}
 TEST_SCENE_LIST=${TEST_SCENE_LIST:-${DATASET_ROOT}/test_psnr_filtered_scenes.csv}
 GS_STATISTICS_PATH=${GS_STATISTICS_PATH:-${DATASET_ROOT}/gs_statistics.json}
-OUTPUT_DIR=${OUTPUT_DIR:-/project2/ricky/outputs/${run_date}-gpu7/objaverse_sr_gsfm_${INPUT_RESOLUTION}to${TARGET_RESOLUTION}_${ALIGNMENT}_${MIX_SCHEDULE}}
+OUTPUT_DIR=${OUTPUT_DIR:-/project2/ricky/outputs/${run_date}-gpu7/objaverse_sr_gsfm_${INPUT_RESOLUTION}to${TARGET_RESOLUTION}_${ALIGNMENT}_${MIX_SCHEDULE}_reg}
 
 case "${MIX_SCHEDULE}" in
     linear|free-range-gs|fm-only) ;;
@@ -76,6 +76,7 @@ torchrun --nnodes=1 --nproc_per_node="${NGPUS}" --rdzv-endpoint="localhost:${MAS
     --gin_param="SplatFactoSRDataset.src_resolution=${INPUT_RESOLUTION}" \
     --gin_param="SplatFactoSRDataset.tgt_resolution=${TARGET_RESOLUTION}" \
     --gin_param="flow_matching.gs_statistics_path='${GS_STATISTICS_PATH}'" \
+    --gin_param="train_dataset/SplatFactoSRDataset.image_per_scene=8" \
     --gin_param="flow_matching.flow_steps=${FLOW_STEPS}" \
     --gin_param="flow_matching.flow_noise_std=${FLOW_NOISE_STD}" \
     --gin_param="flow_matching.loss_type='${FLOW_LOSS_TYPE}'" \

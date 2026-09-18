@@ -35,3 +35,12 @@ def move_to_device(data, device):
         return {key: move_to_device(value, device) for key, value in data.items()}
     else:
         return data.to(device)
+
+def move_training_data(data, device, non_blocking=False):
+    if torch.is_tensor(data):
+        return data.to(device, non_blocking=non_blocking)
+    if isinstance(data, dict):
+        return {key: move_training_data(value, device, non_blocking) for key, value in data.items()}
+    if isinstance(data, (list, tuple)):
+        return type(data)(move_training_data(value, device, non_blocking) for value in data)
+    return data

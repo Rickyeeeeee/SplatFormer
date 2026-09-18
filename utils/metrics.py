@@ -1,4 +1,10 @@
 import os
+import hashlib
+import random
+from contextlib import contextmanager
+from pathlib import Path
+
+import torch.distributed as dist
 
 import torch
 import numpy as np
@@ -186,3 +192,229 @@ def write_densify_stage_render_metrics(output_dir, stage_gs, images, cameras, ch
         json.dump(metrics_by_ply, f, indent=2)
     return metrics_by_ply
 
+
+# Test reports use complete accumulated tensors; legacy chunk serialization stays unchanged.
+METRIC_NAMES = ("psnr", "ssim", "lpips")
+
+
+def scene_metric_report(source, scene_idx, scene_name, image_names, computer):
+    values = {key: torch.cat([value.reshape(-1) for value in computer.results[key]]).detach().cpu().double().tolist()
+              for key in METRIC_NAMES}
+    if any(len(values[key]) != len(image_names) for key in METRIC_NAMES):
+        raise ValueError(f"Metric/image count mismatch for {scene_name}")
+    images = [{"image_id": index, "image_name": str(name), **{key: values[key][index] for key in METRIC_NAMES}}
+              for index, name in enumerate(image_names)]
+    return {"source": source, "scene_idx": int(scene_idx), "scene_name": scene_name, "num_images": len(images),
+            "mean": {key: float(np.mean(values[key])) for key in METRIC_NAMES} if images else None, "images": images}
+
+
+def write_metric_json(path, report):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".json.tmp")
+    with temporary.open("w") as handle:
+        json.dump(report, handle, indent=2)
+    temporary.replace(path)
+
+
+def metric_scene_summary(report, path, root):
+    return {**{key: report[key] for key in ("scene_idx", "scene_name", "num_images", "mean")},
+            "metrics_file": os.path.relpath(path, root)}
+
+
+def dataset_metric_report(source, scenes, excluded=()):
+    scenes = sorted(scenes, key=lambda item: item["scene_idx"])
+    if len({item["scene_idx"] for item in scenes}) != len(scenes) or len({item["scene_name"] for item in scenes}) != len(scenes):
+        raise ValueError("Duplicate scenes in distributed evaluation results")
+    return {"source": source, "averaging": "mean_of_scene_means", "num_scenes": len(scenes),
+            "num_images": sum(item["num_images"] for item in scenes),
+            "mean": {key: float(np.mean([item["mean"][key] for item in scenes])) for key in METRIC_NAMES} if scenes else None,
+            "scenes": scenes, "num_excluded_scenes": len(excluded), "excluded_scenes": list(excluded)}
+
+
+def gather_metric_records(records):
+    if not dist.is_initialized():
+        return records
+    gathered = [None] * dist.get_world_size()
+    dist.all_gather_object(gathered, records)
+    return [item for shard in gathered for item in shard]
+
+
+@contextmanager
+def preserve_metric_rng(device):
+    python_state, numpy_state = random.getstate(), np.random.get_state()
+    devices = [device.index if device.index is not None else torch.cuda.current_device()] if device.type == "cuda" else []
+    try:
+        with torch.random.fork_rng(devices=devices):
+            yield
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+
+
+def render_test_baseline(source, gs, scene, target_data, chunk_size, device):
+    with preserve_metric_rng(device), torch.no_grad():
+        computer = MetricComputer()
+        gs = gpu_utils.move_to_device(gs, device)
+        images = target_data["images"]
+        if not images:
+            raise ValueError(f"Evaluation has zero views: {scene['scene_name']}")
+        chunk_size = min(chunk_size, len(images)) if chunk_size is not None and chunk_size > 0 else len(images)
+        for start in range(0, len(images), chunk_size):
+            end = min(start + chunk_size, len(images))
+            cameras = {key: value[start:end] if key == "camera_to_worlds" else value
+                       for key, value in target_data["cameras"].items()}
+            cameras = gpu_utils.move_to_device(cameras, device)
+            predictions, _ = gs_utils.rasterize_gaussians_to_multiimgs(gs, cameras)
+            predictions = torch.stack(predictions)
+            targets = torch.stack(gpu_utils.move_to_device(images[start:end], device))
+            if targets.shape[-1] == 4:
+                predictions = predictions * targets[..., 3:4]
+            predictions = (predictions * 255).to(torch.uint8)
+            targets = (targets[..., :3] * 255).to(torch.uint8)
+            computer.update(predictions, targets, name=str(start))
+        return scene_metric_report(source, scene["scene_idx"], scene["scene_name"], target_data["images_name"], computer)
+
+
+def test_baseline_signature(dataset, indices, options, sources):
+    attributes = ("dataset_root", "scene_list", "src_resolution", "tgt_resolution", "remove_outlier_ndevs",
+                  "max_gs_num", "background_color", "coordinate_frame", "coordinate_frame_version")
+    config = {name: getattr(dataset, name, None) for name in attributes}
+    config.update(options)
+    artifacts = []
+    scenes = []
+    for index in indices:
+        info = dataset.folders[index]
+        scenes.append({"scene_idx": index, "scene_name": info["scene_name"]})
+        paths = info.get("resolution_paths", {})
+        roots = set()
+        for resolution_paths in paths.values():
+            roots.update(resolution_paths[key] for key in ("image_dir", "sparse_dir") if key in resolution_paths)
+            if "gsplat_dir" in resolution_paths:
+                roots.add(os.path.join(resolution_paths["gsplat_dir"], "ckpts"))
+        if "target_fit_lr_to_hr" in sources:
+            roots.add(os.path.join(dataset.pretrained_path("fit_lr_to_hr", info["scene_name"], dataset.src_resolution), "ckpts"))
+        if options.get("alignment") == "fit_hr_to_lr":
+            roots.add(os.path.join(dataset.pretrained_path("fit_hr_to_lr", info["scene_name"], dataset.tgt_resolution), "ckpts"))
+        for root in sorted(roots):
+            path = Path(root)
+            artifacts.append((str(path), path.exists()))
+            if path.exists():
+                for entry in sorted(path.rglob("*")):
+                    if entry.is_file():
+                        stat = entry.stat()
+                        artifacts.append((str(entry), stat.st_size, stat.st_mtime_ns))
+    payload = {"version": 1, "config": config, "scenes": scenes, "sources": list(sources), "artifacts": artifacts}
+    # JSON round-trip gives manifests stable representations for tuple-valued configuration.
+    payload = json.loads(json.dumps(payload, default=str))
+    payload["fingerprint"] = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+    return payload
+
+
+class TestBaselineReports:
+    """Cache fixed test render metrics; only summaries participate in distributed collectives."""
+
+    def __init__(self, root, dataset, indices, options, sources):
+        self.root = Path(root)
+        self.sources = tuple(sources)
+        self.rank = dist.get_rank() if dist.is_initialized() else 0
+        self.records = {source: [] for source in sources}
+        decision = [None]
+        self.signature = None
+        if self.rank == 0:
+            try:
+                signature = test_baseline_signature(dataset, indices, options, sources)
+                manifest_path = self.root / "manifest.json"
+                reusable = False
+                if manifest_path.exists():
+                    try:
+                        manifest = json.loads(manifest_path.read_text())
+                        reusable = manifest.get("signature") == signature and self.complete(manifest)
+                    except (OSError, ValueError, KeyError, TypeError):
+                        reusable = False
+                self.signature = signature
+                decision[0] = {"reuse": reusable}
+            except Exception as error:
+                decision[0] = {"error": str(error)}
+        if dist.is_initialized():
+            dist.broadcast_object_list(decision, src=0)
+        if "error" in decision[0]:
+            raise RuntimeError(f"Cannot prepare test baselines: {decision[0]['error']}")
+        self.reuse = decision[0]["reuse"]
+
+    def complete(self, manifest):
+        if not manifest.get("complete") or manifest.get("excluded_scenes"):
+            return False
+        expected = {item["scene_name"] for item in manifest["signature"]["scenes"]}
+        for source in self.sources:
+            report = json.loads((self.root / f"metrics_{source}.json").read_text())
+            if report["source"] != source or {item["scene_name"] for item in report["scenes"]} != expected:
+                return False
+            if report != dataset_metric_report(source, report["scenes"], report["excluded_scenes"]):
+                return False
+            for item in report["scenes"]:
+                detail = json.loads((self.root / item["metrics_file"]).read_text())
+                if detail["source"] != source or len(detail["images"]) != item["num_images"] or detail["mean"] != item["mean"]:
+                    return False
+                if [image["image_name"] for image in detail["images"]] != manifest["views"][item["scene_name"]]:
+                    return False
+                if [image["image_id"] for image in detail["images"]] != list(range(item["num_images"])):
+                    return False
+                if metric_scene_summary(detail, self.root / item["metrics_file"], self.root) != item:
+                    return False
+                if any(any(key not in image for key in METRIC_NAMES) for image in detail["images"]):
+                    return False
+        return True
+
+    def scene(self, scene, target_data, gaussian_sets, chunk_size, device):
+        means = {}
+        summaries = {}
+        for source in self.sources:
+            path = self.root / "scenes" / scene["scene_name"] / f"metrics_{source}.json"
+            if self.reuse:
+                report = json.loads(path.read_text())
+                if [image["image_name"] for image in report["images"]] != list(target_data["images_name"]):
+                    raise ValueError(f"Cached test views changed for {scene['scene_name']}")
+            else:
+                report = render_test_baseline(source, gaussian_sets[source], scene, target_data, chunk_size, device)
+                write_metric_json(path, report)
+            means[source] = report["mean"]
+            summaries[source] = metric_scene_summary(report, path, self.root)
+        # Commit a scene only after every baseline succeeded.
+        for source, summary in summaries.items():
+            self.records[source].append(summary)
+        return means
+
+    def finish(self, excluded=()):
+        reports = {}
+        for source in self.sources:
+            records = gather_metric_records(self.records[source])
+            reports[source] = dataset_metric_report(source, records, excluded)
+        if self.rank == 0 and (not self.reuse or excluded):
+            for source, report in reports.items():
+                write_metric_json(self.root / f"metrics_{source}.json", report)
+            views = {}
+            for item in reports[self.sources[0]]["scenes"]:
+                detail = json.loads((self.root / item["metrics_file"]).read_text())
+                views[item["scene_name"]] = [image["image_name"] for image in detail["images"]]
+            write_metric_json(self.root / "manifest.json", {"signature": self.signature, "complete": True,
+                              "views": views, "excluded_scenes": list(excluded)})
+        return reports
+
+    def links(self, directory):
+        return {source: os.path.relpath(self.root / f"metrics_{source}.json", directory) for source in self.sources}
+
+
+_LOGGED_TEST_BASELINES = set()
+
+
+def log_test_baselines(wandb, root, reports):
+    if wandb is None or wandb.run is None or (dist.is_initialized() and dist.get_rank() != 0):
+        return
+    identity = (id(wandb.run), os.path.abspath(root))
+    if identity in _LOGGED_TEST_BASELINES:
+        return
+    values = {f"eval_baselines/{source}/{key}": value for source, report in reports.items()
+              for key, value in (report["mean"] or {}).items()}
+    wandb.log(values, commit=False)
+    _LOGGED_TEST_BASELINES.add(identity)

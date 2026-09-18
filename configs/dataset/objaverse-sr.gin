@@ -24,7 +24,7 @@ SplatFactoSRDataset.load_src_images = True
 SplatFactoSRDataset.load_tgt_images = True
 
 train_dataset/SplatFactoSRDataset.train_or_test = 'train'
-train_dataset/SplatFactoSRDataset.image_per_scene = 16
+train_dataset/SplatFactoSRDataset.image_per_scene = 8
 train_dataset/SplatFactoSRDataset.split_across_gpus = True
 
 test_dataset/SplatFactoSRDataset.train_or_test = 'test'
