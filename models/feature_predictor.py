@@ -5,6 +5,7 @@ import torch.nn as nn
 from collections import OrderedDict
 from .pointtransformer_v3 import PointTransformerV3Model
 from .spconv import SparseConvModel
+from utils.fourier_features import build_fourier_feature_encoders
 import gin 
 gin.external_configurable(torch.nn.Identity)
 gin.external_configurable(torch.nn.Tanh)
@@ -61,6 +62,11 @@ class FeaturePredictor(nn.Module):
                  input_embed_to_mlp,
                  zeroinit,
                  quat_residual_mode="add",
+                 fourier_input_features=(),
+                 fourier_num_frequencies=None,
+                 fourier_include_raw=True,
+                 fourier_log_sampling=True,
+                 fourier_max_frequency_log2=None,
                  ):
         super(FeaturePredictor, self).__init__()
         if quat_residual_mode not in ["add", "mul"]:
@@ -72,7 +78,12 @@ class FeaturePredictor(nn.Module):
         FEATURE2CHANNEL['features_rest'] = sh_dim*3
         self.input_features = input_features
         self.input_feat_to_mlp = input_feat_to_mlp
-        in_channels = sum([FEATURE2CHANNEL[feature] for feature in input_features])
+        self.fourier_encoders, input_feature_channels = build_fourier_feature_encoders(
+            FEATURE2CHANNEL, self.input_features, fourier_input_features,
+            fourier_num_frequencies, fourier_include_raw, fourier_log_sampling,
+            fourier_max_frequency_log2,
+        )
+        in_channels = sum(input_feature_channels[feature] for feature in input_features)
         self.gs_features_dim = in_channels
         self.output_features = output_features
         if max_scale_normalized<=0:
@@ -146,6 +157,12 @@ class FeaturePredictor(nn.Module):
             batch_unnormalized_gs.append(unnormalized_gs)
         return  batch_unnormalized_gs
 
+    def _input_feature_tensor(self, gs, key):
+        value = gs[key].view(gs[key].shape[0], -1) if key == 'features_rest' else gs[key]
+        if key in getattr(self, "fourier_encoders", {}):
+            return self.fourier_encoders[key](value)
+        return value
+
     # def forward(self, batch_gs):
     #     #1. Normalize
     #     batch_normalized_gs, batch_scalers = self.normalized_gs(batch_gs) #Move to dataloader part
@@ -162,12 +179,7 @@ class FeaturePredictor(nn.Module):
         for bi, (gs, idx) in enumerate(zip(batch_normalized_gs, batch_scene_idx)):
             feat_list = []
             for key in self.input_features:
-                if key=='means':
-                    feat_list.append(gs[key])
-                elif key == 'features_rest':
-                    feat_list.append(gs[key].view(gs[key].shape[0], -1))
-                else:
-                    feat_list.append(gs[key])
+                feat_list.append(self._input_feature_tensor(gs, key))
             feat.append(torch.cat(feat_list, dim=1)) #N, D
         feat = torch.cat(feat, dim=0) #Bx-N, D
 

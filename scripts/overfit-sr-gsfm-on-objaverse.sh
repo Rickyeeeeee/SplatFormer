@@ -10,33 +10,33 @@ FIT_HR_TO_LR_ROOT=${FIT_HR_TO_LR_ROOT:-${DATASET_ROOT}/test-set-4x-up/objaverse}
 echo "Using GPU: ${GPU_ID}"
 
 # Example: SCENE_MODE=many SCENE_COUNT=4 BATCH_SIZE=8 GRAD_ACCUM_STEPS=4 bash scripts/overfit-sr-gsfm-on-objaverse.sh
-scene_mode=${SCENE_MODE:-one}
-scene_count=${SCENE_COUNT:-1}
-batch_size=${BATCH_SIZE:-1}
+scene_mode=${SCENE_MODE:-many}
+scene_count=${SCENE_COUNT:-18}
+batch_size=${BATCH_SIZE:-4}
 grad_accum_steps=${GRAD_ACCUM_STEPS:-1}
 scene_name=${SCENE_NAME:-3e288ee8aced4a0797e66d53536112b1}
-total_steps=${1:-20000}
-save_interval=${2:-20000}
-eval_interval=${3:-4000}
-log_image_interval=${4:-4000}
+total_steps=${1:-10000}
+save_interval=${2:-10000}
+eval_interval=${3:-1000}
+log_image_interval=${4:-1000}
 alignment=${5:-fit_lr_to_hr}
 attribute_init=${6:-aligned}
-input_resolution=${7:-128}
-target_resolution=${8:-512}
+input_resolution=${7:-32}
+target_resolution=${8:-128}
 mix_schedule=${9:-${MIX_SCHEDULE:-fm-only}}
 flow_loss_type=${10:-${FLOW_LOSS_TYPE:-velocity}}
 flow_steps=${11:-${FLOW_STEPS:-1}}
 flow_noise_std=${12:-${FLOW_NOISE_STD:-0.0}}
 image_l1_loss_weight=${13:-${IMAGE_L1_LOSS_WEIGHT:-1.0}}
 lpips_loss_weight=${14:-${LPIPS_LOSS_WEIGHT:-1.0}}
-velocity_variance_source=${VELOCITY_VARIANCE_SOURCE:-matching}
+velocity_variance_source=${VELOCITY_VARIANCE_SOURCE:-precomputed_aggregate}
 gs_statistics_path=${GS_STATISTICS_PATH:-/project/ricky/splatformer-sr-data-scaled/test_gs_statistics.json}
 flow_t_eps=${FLOW_T_EPS:-1e-4}
 ptv3_drop_path=${PTV3_DROP_PATH:-0.0}
 ptv3_shuffle_orders=${PTV3_SHUFFLE_ORDERS:-True}
 ptv3_shuffle_orders_eval=${PTV3_SHUFFLE_ORDERS_EVAL:-False}
 ptv3_turn_off_bn=${PTV3_TURN_OFF_BN:-True}
-grid_resolution=${GRID_RESOLUTION:-2048}
+grid_resolution=${GRID_RESOLUTION:-384}
 run_date=$(date +%m%d)
 custom_postfix=${CUSTOM_POSFIX:-run}
 
@@ -63,6 +63,8 @@ output_dir=${OUTPUT_DIR:-${output_root}/${out_name}}
 # Use Gin literals for tuples/dicts and True/False for booleans; strings need no inner quotes.
 # Keep stage counts, channel widths, and head counts compatible; input channels are derived.
 # The current output head supports mlp-relu; the predictor supplies a 3-component time embedding.
+# Fourier example: GS_FOURIER_INPUT_FEATURES="['means', 'scales']" GS_FOURIER_NUM_FREQUENCIES="{'means': 6, 'scales': 4}" CUSTOM_POSFIX=fourier bash scripts/overfit-sr-gsfm-on-objaverse.sh
+# Set GS_FOURIER_INCLUDE_RAW=False, GS_FOURIER_LOG_SAMPLING=False, or GS_FOURIER_MAX_FREQUENCY_LOG2="{'means': 5}" as needed.
 # Example: PTV3_ENC_CHANNELS='(32, 64, 128, 256, 512)' PTV3_DEC_CHANNELS='(64, 64, 128, 256)' GS_OUTPUT_HEAD_WIDTH=64 GS_OUTPUT_HEAD_NLAYER=2 CUSTOM_POSFIX=small bash scripts/overfit-sr-gsfm-on-objaverse.sh
 network_gin_args=()
 for network in PointTransformerV3FlowModel GSFlowPredictor; do
@@ -73,7 +75,7 @@ for network in PointTransformerV3FlowModel GSFlowPredictor; do
             ;;
         GSFlowPredictor)
             prefix=GS
-            parameters=(output_head_nlayer output_head_width output_head_type input_feat_to_mlp zeroinit res_feature_activation quat_residual_mode)
+            parameters=(output_head_nlayer output_head_width output_head_type input_feat_to_mlp zeroinit res_feature_activation quat_residual_mode fourier_input_features fourier_num_frequencies fourier_include_raw fourier_log_sampling fourier_max_frequency_log2)
             ;;
     esac
     for parameter in "${parameters[@]}"; do

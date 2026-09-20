@@ -64,6 +64,7 @@ def flow_matching(
     velocity_variance_floor=1e-8,
     velocity_variance_source="matching",
     gs_statistics_path="/project/ricky/splatformer-sr-data-scaled/test_gs_statistics.json",
+    log_velocity_variance_statistics=True,
 ):
     if velocity_variance_source not in ("matching", "precomputed_scene", "precomputed_aggregate"):
         raise ValueError(f"Unsupported velocity_variance_source={velocity_variance_source!r}")
@@ -84,6 +85,7 @@ def flow_matching(
         "velocity_variance_floor": float(velocity_variance_floor),
         "velocity_variance_source": velocity_variance_source,
         "gs_statistics_path": gs_statistics_path,
+        "log_velocity_variance_statistics": log_velocity_variance_statistics,
     }
 
 @gin.configurable
@@ -143,6 +145,13 @@ def format_velocity_variance_report(report):
             lines.append(
                 "  {}{}: unavailable ({})".format(
                     source, selected_marker, source_report["unavailable"]
+                )
+            )
+            continue
+        if "skipped" in source_report:
+            lines.append(
+                "  {}{}: skipped ({})".format(
+                    source, selected_marker, source_report["skipped"]
                 )
             )
             continue
@@ -400,14 +409,6 @@ def prepare_overfit_scene(dataset, scene, output_dir, logger, device, flow_cfg):
     loss_target_gs = matching_target_gs
     source_flow_gs = gs_utils.clone_gaussians(source_gs)
     target_flow_gs = gs_utils.clone_gaussians(loss_target_gs)
-    raw_velocity_variances, velocity_variances = (
-        flow.compute_matching_velocity_variances(
-            source_flow_gs,
-            target_flow_gs,
-            flow_cfg["velocity_variance_floor"],
-        )
-    )
-    # Report all sources, independently of which variance normalizes the loss.
     selected_source = flow_cfg["velocity_variance_source"]
     stats_path = flow_cfg["gs_statistics_path"]
     variance_report = {
@@ -415,16 +416,30 @@ def prepare_overfit_scene(dataset, scene, output_dir, logger, device, flow_cfg):
         "gs_statistics_path": stats_path,
         "selected_source": selected_source,
         "used_for_loss": flow_cfg["loss_type"] == "velocity",
-        "sources": {"matching": {
+        "sources": {},
+    }
+    available_variances = {}
+    if selected_source == "matching":
+        raw_velocity_variances, velocity_variances = (
+            flow.compute_matching_velocity_variances(
+                source_flow_gs,
+                target_flow_gs,
+                flow_cfg["velocity_variance_floor"],
+            )
+        )
+        variance_report["sources"]["matching"] = {
             key: {
                 "mean": (target_flow_gs[key] - source_flow_gs[key]).detach().float().mean(dim=0).cpu().tolist(),
                 "variance": raw_velocity_variances[key].detach().cpu().tolist(),
                 "effective_variance": velocity_variances[key].detach().cpu().tolist(),
             }
             for key in SUPPORTED_GS_KEYS
-        }},
-    }
-    available_variances = {"matching": velocity_variances}
+        }
+        available_variances["matching"] = velocity_variances
+    else:
+        variance_report["sources"]["matching"] = {
+            "skipped": "precomputed variance source selected"
+        }
     statistics = None
     statistics_error = None
     try:
@@ -433,6 +448,9 @@ def prepare_overfit_scene(dataset, scene, output_dir, logger, device, flow_cfg):
     except (OSError, ValueError) as error:
         statistics_error = str(error)
     for source in ("precomputed_scene", "precomputed_aggregate"):
+        if source != selected_source:
+            variance_report["sources"][source] = {"skipped": "not selected"}
+            continue
         try:
             if statistics_error is not None:
                 raise ValueError(statistics_error)
@@ -455,13 +473,14 @@ def prepare_overfit_scene(dataset, scene, output_dir, logger, device, flow_cfg):
             available_variances[source] = effective
         except (KeyError, TypeError, ValueError, RuntimeError) as error:
             variance_report["sources"][source] = {"unavailable": str(error)}
-    variance_report_path = os.path.join(output_dir, "velocity_variance_statistics.json")
-    with open(variance_report_path, "w") as variance_report_file:
-        json.dump(variance_report, variance_report_file, indent=2, sort_keys=True)
-        variance_report_file.write("\n")
-    variance_message = format_velocity_variance_report(variance_report)
-    print(variance_message)
-    logger.info(variance_message)
+    if flow_cfg["log_velocity_variance_statistics"]:
+        variance_report_path = os.path.join(output_dir, "velocity_variance_statistics.json")
+        with open(variance_report_path, "w") as variance_report_file:
+            json.dump(variance_report, variance_report_file, indent=2, sort_keys=True)
+            variance_report_file.write("\n")
+        variance_message = format_velocity_variance_report(variance_report)
+        # print(variance_message)
+        logger.info(variance_message)
     if flow_cfg["loss_type"] == "velocity":
         if selected_source not in available_variances:
             raise ValueError(f"Selected velocity variance source {selected_source!r} unavailable: {variance_report['sources'][selected_source]}")

@@ -9,7 +9,7 @@ import torch
 from absl import app, flags
 from tqdm import tqdm
 
-from dataset.GS_multi import SplatFactoMultiLevelDataset
+from dataset.GS_SR import SplatFactoSRDataset
 from models.feature_predictor import FeaturePredictor
 from utils import gpu_utils, gs_utils, loss_utils
 from utils.log_utils import ProcessSafeLogger
@@ -28,8 +28,6 @@ flags.DEFINE_multi_string("gin_param", "", "Newline separated list of Gin parame
 
 FLAGS = flags.FLAGS
 
-INPUT_FACTOR = 4
-TARGET_FACTOR = 2
 
 
 @gin.configurable
@@ -106,69 +104,12 @@ def _sanitize_for_filename(value):
     return str(value).replace("/", "_").replace("\\", "_")
 
 
-def _build_dataset():
-    with gin.config_scope("train_dataset"):
-        return SplatFactoMultiLevelDataset()
-
-
-def _scene_name_from_dataset(dataset, idx):
-    return dataset.folders[idx]["scene_name"]
-
-
-def _find_scene_index(dataset, scene_name):
-    if scene_name == "":
-        return 0
-    for idx in range(len(dataset.folders)):
-        if _scene_name_from_dataset(dataset, idx) == scene_name:
-            return idx
-    return 0
-
-
-def _build_split_payload(dataset, scene_idx, scene_name, factor_entry, split):
-    meta = factor_entry["meta"]
-    imgs_path = factor_entry["imgs_path"]
-    imgs_name = factor_entry["imgs_name"]
-
-    if dataset.background_color == "random":
-        background = torch.rand(3)
-    else:
-        background = torch.tensor(dataset.background_color, dtype=torch.float32) / 255.0
-
-    total_num = len(meta["camera_to_worlds"])
-    if split == "train":
-        if dataset.image_per_scene is None:
-            sample_num = total_num
-        else:
-            sample_num = min(dataset.image_per_scene, total_num)
-        cam_ids = np.random.permutation(total_num)[:sample_num]
-    elif split == "test":
-        cam_ids = np.arange(total_num)
-    else:
-        raise ValueError(f"Unsupported split: {split}")
-
-    images = [dataset.read_image(imgs_path[i], background=background) for i in cam_ids]
-    images_name = [imgs_name[i] for i in cam_ids]
-    camera_to_worlds = meta["camera_to_worlds"][cam_ids]
-
-    cameras = {
-        "camera_to_worlds": torch.as_tensor(camera_to_worlds).float(),
-        "fx": torch.as_tensor(meta["fx"]).float(),
-        "fy": torch.as_tensor(meta["fy"]).float(),
-        "cx": torch.as_tensor(meta["cx"]).float(),
-        "cy": torch.as_tensor(meta["cy"]).float(),
-        "width": torch.as_tensor(meta["width"]).float(),
-        "height": torch.as_tensor(meta["height"]).float(),
-        "background_color": background,
-    }
-
-    return {
-        "gs_params": factor_entry["gs_params"],
-        "images": images,
-        "images_name": images_name,
-        "cameras": cameras,
-        "scene_idx": scene_idx,
-        "scene_name": scene_name,
-    }
+def _sample_views(images, cameras, count):
+    camera_indices = np.random.permutation(len(images))[:count]
+    sampled_images = [images[index] for index in camera_indices]
+    sampled_cameras = dict(cameras)
+    sampled_cameras["camera_to_worlds"] = sampled_cameras["camera_to_worlds"][camera_indices]
+    return sampled_images, sampled_cameras
 
 
 def evaluate_single_scene(
@@ -370,31 +311,24 @@ def main(argv):
     logger = ProcessSafeLogger(os.path.join(FLAGS.output_dir, "overfit.log")).get_logger()
     device = torch.device("cuda")
 
-    dataset: SplatFactoMultiLevelDataset = _build_dataset()
-    scene_idx = _find_scene_index(dataset, FLAGS.scene_name)
+    dataset = SplatFactoSRDataset.from_gin_scope("test_dataset")
+    scene_idx = dataset.scene_index(FLAGS.scene_name)
     scene = dataset.load_scene(scene_idx)
-    input_factor_entry = scene["factor_data"][INPUT_FACTOR]
-    target_factor_entry = scene["factor_data"][TARGET_FACTOR]
+    if scene["coordinate_frame"] != "input_resolution":
+        raise ValueError("SR dev overfitting requires input_resolution coordinates")
+    input_resolution_entry = scene["data"][dataset.src_resolution]
+    target_resolution_entry = scene["data"][dataset.tgt_resolution]
 
-    train_payload = _build_split_payload(
-        dataset, scene["idx"], scene["scene_name"], target_factor_entry, split="train"
-    )
-    eval_payload = _build_split_payload(
-        dataset, scene["idx"], scene["scene_name"], target_factor_entry, split="test"
-    )
-    if len(eval_payload["images"]) == 0:
-        eval_payload = _build_split_payload(
-            dataset, scene["idx"], scene["scene_name"], target_factor_entry, split="train"
-        )
+    eval_images = target_resolution_entry["images"]
+    eval_cameras = target_resolution_entry["cameras"]
+    eval_image_names = target_resolution_entry["images_name"]
+    if len(eval_images) == 0:
+        raise ValueError(f"Scene {scene['scene_name']!r} has no target views")
+    render_view_count = min(dataset.image_per_scene or len(eval_images), len(eval_images))
 
-    batch_gs = gpu_utils.move_to_device([input_factor_entry["gs_params"]], device)
-    batch_scene_idx = [scene["idx"]]
-
-    eval_images = eval_payload["images"]
-    eval_cameras = eval_payload["cameras"]
-    eval_chunk_size = dataset.image_per_scene if dataset.image_per_scene is not None else len(eval_images)
-    if eval_chunk_size <= 0:
-        eval_chunk_size = len(eval_images)
+    batch_gs = gpu_utils.move_to_device([input_resolution_entry["gs_params"]], device)
+    batch_scene_idx = [scene["scene_idx"]]
+    eval_chunk_size = dataset.image_per_scene or len(eval_images)
 
     model = FeaturePredictor().to(device)
     if model.resume_ckpt is not None:
@@ -421,39 +355,36 @@ def main(argv):
     lpips_loss_func = loss_utils.lpips_loss_fn() if lpips_loss_weight > 0 else None
 
     print(
-        f"Overfit scene={scene['scene_name']} idx={scene['idx']} "
-        f"train_views={len(train_payload['images'])} eval_views={len(eval_payload['images'])} "
-        f"gaussians={input_factor_entry['gs_params']['means'].shape[0]} "
-        f"input_factor={INPUT_FACTOR} target_factor={TARGET_FACTOR}"
+        f"Overfit scene={scene['scene_name']} idx={scene['scene_idx']} "
+        f"train_views={render_view_count} eval_views={len(eval_images)} "
+        f"gaussians={input_resolution_entry['gs_params']['means'].shape[0]} "
+        f"input_resolution={dataset.src_resolution} target_resolution={dataset.tgt_resolution}"
     )
 
     os.makedirs(os.path.join(FLAGS.output_dir, "train"), exist_ok=True)
     os.makedirs(os.path.join(FLAGS.output_dir, "checkpoints"), exist_ok=True)
 
-    init_batch_images = gpu_utils.move_to_device([train_payload["images"]], device)
-    gt_imgs_uint8 = [(img[..., :3] * 255).detach().cpu().numpy().astype(np.uint8) for img in init_batch_images[0]]
+    gt_imgs_uint8 = [(img[..., :3] * 255).detach().cpu().numpy().astype(np.uint8) for img in eval_images[:9]]
     gt_grid = cv2.cvtColor(make_grid(gt_imgs_uint8), cv2.COLOR_RGB2BGR)
     cv2.imwrite(os.path.join(FLAGS.output_dir, "train", "00000000_gt.png"), gt_grid)
 
     optimizer.zero_grad(set_to_none=True)
     pbar = tqdm(range(resume_from_step, total_steps))
     for step in pbar:
-        train_payload = _build_split_payload(
-            dataset, scene["idx"], scene["scene_name"], target_factor_entry, split="train"
-        )
-        batch_cameras = gpu_utils.move_to_device([train_payload["cameras"]], device)
-        batch_images = gpu_utils.move_to_device([train_payload["images"]], device)
+        train_images, train_cameras = _sample_views(eval_images, eval_cameras, render_view_count)
+        batch_cameras = gpu_utils.move_to_device(train_cameras, device)
+        batch_images = gpu_utils.move_to_device(train_images, device)
 
         with torch.cuda.amp.autocast(enabled=enable_amp):
             out_batch_gs = model(batch_normalized_gs=batch_gs, batch_scene_idx=batch_scene_idx)
             out_gs = out_batch_gs[0]
-            pred_imgs, _ = gs_utils.rasterize_gaussians_to_multiimgs(out_gs, batch_cameras[0])
+            pred_imgs, _ = gs_utils.rasterize_gaussians_to_multiimgs(out_gs, batch_cameras)
 
             image_l1 = 0
             lpips_loss = 0
             train_psnr = 0
             num_images = len(pred_imgs)
-            for pred_img, gt_img in zip(pred_imgs, batch_images[0]):
+            for pred_img, gt_img in zip(pred_imgs, batch_images):
                 gt_rgb = gt_img[..., :3]
                 image_l1 += (pred_img - gt_rgb).abs().mean()
                 train_psnr += psnr(pred_img.unsqueeze(0), gt_rgb.unsqueeze(0)).mean()
@@ -517,12 +448,12 @@ def main(argv):
             metrics, metrics_input = evaluate_single_scene(
                 model=model,
                 input_gs=batch_gs[0],
-                gt_gs=target_factor_entry["gs_params"],
-                scene_idx=eval_payload["scene_idx"],
-                scene_name=eval_payload["scene_name"],
+                gt_gs=target_resolution_entry["gs_params"],
+                scene_idx=scene["scene_idx"],
+                scene_name=scene["scene_name"],
                 eval_images=eval_images,
                 eval_cameras=eval_cameras,
-                image_names=eval_payload["images_name"],
+                image_names=eval_image_names,
                 output_dir=eval_dir,
                 eval_chunk_size=eval_chunk_size,
                 compare_with_input=FLAGS.compare_with_input,
@@ -545,12 +476,12 @@ def main(argv):
     metrics, metrics_input = evaluate_single_scene(
         model=model,
         input_gs=batch_gs[0],
-        gt_gs=target_factor_entry["gs_params"],
-        scene_idx=eval_payload["scene_idx"],
-        scene_name=eval_payload["scene_name"],
+        gt_gs=target_resolution_entry["gs_params"],
+        scene_idx=scene["scene_idx"],
+        scene_name=scene["scene_name"],
         eval_images=eval_images,
         eval_cameras=eval_cameras,
-        image_names=eval_payload["images_name"],
+        image_names=eval_image_names,
         output_dir=final_eval_dir,
         eval_chunk_size=eval_chunk_size,
         compare_with_input=FLAGS.compare_with_input,

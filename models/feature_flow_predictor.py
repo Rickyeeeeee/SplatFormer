@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 
 from .pointtransformer_v3_flow import PointTransformerV3FlowModel
+from utils.fourier_features import build_fourier_feature_encoders
 
 gin.external_configurable(torch.nn.Identity)
 gin.external_configurable(torch.nn.Tanh)
@@ -58,6 +59,11 @@ class GSFlowPredictor(nn.Module):
         zeroinit,
         res_feature_activation,
         quat_residual_mode="add",
+        fourier_input_features=(),
+        fourier_num_frequencies=None,
+        fourier_include_raw=True,
+        fourier_log_sampling=True,
+        fourier_max_frequency_log2=None,
     ):
         super().__init__()
         if quat_residual_mode not in ["add", "mul"]:
@@ -77,7 +83,12 @@ class GSFlowPredictor(nn.Module):
         self.quat_residual_mode = quat_residual_mode
         self.backbone_type = "PT_FLOW"
 
-        in_channels = sum(self.feature2channel[feature] for feature in self.input_features)
+        self.fourier_encoders, input_feature_channels = build_fourier_feature_encoders(
+            self.feature2channel, self.input_features, fourier_input_features,
+            fourier_num_frequencies, fourier_include_raw, fourier_log_sampling,
+            fourier_max_frequency_log2,
+        )
+        in_channels = sum(input_feature_channels[feature] for feature in self.input_features)
         self.gs_features_dim = in_channels
         self.backbone = PointTransformerV3FlowModel(in_channels=in_channels)
 
@@ -112,6 +123,12 @@ class GSFlowPredictor(nn.Module):
         value = gs[key]
         if key == "features_rest":
             return value.view(value.shape[0], -1)
+        return value
+
+    def _input_feature_tensor(self, gs, key):
+        value = self._feature_tensor(gs, key)
+        if key in getattr(self, "fourier_encoders", {}):
+            return self.fourier_encoders[key](value)
         return value
 
     def _time_embedding(self, t, batch_size, device):
@@ -154,7 +171,7 @@ class GSFlowPredictor(nn.Module):
         offset = torch.tensor(counts, device=device, dtype=torch.long).cumsum(0)
         feat = []
         for gs in batch_flow_gs:
-            feat_list = [self._feature_tensor(gs, key) for key in self.input_features]
+            feat_list = [self._input_feature_tensor(gs, key) for key in self.input_features]
             feat.append(torch.cat(feat_list, dim=1))
         feat = torch.cat(feat, dim=0)
 

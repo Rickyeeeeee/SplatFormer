@@ -25,6 +25,11 @@ FeaturePredictor.res_feature_activation = {
 
 FeaturePredictor.input_embed_to_mlp = False
 FeaturePredictor.input_feat_to_mlp = True
+FeaturePredictor.fourier_input_features = []
+FeaturePredictor.fourier_num_frequencies = {}
+FeaturePredictor.fourier_include_raw = True
+FeaturePredictor.fourier_log_sampling = True
+FeaturePredictor.fourier_max_frequency_log2 = {}
 
 PointTransformerV3Model.enable_flash = True
 PointTransformerV3Model.output_dim = 96
