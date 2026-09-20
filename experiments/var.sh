@@ -156,17 +156,53 @@
 # CUSTOM_POSFIX=larger \
 # bash scripts/overfit-sr-gsfm-on-objaverse.sh 20000 20000 4000 4000 fit_lr_to_hr aligned 32 128
 
-GPU_ID=2 \
-BATCH_SIZE=4 \
-GRAD_ACCUM_STEPS=1 \
-GRID_RESOLUTION=1536 \
+# GPU_ID=2 \
+# BATCH_SIZE=4 \
+# GRAD_ACCUM_STEPS=1 \
+# GRID_RESOLUTION=1536 \
+# SCENE_MODE=many \
+# SCENE_COUNT=18 \
+# VELOCITY_VARIANCE_SOURCE=precomputed_aggregate \
+# PTV3_ENC_DEPTHS='(3,3,3,6,3)' \
+# PTV3_DEC_DEPTHS='(3,3,3,3)' \
+# PTV3_ENC_CHANNELS='(128,192,256,512,1024)' \
+# PTV3_DEC_CHANNELS='(192,192,512,512)' \
+# CUSTOM_POSFIX=wider_and_larger \
+# bash scripts/overfit-sr-gsfm-on-objaverse.sh 20000 20000 4000 4000 fit_lr_to_hr aligned 32 128
+
+# SR-MSE counterparts to the 0913 GSFM overfitting runs
+# 0920
+DATASET_ROOT=/project/ricky/splatformer-sr-data-scaled \
+IMAGE_L1_LOSS_WEIGHT=0 \
+LPIPS_LOSS_WEIGHT=0 \
+PTV3_OUTPUT_DIM=128 \
+PTV3_ENC_CHANNELS='(96,144,192,384,768)' \
+PTV3_DEC_CHANNELS='(128,192,384,384)' \
+GS_OUTPUT_HEAD_WIDTH=128 \
+
+GPU_ID=0 \
+BATCH_SIZE=1 \
+GRID_RESOLUTION=768 \
+SCENE_MODE=one \
+bash scripts/overfit-sr-mse-on-objaverse.sh 10000 10000 1000 1000 fit_lr_to_hr aligned 32 128
+
+GPU_ID=0 \
+BATCH_SIZE=1 \
+GRID_RESOLUTION=768 \
 SCENE_MODE=many \
 SCENE_COUNT=18 \
-VELOCITY_VARIANCE_SOURCE=precomputed_aggregate \
-PTV3_ENC_DEPTHS='(3,3,3,6,3)' \
-PTV3_DEC_DEPTHS='(3,3,3,3)' \
-PTV3_ENC_CHANNELS='(128,192,256,512,1024)' \
-PTV3_DEC_CHANNELS='(192,192,512,512)' \
-CUSTOM_POSFIX=wider_and_larger \
-bash scripts/overfit-sr-gsfm-on-objaverse.sh 20000 20000 4000 4000 fit_lr_to_hr aligned 32 128
+bash scripts/overfit-sr-mse-on-objaverse.sh 20000 20000 4000 4000 fit_lr_to_hr aligned 32 128
 
+GPU_ID=0 \
+BATCH_SIZE=4 \
+GRID_RESOLUTION=768 \
+SCENE_MODE=many \
+SCENE_COUNT=18 \
+bash scripts/overfit-sr-mse-on-objaverse.sh 20000 20000 4000 4000 fit_lr_to_hr aligned 32 128
+
+GPU_ID=0 \
+BATCH_SIZE=8 \
+GRID_RESOLUTION=768 \
+SCENE_MODE=many \
+SCENE_COUNT=18 \
+bash scripts/overfit-sr-mse-on-objaverse.sh 20000 20000 4000 4000 fit_lr_to_hr aligned 32 128
