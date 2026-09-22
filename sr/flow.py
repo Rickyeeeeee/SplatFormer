@@ -104,11 +104,7 @@ def sample_stochastic_interpolant(
             else torch.zeros_like(source_value)
         )
         flow_noise[key] = noise
-        query_flow_gs[key] = (
-            (1.0 - alpha) * source_value
-            + alpha * target_value
-            + gamma * noise
-        )
+        query_flow_gs[key] = ((1.0 - alpha) * source_value + alpha * target_value + gamma * noise        )
     return query_flow_gs, flow_noise, gamma, gamma_dot
 
 

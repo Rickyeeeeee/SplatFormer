@@ -14,8 +14,11 @@ training.resume_from_step = 0
 training.enable_amp = True
 training.empty_cache_fre = -1
 
-flow_matching.flow_steps = 5
-flow_matching.flow_noise_std = 0.0
+flow_matching.flow_steps = 10
+flow_matching.flow_noise_std = 1.0
+flow_matching.interpolant_type = 'linear'
+flow_matching.loss_rollout_steps = 10
+flow_matching.eval_noise_seed = 0
 flow_matching.flow_t_eps = 1e-4
 flow_matching.loss_type = 'velocity'
 flow_matching.normalization_variance_floor = 1e-8

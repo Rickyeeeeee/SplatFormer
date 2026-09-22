@@ -25,8 +25,15 @@ input_resolution=${7:-32}
 target_resolution=${8:-128}
 mix_schedule=${9:-${MIX_SCHEDULE:-fm-only}}
 flow_loss_type=${10:-${FLOW_LOSS_TYPE:-velocity}}
-flow_steps=${11:-${FLOW_STEPS:-1}}
-flow_noise_std=${12:-${FLOW_NOISE_STD:-0.0}}
+interpolant_type=${INTERPOLANT_TYPE:-linear}
+default_flow_steps=1
+if [[ "${interpolant_type}" == "encoding_decoding" ]]; then
+    default_flow_steps=10
+fi
+flow_steps=${11:-${FLOW_STEPS:-${default_flow_steps}}}
+loss_rollout_steps=${LOSS_ROLLOUT_STEPS:-10}
+eval_noise_seed=${EVAL_NOISE_SEED:-0}
+flow_noise_std=${12:-${FLOW_NOISE_STD:-1.0}}
 image_l1_loss_weight=${13:-${IMAGE_L1_LOSS_WEIGHT:-1.0}}
 lpips_loss_weight=${14:-${LPIPS_LOSS_WEIGHT:-1.0}}
 normalization_variance_floor=${NORMALIZATION_VARIANCE_FLOOR:-1e-8}
@@ -50,8 +57,8 @@ ${alignment}_\
 ${attribute_init}_\
 ir${input_resolution}_\
 tr${target_resolution}_\
-interpolants_${mix_schedule}_\
-noise${flow_noise_std}_\
+interpolants_${interpolant_type}_${mix_schedule}_\
+noise${flow_noise_std}_steps${flow_steps}_rollout${loss_rollout_steps}_seed${eval_noise_seed}_\
 grid${grid_resolution}_\
 batch_size${batch_size}_\
 ${custom_postfix}
@@ -109,6 +116,9 @@ CUDA_VISIBLE_DEVICES=${GPU_ID} python overfit-sr-interpolants.py \
     --attribute_init="${attribute_init}" \
     --gin_param="flow_matching.normalization_variance_floor=${normalization_variance_floor}" \
     --gin_param="flow_matching.gs_statistics_path='${gs_statistics_path}'" \
+    --gin_param="flow_matching.interpolant_type='${interpolant_type}'" \
+    --gin_param="flow_matching.loss_rollout_steps=${loss_rollout_steps}" \
+    --gin_param="flow_matching.eval_noise_seed=${eval_noise_seed}" \
     --gin_param="flow_matching.flow_steps=${flow_steps}" \
     --gin_param="flow_matching.flow_noise_std=${flow_noise_std}" \
     --gin_param="flow_matching.loss_type='${flow_loss_type}'" \

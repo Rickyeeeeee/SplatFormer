@@ -57,12 +57,16 @@ def set_seed(seed):
 
 
 @gin.configurable
-def flow_matching(flow_steps=5, flow_noise_std=0.0, flow_t_eps=1e-4, loss_type="velocity",
+def flow_matching(flow_steps=10, flow_noise_std=1.0, flow_t_eps=1e-4, loss_type="velocity",
+                  interpolant_type="linear", loss_rollout_steps=10, eval_noise_seed=0,
                   normalization_variance_floor=1e-8,
                   gs_statistics_path="/project/ricky/splatformer-sr-data-scaled/gs_statistics.json"):
     if loss_type not in ("velocity", "x1"):
         raise ValueError(f"Unsupported flow_matching.loss_type={loss_type!r}")
-    return {"flow_steps": flow_steps, "flow_noise_std": flow_noise_std, "flow_t_eps": flow_t_eps,
+    interpolants.validate_settings(interpolant_type, flow_steps, flow_t_eps)
+    interpolants.validate_settings(interpolant_type, loss_rollout_steps, flow_t_eps)
+    return {"interpolant_type": interpolant_type, "loss_rollout_steps": loss_rollout_steps,
+            "eval_noise_seed": eval_noise_seed, "flow_steps": flow_steps, "flow_noise_std": flow_noise_std, "flow_t_eps": flow_t_eps,
             "loss_type": loss_type, "normalization_variance_floor": normalization_variance_floor,
             "gs_statistics_path": gs_statistics_path}
 
@@ -90,6 +94,7 @@ def evaluate_single_scene(
     output_dir,
     flow_steps,
     standardizer,
+    flow_cfg,
     eval_chunk_size=None,
     gt_gs=None,
     compare_with_input=False,
@@ -118,7 +123,9 @@ def evaluate_single_scene(
         os.makedirs(compare_dir, exist_ok=True)
 
     with torch.no_grad():
-        out_gs = interpolants.sample_flow_model(model, source_flow_gs, scene_idx, flow_steps, standardizer)
+        out_gs = interpolants.sample_flow_model(model, source_flow_gs, scene_idx, flow_steps, standardizer,
+                                               mode=flow_cfg["interpolant_type"], target_means=gt_gs["means"],
+                                               t_eps=flow_cfg["flow_t_eps"], noise_seed=flow_cfg["eval_noise_seed"])
         pred_preview = []
         gt_preview = []
 
@@ -298,25 +305,26 @@ def compute_microbatch_loss(model, scenes, device, flow_cfg, mix_cfg, standardiz
                             image_l1_loss_weight, lpips_loss_weight, lpips_loss_func, enable_amp):
     """Return summed sample losses; keep temporary GPU state scoped to one microbatch."""
     is_fm_only = mix_cfg["schedule"] == "fm-only"
+    render_enabled = not is_fm_only and (image_l1_loss_weight != 0 or (lpips_loss_weight != 0 and lpips_loss_func is not None))
+    mode = flow_cfg["interpolant_type"]
     samples = []
     for active in scenes:
-        source = gpu_utils.move_to_device(active["source_flow_gs"], device)
+        source = None if mode == "one_sided" else gpu_utils.move_to_device(active["source_flow_gs"], device)
         target = gpu_utils.move_to_device(active["target_flow_gs"], device)
         t = torch.empty(1, device=device).uniform_(float(flow_cfg["flow_t_eps"]), 1.0 - float(flow_cfg["flow_t_eps"]))
         train_images, train_cameras = None, None
-        if not is_fm_only:
+        if render_enabled:
             camera_indices = np.random.permutation(len(active["target_images"]))[:active["render_view_count"]]
             train_images = gpu_utils.move_to_device([active["target_images"][index] for index in camera_indices], device)
             train_cameras = dict(active["target_cameras"])
             train_cameras["camera_to_worlds"] = train_cameras["camera_to_worlds"][camera_indices]
             train_cameras = gpu_utils.move_to_device(train_cameras, device)
-        query, noise, gamma, gamma_dot = flow.sample_stochastic_interpolant(source, target, t, float(flow_cfg["flow_noise_std"]))
-        samples.append({
-            "source": source, "target": target, "t": t, "query": query, "noise": noise,
-            "gamma": gamma, "gamma_dot": gamma_dot,
-            "reference_means": active["source_gs"]["means"].to(device),
-            "images": train_images, "cameras": train_cameras,
-        })
+        source_means = None if mode == "one_sided" else active["source_gs"]["means"].to(device)
+        target_means = active["target_gs"]["means"].to(device)
+        path = interpolants.construct_path(source, target, t, mode, source_means, target_means, float(flow_cfg["flow_noise_std"]))
+        samples.append({**path, "source": source, "target": target, "t": t,
+                        "source_means": source_means, "target_means": target_means, "scene_idx": active["scene_idx"],
+                        "images": train_images, "cameras": train_cameras})
 
     summed_loss = None
     statistics = {}
@@ -328,21 +336,17 @@ def compute_microbatch_loss(model, scenes, device, flow_cfg, mix_cfg, standardiz
             t=torch.cat([sample["t"] for sample in samples]),
         )
         for sample, pred_vel in zip(samples, predictions):
-            source_flow_gs, target_flow_gs = sample["source"], sample["target"]
-            loss_target_gs = target_flow_gs
-            query_flow_gs, flow_noise = sample["query"], sample["noise"]
             t, gamma, gamma_dot = sample["t"], sample["gamma"], sample["gamma_dot"]
             train_images, train_cameras = sample["images"], sample["cameras"]
-            x1_pred_flow_gs = flow.predict_x1_from_velocity(
-                model, source_flow_gs, query_flow_gs, pred_vel, flow_noise, gamma, gamma_dot, t
-            )
+            if flow_cfg["loss_type"] == "x1" or render_enabled:
+                x1_pred_flow_gs = interpolants.rollout(
+                    model, sample["source"], sample["scene_idx"], flow_cfg["loss_rollout_steps"], mode,
+                    sample["source_means"], sample["target_means"], sample["noise"], flow_cfg["flow_t_eps"])
             if flow_cfg["loss_type"] == "velocity":
-                velocity_target = {key: target_flow_gs[key] - source_flow_gs[key] + gamma_dot * flow_noise[key]
-                                   for key in SUPPORTED_GS_KEYS}
-                fm_loss, attr_losses, weighted_attr_losses = interpolants.attribute_mse(pred_vel, velocity_target)
+                fm_loss, attr_losses, weighted_attr_losses = interpolants.attribute_mse(pred_vel, sample["velocity"])
             else:
-                fm_loss, attr_losses, weighted_attr_losses = interpolants.attribute_mse(x1_pred_flow_gs, loss_target_gs)
-            if is_fm_only:
+                fm_loss, attr_losses, weighted_attr_losses = interpolants.attribute_mse(x1_pred_flow_gs, sample["target"])
+            if not render_enabled:
                 render_l1 = fm_loss.new_zeros(())
                 render_lpips = render_l1
                 weighted_render_l1 = render_l1
@@ -578,7 +582,10 @@ def training(
             active = batch_scenes[0]
             with torch.no_grad():
                 source_flow_gs = gpu_utils.move_to_device(active["source_gs"], device)
-                train_out_gs = interpolants.sample_flow_model(model, source_flow_gs, active["scene_idx"], int(flow_cfg["flow_steps"]), standardizer)
+                train_out_gs = interpolants.sample_flow_model(
+                    model, source_flow_gs, active["scene_idx"], int(flow_cfg["flow_steps"]), standardizer,
+                    mode=flow_cfg["interpolant_type"], target_means=active["target_gs"]["means"].to(device),
+                    t_eps=flow_cfg["flow_t_eps"], noise_seed=flow_cfg["eval_noise_seed"])
                 pred_imgs, _ = gs_utils.rasterize_gaussians_to_multiimgs(train_out_gs, gpu_utils.move_to_device(active["target_cameras"], device))
                 pred_imgs_uint8 = [(im * 255).detach().cpu().numpy().astype(np.uint8) for im in pred_imgs[:9]]
                 if len(pred_imgs_uint8) > 0:
@@ -607,6 +614,7 @@ def training(
                         input_gs=gpu_utils.move_to_device(evaluated["source_gs"], device),
                         source_flow_gs=gpu_utils.move_to_device(evaluated["source_gs"], device),
                         standardizer=standardizer,
+                        flow_cfg=flow_cfg,
                         gt_gs=gpu_utils.move_to_device(evaluated["target_gs"], device),
                         scene_idx=evaluated["scene_idx"],
                         scene_name=scene_name,
