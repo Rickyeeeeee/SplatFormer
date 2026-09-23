@@ -23,7 +23,7 @@ flow_matching.flow_t_eps = 1e-4
 flow_matching.loss_type = 'velocity'
 flow_matching.normalization_variance_floor = 1e-8
 
-loss_mixing.schedule = 'free-range-gs'
+loss_mixing.schedule = 'fm-only'
 
 # Standardized velocities are unbounded and additive for every attribute.
 GSFlowPredictor.quat_residual_mode = 'add'
@@ -46,4 +46,4 @@ train2D/build_optimizer.lr_dict = {
 train2D/build_optimizer.optimizer_type = 'adam'
 train2D/build_optimizer.optimizer_params = {'eps': 1e-15}
 train2D/build_scheduler.total_step = %total_steps
-train2D/build_scheduler.schedule = 'linear'
+train2D/build_scheduler.schedule = 'cosine'

@@ -1,7 +1,7 @@
 #!/bin/bash
 
 set -euo pipefail
-GPU_ID=${GPU_ID:-5}
+GPU_ID=${GPU_ID:-4}
 DATASET_ROOT=${DATASET_ROOT:-/project/ricky/splatformer-sr-data-scaled}
 TRAIN_SCENE_LIST=${TRAIN_SCENE_LIST:-${DATASET_ROOT}/psnr_filtered_scenes.csv}
 TEST_SCENE_LIST=${TEST_SCENE_LIST:-${DATASET_ROOT}/test_psnr_filtered_scenes.csv}
@@ -10,8 +10,8 @@ FIT_HR_TO_LR_ROOT=${FIT_HR_TO_LR_ROOT:-${DATASET_ROOT}/test-set-4x-up/objaverse}
 echo "Using GPU: ${GPU_ID}"
 
 # Example: SCENE_MODE=many SCENE_COUNT=4 BATCH_SIZE=8 GRAD_ACCUM_STEPS=4 bash scripts/overfit-sr-interpolants.sh
-scene_mode=${SCENE_MODE:-many}
-scene_count=${SCENE_COUNT:-18}
+scene_mode=${SCENE_MODE:-one}
+scene_count=${SCENE_COUNT:-1}
 batch_size=${BATCH_SIZE:-4}
 grad_accum_steps=${GRAD_ACCUM_STEPS:-1}
 scene_name=${SCENE_NAME:-3e288ee8aced4a0797e66d53536112b1}
@@ -26,9 +26,9 @@ target_resolution=${8:-128}
 mix_schedule=${9:-${MIX_SCHEDULE:-fm-only}}
 flow_loss_type=${10:-${FLOW_LOSS_TYPE:-velocity}}
 interpolant_type=${INTERPOLANT_TYPE:-linear}
-default_flow_steps=1
+default_flow_steps=50
 if [[ "${interpolant_type}" == "encoding_decoding" ]]; then
-    default_flow_steps=10
+    default_flow_steps=50
 fi
 flow_steps=${11:-${FLOW_STEPS:-${default_flow_steps}}}
 loss_rollout_steps=${LOSS_ROLLOUT_STEPS:-10}
@@ -43,7 +43,7 @@ ptv3_drop_path=${PTV3_DROP_PATH:-0.0}
 ptv3_shuffle_orders=${PTV3_SHUFFLE_ORDERS:-True}
 ptv3_shuffle_orders_eval=${PTV3_SHUFFLE_ORDERS_EVAL:-False}
 ptv3_turn_off_bn=${PTV3_TURN_OFF_BN:-True}
-grid_resolution=${GRID_RESOLUTION:-384}
+grid_resolution=${GRID_RESOLUTION:-1536}
 run_date=$(date +%m%d)
 custom_postfix=${CUSTOM_POSFIX:-run}
 
@@ -58,12 +58,12 @@ ${attribute_init}_\
 ir${input_resolution}_\
 tr${target_resolution}_\
 interpolants_${interpolant_type}_${mix_schedule}_\
-noise${flow_noise_std}_steps${flow_steps}_rollout${loss_rollout_steps}_seed${eval_noise_seed}_\
+noise${flow_noise_std}_steps${flow_steps}_seed${eval_noise_seed}_\
 grid${grid_resolution}_\
 batch_size${batch_size}_\
 ${custom_postfix}
 
-output_root=${OUTPUT_ROOT:-/project2/ricky/experiments/${run_date}/overfit_sr_interpolants_512}
+output_root=${OUTPUT_ROOT:-/project2/ricky/experiments/${run_date}_arch_tune/overfit_sr_interpolants_512}
 output_dir=${OUTPUT_DIR:-${output_root}/${out_name}}
 
 # Optional architecture overrides retain Gin/model defaults when unset or empty.
