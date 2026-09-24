@@ -1,0 +1,28 @@
+# DiPT Gaussian velocity predictor for stochastic interpolants.
+DiffusionGaussianPredictor.sh_degree = 1
+DiffusionGaussianPredictor.input_features = ['means', 'scales', 'opacities', 'quats', 'features_dc', 'features_rest']
+DiffusionGaussianPredictor.output_features = ['means', 'scales', 'opacities', 'quats', 'features_dc', 'features_rest']
+DiffusionGaussianPredictor.input_feat_to_mlp = True
+DiffusionGaussianPredictor.output_head_nlayer = 4
+DiffusionGaussianPredictor.output_head_type = 'mlp-relu'
+DiffusionGaussianPredictor.output_head_width = 128
+DiffusionGaussianPredictor.grid_resolution = 1024
+DiffusionGaussianPredictor.resume_ckpt = None
+DiffusionGaussianPredictor.zeroinit = True
+DiffusionGaussianPredictor.fourier_input_features = []
+DiffusionGaussianPredictor.fourier_num_frequencies = {}
+DiffusionGaussianPredictor.fourier_include_raw = True
+DiffusionGaussianPredictor.fourier_log_sampling = True
+DiffusionGaussianPredictor.fourier_max_frequency_log2 = {}
+
+# DiPT-S uses a 12-block, 384-channel backbone with alternating attention patches.
+DiffusionGaussianTransformer.order = ('z', 'z-trans')
+DiffusionGaussianTransformer.depth = 12
+DiffusionGaussianTransformer.channels = 384
+DiffusionGaussianTransformer.num_head = 6
+DiffusionGaussianTransformer.patch_size = (256, 512, 1024, 1024, 256, 512, 1024, 1024, 256, 512, 1024, 1024)
+DiffusionGaussianTransformer.frequency_embedding_size = 256
+DiffusionGaussianTransformer.drop_path = 0.3
+DiffusionGaussianTransformer.shuffle_orders = True
+DiffusionGaussianTransformer.shuffle_orders_eval = True
+DiffusionGaussianTransformer.enable_flash = True

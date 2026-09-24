@@ -32,6 +32,12 @@ GSFlowPredictor.res_feature_activation = {
     'scales': @Identity(), 'opacities': @Identity(), 'quats': @Identity(),
 }
 
+DiffusionGaussianPredictor.quat_residual_mode = 'add'
+DiffusionGaussianPredictor.res_feature_activation = {
+    'means': @Identity(), 'features_dc': @Identity(), 'features_rest': @Identity(),
+    'scales': @Identity(), 'opacities': @Identity(), 'quats': @Identity(),
+}
+
 train2D/build_optimizer.lr_dict = {
     'base': 3e-4,
     'embedding': 3e-4,

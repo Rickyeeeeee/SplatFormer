@@ -44,6 +44,27 @@ ptv3_shuffle_orders=${PTV3_SHUFFLE_ORDERS:-True}
 ptv3_shuffle_orders_eval=${PTV3_SHUFFLE_ORDERS_EVAL:-False}
 ptv3_turn_off_bn=${PTV3_TURN_OFF_BN:-True}
 grid_resolution=${GRID_RESOLUTION:-1536}
+# predictor=${PREDICTOR:-ptv3}
+predictor=${PREDICTOR:-dipt}
+case "${predictor}" in
+    ptv3)
+        predictor_class=GSFlowPredictor
+        backbone_class=PointTransformerV3FlowModel
+        model_gin_file=configs/model/ptv3_flow.gin
+        predictor_suffix=
+        ;;
+    dipt)
+        predictor_class=DiffusionGaussianPredictor
+        backbone_class=DiffusionGaussianTransformer
+        model_gin_file=configs/model/dipt_gaussian.gin
+        predictor_suffix=_dipt
+        ;;
+    *)
+        echo "Unsupported PREDICTOR: ${predictor}; expected ptv3 or dipt" >&2
+        exit 2
+        ;;
+esac
+echo "Using predictor: ${predictor}"
 run_date=$(date +%m%d)
 custom_postfix=${CUSTOM_POSFIX:-run}
 
@@ -61,26 +82,30 @@ interpolants_${interpolant_type}_${mix_schedule}_\
 noise${flow_noise_std}_steps${flow_steps}_seed${eval_noise_seed}_\
 grid${grid_resolution}_\
 batch_size${batch_size}_\
-${custom_postfix}
+${custom_postfix}${predictor_suffix}
 
-output_root=${OUTPUT_ROOT:-/project2/ricky/experiments/${run_date}_arch_tune/overfit_sr_interpolants_512}
+output_root=${OUTPUT_ROOT:-/project2/ricky/experiments/${run_date}/overfit_sr_interpolants_512_dipt}
 output_dir=${OUTPUT_DIR:-${output_root}/${out_name}}
 
 # Optional architecture overrides retain Gin/model defaults when unset or empty.
 # Use Gin literals for tuples/dicts and True/False for booleans; strings need no inner quotes.
 # Keep stage counts, channel widths, and head counts compatible; input channels are derived.
-# The current output head supports mlp-relu; the predictor supplies a 3-component time embedding.
+# The output head supports mlp-relu; DiPT embeds continuous time in its transformer blocks.
 # Fourier example: GS_FOURIER_INPUT_FEATURES="['means', 'scales']" GS_FOURIER_NUM_FREQUENCIES="{'means': 6, 'scales': 4}" CUSTOM_POSFIX=fourier bash scripts/overfit-sr-interpolants.sh
 # Set GS_FOURIER_INCLUDE_RAW=False, GS_FOURIER_LOG_SAMPLING=False, or GS_FOURIER_MAX_FREQUENCY_LOG2="{'means': 5}" as needed.
 # Example: PTV3_ENC_CHANNELS='(32, 64, 128, 256, 512)' PTV3_DEC_CHANNELS='(64, 64, 128, 256)' GS_OUTPUT_HEAD_WIDTH=64 GS_OUTPUT_HEAD_NLAYER=2 CUSTOM_POSFIX=small bash scripts/overfit-sr-interpolants.sh
 network_gin_args=()
-for network in PointTransformerV3FlowModel GSFlowPredictor; do
+for network in "${backbone_class}" "${predictor_class}"; do
     case "${network}" in
         PointTransformerV3FlowModel)
             prefix=PTV3
             parameters=(enc_dim output_dim enc_channels dec_channels enc_depths dec_depths enc_num_head dec_num_head stride embedding_type T_dim enable_flash pdnorm_bn pdnorm_ln pretrained_ckpt)
             ;;
-        GSFlowPredictor)
+        DiffusionGaussianTransformer)
+            prefix=DIPT
+            parameters=(order depth channels num_head patch_size mlp_ratio frequency_embedding_size qkv_bias qk_scale attn_drop proj_drop drop_path pre_norm shuffle_orders shuffle_orders_eval enable_rpe enable_flash upcast_attention upcast_softmax pdnorm_bn pdnorm_ln pdnorm_decouple pdnorm_adaptive pdnorm_affine pdnorm_conditions pdnorm_condition)
+            ;;
+        GSFlowPredictor|DiffusionGaussianPredictor)
             prefix=GS
             parameters=(output_head_nlayer output_head_width output_head_type input_feat_to_mlp zeroinit res_feature_activation quat_residual_mode fourier_input_features fourier_num_frequencies fourier_include_raw fourier_log_sampling fourier_max_frequency_log2)
             ;;
@@ -90,7 +115,7 @@ for network in PointTransformerV3FlowModel GSFlowPredictor; do
         value=${!env_name:-}
         if [[ -n "${value}" ]]; then
             case "${parameter}" in
-                embedding_type|pretrained_ckpt|output_head_type|quat_residual_mode)
+                embedding_type|pretrained_ckpt|output_head_type|quat_residual_mode|pdnorm_condition)
                     # Escape ordinary strings as Gin string literals, including checkpoint paths.
                     value=${value//\\/\\\\}
                     value=${value//\'/\\\'}
@@ -104,10 +129,20 @@ for network in PointTransformerV3FlowModel GSFlowPredictor; do
         fi
     done
 done
+if [[ "${predictor}" == "ptv3" ]]; then
+    network_gin_args+=(
+        "--gin_param=PointTransformerV3FlowModel.drop_path=${ptv3_drop_path}"
+        "--gin_param=PointTransformerV3FlowModel.shuffle_orders=${ptv3_shuffle_orders}"
+        "--gin_param=PointTransformerV3FlowModel.shuffle_orders_eval=${ptv3_shuffle_orders_eval}"
+        "--gin_param=PointTransformerV3FlowModel.turn_off_bn=${ptv3_turn_off_bn}"
+    )
+fi
+network_gin_args+=("--gin_param=${predictor_class}.grid_resolution=${grid_resolution}")
 
 CUDA_VISIBLE_DEVICES=${GPU_ID} python overfit-sr-interpolants.py \
     --output_dir="${output_dir}" \
     --scene_name="${scene_name}" \
+    --predictor="${predictor}" \
     --scene_mode="${scene_mode}" \
     --scene_count="${scene_count}" \
     --batch_size="${batch_size}" \
@@ -123,7 +158,7 @@ CUDA_VISIBLE_DEVICES=${GPU_ID} python overfit-sr-interpolants.py \
     --gin_param="flow_matching.flow_noise_std=${flow_noise_std}" \
     --gin_param="flow_matching.loss_type='${flow_loss_type}'" \
     --gin_param="flow_matching.flow_t_eps=${flow_t_eps}" \
-    --gin_file=configs/model/ptv3_flow.gin \
+    --gin_file="${model_gin_file}" \
     --gin_file=configs/dataset/objaverse-sr.gin \
     --gin_file=configs/overfit/sr_interpolants.gin \
     --gin_param="dataset_root='${DATASET_ROOT}'" \
@@ -137,11 +172,6 @@ CUDA_VISIBLE_DEVICES=${GPU_ID} python overfit-sr-interpolants.py \
     --gin_param="SplatFactoSRDataset.load_tgt_gs=True" \
     --gin_param="SplatFactoSRDataset.load_src_images=True" \
     --gin_param="SplatFactoSRDataset.load_tgt_images=True" \
-    --gin_param="PointTransformerV3FlowModel.drop_path=${ptv3_drop_path}" \
-    --gin_param="PointTransformerV3FlowModel.shuffle_orders=${ptv3_shuffle_orders}" \
-    --gin_param="PointTransformerV3FlowModel.shuffle_orders_eval=${ptv3_shuffle_orders_eval}" \
-    --gin_param="PointTransformerV3FlowModel.turn_off_bn=${ptv3_turn_off_bn}" \
-    --gin_param="GSFlowPredictor.grid_resolution=${grid_resolution}" \
     --gin_param="training.total_steps=${total_steps}" \
     --gin_param="train2D/build_scheduler.total_step=${total_steps}" \
     --gin_param="training.save_interval=${save_interval}" \

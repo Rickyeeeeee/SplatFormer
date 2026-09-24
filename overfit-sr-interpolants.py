@@ -9,6 +9,7 @@ from absl import app, flags
 from tqdm import tqdm
 
 from dataset.GS_SR import SplatFactoSRDataset
+from models.diffusion_gaussian_predictor import DiffusionGaussianPredictor
 from models.feature_flow_predictor import GSFlowPredictor
 from models.feature_predictor import FeaturePredictor  # Registers legacy Gin keys.
 from sr import flow, interpolants
@@ -26,6 +27,7 @@ from utils.optimizers import build_optimizer, build_scheduler
 flags.DEFINE_string("output_dir", "output_overfit_interpolants", "Output directory")
 flags.DEFINE_string("eval_subdir", "eval_final", "Eval subdirectory")
 flags.DEFINE_string("scene_name", "", "Scene name to overfit in one mode")
+flags.DEFINE_enum("predictor", "ptv3", ["ptv3", "dipt"], "Gaussian velocity predictor")
 flags.DEFINE_enum("scene_mode", "one", ["one", "many"], "Overfit one scene or a fixed random scene set")
 flags.DEFINE_integer("scene_count", 1, "Number of scenes selected in many mode")
 flags.DEFINE_integer("batch_size", 1, "Total scene samples per optimizer update")
@@ -46,6 +48,7 @@ flags.DEFINE_multi_string("gin_file", None, "List of paths to the config files."
 flags.DEFINE_multi_string("gin_param", "", "Newline separated list of Gin parameter bindings.")
 
 FLAGS = flags.FLAGS
+PREDICTORS = {"ptv3": GSFlowPredictor, "dipt": DiffusionGaussianPredictor}
 EVAL_FLOW_STEPS = [50]
 MEANS_LOSS_REDUCTION = "mean"  # Set to "sum" to match PUFM-style summed point loss.
 
@@ -332,7 +335,7 @@ def compute_microbatch_loss(model, scenes, device, flow_cfg, mix_cfg, standardiz
         predictions = model(
             batch_flow_gs=[sample["query"] for sample in samples],
             batch_scene_idx=[scene["scene_idx"] for scene in scenes],
-            batch_reference_means=[sample["reference_means"] for sample in samples],
+            # batch_reference_means=[sample["reference_means"] for sample in samples],
             t=torch.cat([sample["t"] for sample in samples]),
         )
         for sample, pred_vel in zip(samples, predictions):
@@ -476,11 +479,13 @@ def training(
     logger.info(f"Baseline render metrics saved to {baseline_path}: mean={baseline_mean}")
     # exit()
     os.makedirs(os.path.join(output_dir, "checkpoints"), exist_ok=True)
-    model = GSFlowPredictor().to(device)
+    predictor_class = PREDICTORS[FLAGS.predictor]
+    model = predictor_class().to(device)
+    logger.info(f"Predictor={FLAGS.predictor} class={predictor_class.__name__}")
     missing_outputs = sorted(set(SUPPORTED_GS_KEYS) - set(model.output_features))
     if missing_outputs:
         raise ValueError(
-            f"GSFlowPredictor.output_features must include all Gaussian "
+            f"{predictor_class.__name__}.output_features must include all Gaussian "
             f"attributes; missing {missing_outputs}"
         )
     if model.resume_ckpt is not None:
