@@ -62,6 +62,7 @@ def set_seed(seed):
 @gin.configurable
 def flow_matching(flow_steps=10, flow_noise_std=1.0, flow_t_eps=1e-4, loss_type="velocity",
                   interpolant_type="linear", loss_rollout_steps=10, eval_noise_seed=0,
+                  fixed_train_noise=False, train_noise_seed=0,
                   normalization_variance_floor=1e-8,
                   gs_statistics_path="/project/ricky/splatformer-sr-data-scaled/gs_statistics.json"):
     if loss_type not in ("velocity", "x1"):
@@ -69,7 +70,8 @@ def flow_matching(flow_steps=10, flow_noise_std=1.0, flow_t_eps=1e-4, loss_type=
     interpolants.validate_settings(interpolant_type, flow_steps, flow_t_eps)
     interpolants.validate_settings(interpolant_type, loss_rollout_steps, flow_t_eps)
     return {"interpolant_type": interpolant_type, "loss_rollout_steps": loss_rollout_steps,
-            "eval_noise_seed": eval_noise_seed, "flow_steps": flow_steps, "flow_noise_std": flow_noise_std, "flow_t_eps": flow_t_eps,
+            "eval_noise_seed": eval_noise_seed, "fixed_train_noise": fixed_train_noise,
+            "train_noise_seed": train_noise_seed, "flow_steps": flow_steps, "flow_noise_std": flow_noise_std, "flow_t_eps": flow_t_eps,
             "loss_type": loss_type, "normalization_variance_floor": normalization_variance_floor,
             "gs_statistics_path": gs_statistics_path}
 
@@ -324,7 +326,9 @@ def compute_microbatch_loss(model, scenes, device, flow_cfg, mix_cfg, standardiz
             train_cameras = gpu_utils.move_to_device(train_cameras, device)
         source_means = None if mode == "one_sided" else active["source_gs"]["means"].to(device)
         target_means = active["target_gs"]["means"].to(device)
-        path = interpolants.construct_path(source, target, t, mode, source_means, target_means, float(flow_cfg["flow_noise_std"]))
+        noise = gpu_utils.move_to_device(active["fixed_train_noise"], device) if flow_cfg.get("fixed_train_noise", False) else None
+        path = interpolants.construct_path(source, target, t, mode, source_means, target_means,
+                                           float(flow_cfg["flow_noise_std"]), noise=noise)
         samples.append({**path, "source": source, "target": target, "t": t,
                         "source_means": source_means, "target_means": target_means, "scene_idx": active["scene_idx"],
                         "images": train_images, "cameras": train_cameras})
@@ -335,7 +339,7 @@ def compute_microbatch_loss(model, scenes, device, flow_cfg, mix_cfg, standardiz
         predictions = model(
             batch_flow_gs=[sample["query"] for sample in samples],
             batch_scene_idx=[scene["scene_idx"] for scene in scenes],
-            # batch_reference_means=[sample["reference_means"] for sample in samples],
+            batch_reference_means=[sample["reference_means"] for sample in samples],
             t=torch.cat([sample["t"] for sample in samples]),
         )
         for sample, pred_vel in zip(samples, predictions):
@@ -437,6 +441,10 @@ def training(
             raise RuntimeError(f"Failed to prepare scene {scene_name!r} (index {scene_idx})") from error
         view_count = len(prepared["target_images"])
         prepared["render_view_count"] = 0 if is_fm_only else min(dataset.image_per_scene or view_count, view_count)
+        if flow_cfg["fixed_train_noise"]:
+            prepared["fixed_train_noise"] = interpolants.seeded_noise_like(
+                prepared["target_flow_gs"], int(flow_cfg["train_noise_seed"]) + int(prepared["scene_idx"])
+            )
         if not prepared["target_images"]:
             raise ValueError(f"Scene {scene_name!r} has no target views")
         if not is_fm_only and prepared["render_view_count"] <= 0:

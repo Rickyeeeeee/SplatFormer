@@ -1,4 +1,7 @@
-import torch, gin 
+import math
+
+import gin
+import torch
 @gin.configurable
 def build_3DGSoptimizer(gs_params, lr_dict, optimizer_type, optimizer_params):
     params_lr = []
@@ -54,7 +57,29 @@ def build_optimizer(model,
     return optimizer
 
 @gin.configurable
-def build_scheduler(optimizer, schedule, total_step, warmup_step=0):
+def build_scheduler(optimizer, schedule, total_step, warmup_step=0, warmup_start_factor=1.0 / 30.0):
+    if total_step <= 0:
+        raise ValueError("total_step must be positive")
+    if warmup_step < 0 or warmup_step >= total_step:
+        raise ValueError("warmup_step must be in [0, total_step)")
+    if not 0 < warmup_start_factor <= 1:
+        raise ValueError("warmup_start_factor must be in (0, 1]")
+    if warmup_step > 0:
+        decay_steps = total_step - warmup_step
+
+        def lr_multiplier(step):
+            if step < warmup_step:
+                return warmup_start_factor + (1.0 - warmup_start_factor) * step / warmup_step
+            progress = min((step - warmup_step) / decay_steps, 1.0)
+            if schedule == 'constant':
+                return 1.0
+            if schedule == 'linear':
+                return 1.0 - progress
+            if schedule == 'cosine':
+                return 0.5 * (1.0 + math.cos(math.pi * progress))
+            raise NotImplementedError(f"Unsupported schedule {schedule!r}")
+
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_multiplier)
     if schedule == 'constant':
         lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda step: 1)
     elif schedule == 'linear':
@@ -66,7 +91,4 @@ def build_scheduler(optimizer, schedule, total_step, warmup_step=0):
         lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=exponential_gamma)
     else:
         raise NotImplementedError
-    if warmup_step > 0:
-        warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda step: step/warmup_step)
-        lr_scheduler = torch.optim.lr_scheduler.ChainedScheduler([warmup_scheduler, lr_scheduler], optimizer)
     return lr_scheduler

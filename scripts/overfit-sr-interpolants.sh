@@ -1,7 +1,7 @@
 #!/bin/bash
 
 set -euo pipefail
-GPU_ID=${GPU_ID:-4}
+GPU_ID=${GPU_ID:-3}
 DATASET_ROOT=${DATASET_ROOT:-/project/ricky/splatformer-sr-data-scaled}
 TRAIN_SCENE_LIST=${TRAIN_SCENE_LIST:-${DATASET_ROOT}/psnr_filtered_scenes.csv}
 TEST_SCENE_LIST=${TEST_SCENE_LIST:-${DATASET_ROOT}/test_psnr_filtered_scenes.csv}
@@ -12,10 +12,16 @@ echo "Using GPU: ${GPU_ID}"
 # Example: SCENE_MODE=many SCENE_COUNT=4 BATCH_SIZE=8 GRAD_ACCUM_STEPS=4 bash scripts/overfit-sr-interpolants.sh
 scene_mode=${SCENE_MODE:-one}
 scene_count=${SCENE_COUNT:-1}
-batch_size=${BATCH_SIZE:-4}
+batch_size=${BATCH_SIZE:-16}
 grad_accum_steps=${GRAD_ACCUM_STEPS:-1}
 scene_name=${SCENE_NAME:-3e288ee8aced4a0797e66d53536112b1}
 total_steps=${1:-10000}
+lr_warmup_steps=${LR_WARMUP_STEPS:-0}
+lr_warmup_start_factor=${LR_WARMUP_START_FACTOR:-0.03333333333333333}
+if [[ ! "${lr_warmup_steps}" =~ ^[0-9]+$ ]] || (( lr_warmup_steps >= total_steps )); then
+    echo "LR_WARMUP_STEPS must be a nonnegative integer smaller than total_steps" >&2
+    exit 2
+fi
 save_interval=${2:-10000}
 eval_interval=${3:-1000}
 log_image_interval=${4:-1000}
@@ -33,6 +39,15 @@ fi
 flow_steps=${11:-${FLOW_STEPS:-${default_flow_steps}}}
 loss_rollout_steps=${LOSS_ROLLOUT_STEPS:-10}
 eval_noise_seed=${EVAL_NOISE_SEED:-0}
+fixed_train_noise=${FIXED_TRAIN_NOISE:-False}
+train_noise_seed=${TRAIN_NOISE_SEED:-0}
+case "${fixed_train_noise}" in
+    True|False) ;;
+    *)
+        echo "Unsupported FIXED_TRAIN_NOISE: ${fixed_train_noise}; expected True or False" >&2
+        exit 2
+        ;;
+esac
 flow_noise_std=${12:-${FLOW_NOISE_STD:-1.0}}
 image_l1_loss_weight=${13:-${IMAGE_L1_LOSS_WEIGHT:-1.0}}
 lpips_loss_weight=${14:-${LPIPS_LOSS_WEIGHT:-1.0}}
@@ -44,6 +59,15 @@ ptv3_shuffle_orders=${PTV3_SHUFFLE_ORDERS:-True}
 ptv3_shuffle_orders_eval=${PTV3_SHUFFLE_ORDERS_EVAL:-False}
 ptv3_turn_off_bn=${PTV3_TURN_OFF_BN:-True}
 grid_resolution=${GRID_RESOLUTION:-1536}
+
+train_noise_suffix=
+if [[ "${fixed_train_noise}" == "True" ]]; then
+    train_noise_suffix=_fixedtrainnoise${train_noise_seed}
+fi
+lr_warmup_suffix=
+if (( lr_warmup_steps > 0 )); then
+    lr_warmup_suffix=_warmup${lr_warmup_steps}
+fi
 # predictor=${PREDICTOR:-ptv3}
 predictor=${PREDICTOR:-dipt}
 case "${predictor}" in
@@ -79,9 +103,9 @@ ${attribute_init}_\
 ir${input_resolution}_\
 tr${target_resolution}_\
 interpolants_${interpolant_type}_${mix_schedule}_\
-noise${flow_noise_std}_steps${flow_steps}_seed${eval_noise_seed}_\
-grid${grid_resolution}_\
-batch_size${batch_size}_\
+noise${flow_noise_std}_steps${flow_steps}_seed${eval_noise_seed}${train_noise_suffix}_\
+grid${grid_resolution}}_\
+batch_size${batch_size}${lr_warmup_suffix}_\
 ${custom_postfix}${predictor_suffix}
 
 output_root=${OUTPUT_ROOT:-/project2/ricky/experiments/${run_date}/overfit_sr_interpolants_512_dipt}
@@ -154,6 +178,8 @@ CUDA_VISIBLE_DEVICES=${GPU_ID} python overfit-sr-interpolants.py \
     --gin_param="flow_matching.interpolant_type='${interpolant_type}'" \
     --gin_param="flow_matching.loss_rollout_steps=${loss_rollout_steps}" \
     --gin_param="flow_matching.eval_noise_seed=${eval_noise_seed}" \
+    --gin_param="flow_matching.fixed_train_noise=${fixed_train_noise}" \
+    --gin_param="flow_matching.train_noise_seed=${train_noise_seed}" \
     --gin_param="flow_matching.flow_steps=${flow_steps}" \
     --gin_param="flow_matching.flow_noise_std=${flow_noise_std}" \
     --gin_param="flow_matching.loss_type='${flow_loss_type}'" \
@@ -174,6 +200,8 @@ CUDA_VISIBLE_DEVICES=${GPU_ID} python overfit-sr-interpolants.py \
     --gin_param="SplatFactoSRDataset.load_tgt_images=True" \
     --gin_param="training.total_steps=${total_steps}" \
     --gin_param="train2D/build_scheduler.total_step=${total_steps}" \
+    --gin_param="train2D/build_scheduler.warmup_step=${lr_warmup_steps}" \
+    --gin_param="train2D/build_scheduler.warmup_start_factor=${lr_warmup_start_factor}" \
     --gin_param="training.save_interval=${save_interval}" \
     --gin_param="training.eval_interval=${eval_interval}" \
     --gin_param="training.log_image_interval=${log_image_interval}" \

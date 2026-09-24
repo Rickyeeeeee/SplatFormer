@@ -1,0 +1,5 @@
+# Analytic interpolant viewer defaults; compose with a dataset Gin file.
+flow_matching.flow_noise_std = 1.0
+flow_matching.eval_noise_seed = 0
+flow_matching.normalization_variance_floor = 1e-8
+flow_matching.gs_statistics_path = '/project/ricky/splatformer-sr-data-scaled/gs_statistics.json'

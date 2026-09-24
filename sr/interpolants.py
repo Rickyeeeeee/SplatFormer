@@ -76,6 +76,14 @@ def attribute_mse(prediction, target):
     return sum(losses.values()), losses, dict(losses)
 
 
+def seeded_noise_like(reference, seed):
+    """Return deterministic standard Gaussian noise without changing global RNG state."""
+    device = reference["means"].device
+    generator = torch.Generator(device=device).manual_seed(int(seed))
+    return {key: torch.randn(value.shape, device=value.device, dtype=value.dtype, generator=generator)
+            for key, value in reference.items()}
+
+
 def rollout(model, source, scene_idx, steps, mode, source_means, target_means, initial_noise=None, t_eps=1e-4):
     """Return a standardized endpoint without changing model mode or disabling gradients."""
     validate_settings(mode, steps, t_eps)

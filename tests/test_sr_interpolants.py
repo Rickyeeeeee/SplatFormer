@@ -14,6 +14,7 @@ import torch
 
 from sr import interpolants
 from utils.gs_normalization import GaussianStandardizer, STATISTIC_KEYS
+from utils.spatial_coordinates import build_spatial_point_fields
 
 ROOT = Path(__file__).resolve().parents[1]
 SHAPES = {"means": (3,), "scales": (3,), "opacities": (1,), "quats": (4,),
@@ -100,6 +101,41 @@ class InterpolantTests(unittest.TestCase):
         loss, parts, _ = interpolants.attribute_mse(prediction, target)
         self.assertEqual(loss.item(), 6.)
         self.assertTrue(all(part.item() == 1 for part in parts.values()))
+
+    def test_seeded_training_noise_is_fixed_without_changing_global_rng(self):
+        reference = self.normalizer.encode(self.source)
+        rng = torch.get_rng_state().clone()
+        first = interpolants.seeded_noise_like(reference, 7)
+        second = interpolants.seeded_noise_like(reference, 7)
+        third = interpolants.seeded_noise_like(reference, 8)
+        for key in reference:
+            torch.testing.assert_close(first[key], second[key])
+        self.assertFalse(torch.equal(first["means"], third["means"]))
+        self.assertTrue(torch.equal(rng, torch.get_rng_state()))
+
+    def test_microbatch_reuses_precomputed_training_noise(self):
+        namespace = {"torch": torch, "np": np, "flow": self.flow, "interpolants": interpolants,
+                     "SUPPORTED_GS_KEYS": list(STATISTIC_KEYS),
+                     "gpu_utils": SimpleNamespace(move_to_device=lambda value, device: value)}
+        module = load_functions(ROOT / "overfit-sr-interpolants.py", {"compute_microbatch_loss"}, namespace)
+        queries = []
+        class Model(torch.nn.Module):
+            def forward(inner, batch_flow_gs, **kwargs):
+                queries.append({key: value.clone() for key, value in batch_flow_gs[0].items()})
+                return [{key: torch.zeros_like(value) for key, value in batch_flow_gs[0].items()}]
+        target = self.normalizer.encode(self.source)
+        fixed_noise = {key: torch.full_like(value, .5) for key, value in target.items()}
+        scene = {"target_gs": self.source, "target_flow_gs": target, "fixed_train_noise": fixed_noise,
+                 "scene_idx": 0, "render_view_count": 0, "target_images": [], "target_cameras": {}}
+        config = {"flow_t_eps": 1e-4, "flow_noise_std": 1., "loss_type": "velocity",
+                  "interpolant_type": "one_sided", "loss_rollout_steps": 4, "fixed_train_noise": True}
+        with mock.patch.object(torch.Tensor, "uniform_", lambda value, *args: value.fill_(.25)):
+            for _ in range(2):
+                module.compute_microbatch_loss(Model(), [scene], "cpu", config, {"schedule": "fm-only"},
+                                               self.normalizer, 0., 0., None, False)
+        for key in target:
+            torch.testing.assert_close(queries[0][key], queries[1][key])
+            torch.testing.assert_close(queries[0][key], .75 * fixed_noise[key] + .25 * target[key])
 
     def test_euler_uses_scene_references_and_decodes(self):
         calls = []
@@ -271,7 +307,8 @@ class InterpolantTests(unittest.TestCase):
     def test_launcher_forwards_normalization_controls(self):
         env = dict(os.environ, GS_STATISTICS_PATH="/tmp/custom stats.json",
                    NORMALIZATION_VARIANCE_FLOOR="1e-6", FLOW_NOISE_STD="0.7", INTERPOLANT_TYPE="encoding_decoding",
-                   LOSS_ROLLOUT_STEPS="6", EVAL_NOISE_SEED="42")
+                   LOSS_ROLLOUT_STEPS="6", EVAL_NOISE_SEED="42", FLOW_STEPS="10", FIXED_TRAIN_NOISE="True",
+                   TRAIN_NOISE_SEED="9", LR_WARMUP_STEPS="500", LR_WARMUP_START_FACTOR="0.05")
         command = 'python() { printf "%s\\n" "$@"; }; launcher="$1"; shift; source "$launcher"'
         result = subprocess.run(["bash", "-c", command, "test", str(ROOT / "scripts/overfit-sr-interpolants.sh")],
                                 env=env, capture_output=True, text=True, check=True)
@@ -284,6 +321,10 @@ class InterpolantTests(unittest.TestCase):
         self.assertIn("flow_matching.flow_steps=10", result.stdout)
         self.assertIn("flow_matching.loss_rollout_steps=6", result.stdout)
         self.assertIn("flow_matching.eval_noise_seed=42", result.stdout)
+        self.assertIn("flow_matching.fixed_train_noise=True", result.stdout)
+        self.assertIn("flow_matching.train_noise_seed=9", result.stdout)
+        self.assertIn("train2D/build_scheduler.warmup_step=500", result.stdout)
+        self.assertIn("train2D/build_scheduler.warmup_start_factor=0.05", result.stdout)
 
 
 if __name__ == "__main__":
