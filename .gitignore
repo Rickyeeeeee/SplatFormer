@@ -4,6 +4,7 @@ outputs*/
 data/
 *.pth
 outputs_*/
+output_data_augmentation/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

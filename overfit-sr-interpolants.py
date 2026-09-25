@@ -1,4 +1,5 @@
 import json
+import math
 import os
 
 import cv2
@@ -16,6 +17,8 @@ from sr import flow, interpolants
 from utils.gs_normalization import GaussianStandardizer
 from sr.alignment import prepare_alignment
 from utils import gpu_utils, gs_utils, loss_utils
+from utils.data_augmentation import (GAUSSIAN_PARAMETERS, jitter_gaussian_parameters, rotate_camera_to_worlds,
+                                     rotate_gaussians, sample_uniform_rotation_quaternion)
 from utils.gpu_utils import seed_everything
 from utils.gs_utils import make_grid
 from utils.log_utils import ProcessSafeLogger
@@ -85,6 +88,25 @@ def loss_mixing(schedule="linear"):
             f"expected one of {valid_schedules}"
         )
     return {"schedule": schedule}
+
+
+@gin.configurable
+def training_augmentation(random_jitter=False, random_rotate=False, jitter_max_levels=None,
+                          rotation_pivot=(0.5, 0.5, 0.5)):
+    if jitter_max_levels is None:
+        jitter_max_levels = {key: 0.01 for key in GAUSSIAN_PARAMETERS}
+    else:
+        jitter_max_levels = {str(key): float(value) for key, value in jitter_max_levels.items()}
+    unknown = sorted(set(jitter_max_levels) - set(GAUSSIAN_PARAMETERS))
+    if unknown:
+        raise ValueError(f"Unsupported jitter parameters: {unknown}")
+    if any(not math.isfinite(value) or value < 0 for value in jitter_max_levels.values()):
+        raise ValueError("Jitter maximum levels must be finite and non-negative")
+    rotation_pivot = tuple(float(value) for value in rotation_pivot)
+    if len(rotation_pivot) != 3 or any(not math.isfinite(value) for value in rotation_pivot):
+        raise ValueError("rotation_pivot must contain three finite values")
+    return {"random_jitter": bool(random_jitter), "random_rotate": bool(random_rotate),
+            "jitter_max_levels": jitter_max_levels, "rotation_pivot": rotation_pivot}
 
 
 def evaluate_single_scene(
@@ -307,15 +329,17 @@ def prepare_overfit_scene(dataset, scene, output_dir, logger, device, standardiz
 
 
 def compute_microbatch_loss(model, scenes, device, flow_cfg, mix_cfg, standardizer,
-                            image_l1_loss_weight, lpips_loss_weight, lpips_loss_func, enable_amp):
+                            image_l1_loss_weight, lpips_loss_weight, lpips_loss_func, enable_amp,
+                            augmentation_cfg=None, augmentation_generator=None):
     """Return summed sample losses; keep temporary GPU state scoped to one microbatch."""
     is_fm_only = mix_cfg["schedule"] == "fm-only"
     render_enabled = not is_fm_only and (image_l1_loss_weight != 0 or (lpips_loss_weight != 0 and lpips_loss_func is not None))
     mode = flow_cfg["interpolant_type"]
+    augmentation_cfg = augmentation_cfg or {"random_jitter": False, "random_rotate": False}
+    if augmentation_cfg["random_jitter"] and mode == "one_sided":
+        raise ValueError("Random source jitter is incompatible with one_sided interpolation")
     samples = []
     for active in scenes:
-        source = None if mode == "one_sided" else gpu_utils.move_to_device(active["source_flow_gs"], device)
-        target = gpu_utils.move_to_device(active["target_flow_gs"], device)
         t = torch.empty(1, device=device).uniform_(float(flow_cfg["flow_t_eps"]), 1.0 - float(flow_cfg["flow_t_eps"]))
         train_images, train_cameras = None, None
         if render_enabled:
@@ -324,14 +348,43 @@ def compute_microbatch_loss(model, scenes, device, flow_cfg, mix_cfg, standardiz
             train_cameras = dict(active["target_cameras"])
             train_cameras["camera_to_worlds"] = train_cameras["camera_to_worlds"][camera_indices]
             train_cameras = gpu_utils.move_to_device(train_cameras, device)
-        source_means = None if mode == "one_sided" else active["source_gs"]["means"].to(device)
-        target_means = active["target_gs"]["means"].to(device)
+
+        augment = augmentation_cfg["random_jitter"] or augmentation_cfg["random_rotate"]
+        jitter_levels = {}
+        if augment:
+            source_gs = None if mode == "one_sided" else gpu_utils.move_to_device(active["source_gs"], device)
+            target_gs = gpu_utils.move_to_device(active["target_gs"], device)
+            if augmentation_cfg["random_rotate"]:
+                rotation = sample_uniform_rotation_quaternion(
+                    target_gs["means"].dtype, target_gs["means"].device, augmentation_generator
+                )
+                pivot = augmentation_cfg["rotation_pivot"]
+                if source_gs is not None:
+                    source_gs = rotate_gaussians(source_gs, rotation, pivot)
+                target_gs = rotate_gaussians(target_gs, rotation, pivot)
+                if train_cameras is not None:
+                    train_cameras["camera_to_worlds"] = rotate_camera_to_worlds(
+                        train_cameras["camera_to_worlds"], rotation, pivot
+                    )
+            if augmentation_cfg["random_jitter"]:
+                source_gs, jitter_levels = jitter_gaussian_parameters(
+                    source_gs, augmentation_cfg["jitter_max_levels"], augmentation_generator
+                )
+            source = None if source_gs is None else standardizer.encode(source_gs)
+            target = standardizer.encode(target_gs)
+            source_means = None if source_gs is None else source_gs["means"]
+            target_means = target_gs["means"]
+        else:
+            source = None if mode == "one_sided" else gpu_utils.move_to_device(active["source_flow_gs"], device)
+            target = gpu_utils.move_to_device(active["target_flow_gs"], device)
+            source_means = None if mode == "one_sided" else active["source_gs"]["means"].to(device)
+            target_means = active["target_gs"]["means"].to(device)
         noise = gpu_utils.move_to_device(active["fixed_train_noise"], device) if flow_cfg.get("fixed_train_noise", False) else None
         path = interpolants.construct_path(source, target, t, mode, source_means, target_means,
                                            float(flow_cfg["flow_noise_std"]), noise=noise)
         samples.append({**path, "source": source, "target": target, "t": t,
                         "source_means": source_means, "target_means": target_means, "scene_idx": active["scene_idx"],
-                        "images": train_images, "cameras": train_cameras})
+                        "images": train_images, "cameras": train_cameras, "jitter_levels": jitter_levels})
 
     summed_loss = None
     statistics = {}
@@ -390,6 +443,7 @@ def compute_microbatch_loss(model, scenes, device, flow_cfg, mix_cfg, standardiz
             }
             values.update({f"{key}_loss": value for key, value in attr_losses.items()})
             values.update({f"{key}_weighted": value for key, value in weighted_attr_losses.items()})
+            values.update({f"jitter_{key}_level": value for key, value in sample["jitter_levels"].items()})
             for key, value in values.items():
                 scalar = value.detach().item() if torch.is_tensor(value) else float(value)
                 statistics[key] = statistics.get(key, 0.0) + scalar
@@ -419,6 +473,9 @@ def training(
     if not (0.0 < float(flow_cfg["flow_t_eps"]) < 0.5):
         raise ValueError(f"flow_t_eps must be in (0, 0.5), got {flow_cfg['flow_t_eps']}")
     mix_cfg = loss_mixing()
+    augmentation_cfg = training_augmentation()
+    if augmentation_cfg["random_jitter"] and flow_cfg["interpolant_type"] == "one_sided":
+        raise ValueError("Random source jitter is incompatible with one_sided interpolation")
     # Load fixed target statistics before scene preparation or rendering.
     standardizer = GaussianStandardizer(flow_cfg["gs_statistics_path"], flow_cfg["normalization_variance_floor"])
     os.makedirs(output_dir, exist_ok=True)
@@ -514,6 +571,8 @@ def training(
     scaler = torch.cuda.amp.GradScaler(enabled=enable_amp)
     lpips_loss_func = loss_utils.lpips_loss_fn() if not is_fm_only and lpips_loss_weight > 0 else None
     scene_order = []
+    augmentation_generator = torch.Generator(device=device).manual_seed(torch.initial_seed())
+    logger.info(f"Training augmentation config: {augmentation_cfg}")
 
     optimizer.zero_grad(set_to_none=True)
     pbar = tqdm(range(resume_from_step, total_steps))
@@ -540,7 +599,7 @@ def training(
             microbatch_loss, statistics = compute_microbatch_loss(
                 model, batch_scenes[offset:offset + microbatch_size], device, flow_cfg, mix_cfg,
                 standardizer, image_l1_loss_weight, lpips_loss_weight,
-                lpips_loss_func, enable_amp,
+                lpips_loss_func, enable_amp, augmentation_cfg, augmentation_generator,
             )
             microbatch_loss = microbatch_loss / batch_size
             if enable_amp:

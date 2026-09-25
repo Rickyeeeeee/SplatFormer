@@ -15,16 +15,12 @@ scene_count=${SCENE_COUNT:-1}
 batch_size=${BATCH_SIZE:-16}
 grad_accum_steps=${GRAD_ACCUM_STEPS:-1}
 scene_name=${SCENE_NAME:-3e288ee8aced4a0797e66d53536112b1}
-total_steps=${1:-10000}
-lr_warmup_steps=${LR_WARMUP_STEPS:-0}
+lr_warmup_steps=${LR_WARMUP_STEPS:-500}
 lr_warmup_start_factor=${LR_WARMUP_START_FACTOR:-0.03333333333333333}
-if [[ ! "${lr_warmup_steps}" =~ ^[0-9]+$ ]] || (( lr_warmup_steps >= total_steps )); then
-    echo "LR_WARMUP_STEPS must be a nonnegative integer smaller than total_steps" >&2
-    exit 2
-fi
-save_interval=${2:-10000}
-eval_interval=${3:-1000}
-log_image_interval=${4:-1000}
+total_steps=${1:-4000}
+save_interval=${2:-4000}
+eval_interval=${3:-500}
+log_image_interval=${4:-500}
 alignment=${5:-fit_lr_to_hr}
 attribute_init=${6:-aligned}
 input_resolution=${7:-32}
@@ -59,6 +55,17 @@ ptv3_shuffle_orders=${PTV3_SHUFFLE_ORDERS:-True}
 ptv3_shuffle_orders_eval=${PTV3_SHUFFLE_ORDERS_EVAL:-False}
 ptv3_turn_off_bn=${PTV3_TURN_OFF_BN:-True}
 grid_resolution=${GRID_RESOLUTION:-1536}
+random_jitter=${RANDOM_JITTER:-False}
+random_rotate=${RANDOM_ROTATE:-False}
+jitter_max_levels=${JITTER_MAX_LEVELS:-}
+case "${random_jitter}" in
+    True|False) ;;
+    *) echo "RANDOM_JITTER must be True or False" >&2; exit 2 ;;
+esac
+case "${random_rotate}" in
+    True|False) ;;
+    *) echo "RANDOM_ROTATE must be True or False" >&2; exit 2 ;;
+esac
 
 train_noise_suffix=
 if [[ "${fixed_train_noise}" == "True" ]]; then
@@ -162,6 +169,13 @@ if [[ "${predictor}" == "ptv3" ]]; then
     )
 fi
 network_gin_args+=("--gin_param=${predictor_class}.grid_resolution=${grid_resolution}")
+augmentation_gin_args=(
+    "--gin_param=training_augmentation.random_jitter=${random_jitter}"
+    "--gin_param=training_augmentation.random_rotate=${random_rotate}"
+)
+if [[ -n "${jitter_max_levels}" ]]; then
+    augmentation_gin_args+=("--gin_param=training_augmentation.jitter_max_levels=${jitter_max_levels}")
+fi
 
 CUDA_VISIBLE_DEVICES=${GPU_ID} python overfit-sr-interpolants.py \
     --output_dir="${output_dir}" \
@@ -208,4 +222,5 @@ CUDA_VISIBLE_DEVICES=${GPU_ID} python overfit-sr-interpolants.py \
     --gin_param="training.image_l1_loss_weight=${image_l1_loss_weight}" \
     --gin_param="training.lpips_loss_weight=${lpips_loss_weight}" \
     --gin_param="loss_mixing.schedule='${mix_schedule}'" \
+    "${augmentation_gin_args[@]}" \
     "${network_gin_args[@]}"
