@@ -11,8 +11,23 @@ STATISTIC_KEYS = {
 }
 
 
+QUATERNION_REPRESENTATIONS = ("raw_standardized", "unit_unstandardized")
+
+
+def normalize_gaussian_quaternions(endpoint):
+    """Return unit quaternion endpoints without modifying the input dictionary."""
+    quats = endpoint["quats"].float()
+    norms = torch.linalg.vector_norm(quats, dim=-1, keepdim=True)
+    if not torch.isfinite(quats).all() or not torch.isfinite(norms).all() or (norms == 0).any():
+        raise ValueError("Quaternion endpoints must be finite and non-zero")
+    return {**endpoint, "quats": quats / norms}
+
+
 class GaussianStandardizer:
-    def __init__(self, path, variance_floor=1e-8):
+    def __init__(self, path, variance_floor=1e-8, quaternion_representation="raw_standardized"):
+        if quaternion_representation not in QUATERNION_REPRESENTATIONS:
+            raise ValueError(f"Unsupported quaternion_representation={quaternion_representation!r}")
+        self.quaternion_representation = quaternion_representation
         if not math.isfinite(variance_floor) or variance_floor <= 0:
             raise ValueError("normalization_variance_floor must be finite and positive")
         self.path = str(path)
@@ -47,22 +62,51 @@ class GaussianStandardizer:
             self.means[key], self.variances[key] = mean, variance
             self.stds[key] = variance.clamp_min(variance_floor).sqrt()
 
+    def prepare_endpoints(self, source, target=None, align_target_sign=True):
+        """Normalize physical endpoints only; preserve source signs and caller tensors."""
+        if self.quaternion_representation == "raw_standardized":
+            return source, target
+        prepared = []
+        for endpoint in (source, target):
+            if endpoint is None:
+                prepared.append(None)
+                continue
+            prepared.append(normalize_gaussian_quaternions(endpoint))
+        source, target = prepared
+        if align_target_sign and source is not None and target is not None:
+            if source["quats"].shape != target["quats"].shape:
+                raise ValueError("Quaternion sign alignment requires paired endpoint shapes")
+            flip = (source["quats"] * target["quats"]).sum(dim=-1, keepdim=True) < 0
+            target["quats"] = torch.where(flip, -target["quats"], target["quats"])
+        return source, target
+
     def encode(self, gaussians):
         result = {}
         for key in STATISTIC_KEYS:
             value = gaussians[key].float()
             if tuple(value.shape[1:]) != tuple(self.means[key].shape):
                 raise ValueError(f"Statistics shape for {key} does not match Gaussian channels {tuple(value.shape[1:])}")
+            if key == "quats" and self.quaternion_representation == "unit_unstandardized":
+                result[key] = value
+                continue
             result[key] = (value - self.means[key].to(value.device)) / self.stds[key].to(value.device)
         return result
 
     def decode(self, gaussians):
-        return {key: value.float() * self.stds[key].to(value.device) + self.means[key].to(value.device)
+        return {key: (value.float() if key == "quats" and self.quaternion_representation == "unit_unstandardized"
+                      else value.float() * self.stds[key].to(value.device) + self.means[key].to(value.device))
                 for key, value in gaussians.items() if key in STATISTIC_KEYS}
 
     def report(self):
+        attributes = {}
+        for key in STATISTIC_KEYS:
+            bypass = key == "quats" and self.quaternion_representation == "unit_unstandardized"
+            effective_mean = torch.zeros_like(self.means[key]) if bypass else self.means[key]
+            effective_scale = torch.ones_like(self.stds[key]) if bypass else self.stds[key]
+            effective_variance = torch.ones_like(self.variances[key]) if bypass else self.variances[key].clamp_min(self.variance_floor)
+            attributes[key] = {"mean": self.means[key].tolist(), "variance": self.variances[key].tolist(),
+                               "effective_mean": effective_mean.tolist(), "effective_scale": effective_scale.tolist(),
+                               "effective_variance": effective_variance.tolist()}
         return {"source_path": self.path, "statistics_group": "aggregate.normalized.output",
-                "variance_floor": self.variance_floor,
-                "attributes": {key: {"mean": self.means[key].tolist(), "variance": self.variances[key].tolist(),
-                                     "effective_variance": self.variances[key].clamp_min(self.variance_floor).tolist()}
-                               for key in STATISTIC_KEYS}}
+                "variance_floor": self.variance_floor, "quaternion_representation": self.quaternion_representation,
+                "attributes": attributes}

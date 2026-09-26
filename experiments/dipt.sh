@@ -1,4 +1,5 @@
-GPU_ID=${GPU_ID:-3}
+export GPU_ID=${GPU_ID:-3}
+export QUATERNION_REPRESENTATION=${QUATERNION_REPRESENTATION:-unit_unstandardized}
 
 
 # FIXED_TRAIN_NOISE=True \
@@ -28,71 +29,94 @@ GPU_ID=${GPU_ID:-3}
 # bash scripts/overfit-sr-interpolants.sh
 
 # 0925 jitter
-INTERPOLANT_TYPE=linear \
-RANDOM_JITTER=True \
-JITTER_MAX_LEVELS="{
-  'means': 0.01,
-  'scales': 0.0,
-  'opacities': 0.0,
-  'quats': 0.0,
-  'features_dc': 0.0,
-  'features_rest': 0.0
-}" \
-CUSTOM_POSFIX=jmeans
-bash scripts/overfit-sr-interpolants.sh
+# INTERPOLANT_TYPE=linear \
+# RANDOM_JITTER=True \
+# JITTER_MAX_LEVELS="{
+#   'means': 0.01,
+#   'scales': 0.0,
+#   'opacities': 0.0,
+#   'quats': 0.0,
+#   'features_dc': 0.0,
+#   'features_rest': 0.0
+# }" \
+# CUSTOM_POSFIX=jmeans \
+# bash scripts/overfit-sr-interpolants.sh
 
-INTERPOLANT_TYPE=linear \
-RANDOM_JITTER=True \
-JITTER_MAX_LEVELS="{
-  'means': 0.0,
-  'scales': 0.05,
-  'opacities': 0.0,
-  'quats': 0.0,
-  'features_dc': 0.0,
-  'features_rest': 0.0
-}" \
-CUSTOM_POSFIX=jscales
-bash scripts/overfit-sr-interpolants.sh
+# INTERPOLANT_TYPE=linear \
+# RANDOM_JITTER=True \
+# JITTER_MAX_LEVELS="{
+#   'means': 0.0,
+#   'scales': 0.05,
+#   'opacities': 0.0,
+#   'quats': 0.0,
+#   'features_dc': 0.0,
+#   'features_rest': 0.0
+# }" \
+# CUSTOM_POSFIX=jscales \
+# bash scripts/overfit-sr-interpolants.sh
 
-INTERPOLANT_TYPE=linear \
-RANDOM_JITTER=True \
-JITTER_MAX_LEVELS="{
-  'means': 0.0,
-  'scales': 0.0,
-  'opacities': 0.1,
-  'quats': 0.0,
-  'features_dc': 0.0,
-  'features_rest': 0.0
-}" \
-CUSTOM_POSFIX=jopacities
-bash scripts/overfit-sr-interpolants.sh
+# INTERPOLANT_TYPE=linear \
+# RANDOM_JITTER=True \
+# JITTER_MAX_LEVELS="{
+#   'means': 0.0,
+#   'scales': 0.0,
+#   'opacities': 0.1,
+#   'quats': 0.0,
+#   'features_dc': 0.0,
+#   'features_rest': 0.0
+# }" \
+# CUSTOM_POSFIX=jopacities
+# bash scripts/overfit-sr-interpolants.sh
 
-INTERPOLANT_TYPE=linear \
-RANDOM_JITTER=True \
-JITTER_MAX_LEVELS="{
-  'means': 0.0,
-  'scales': 0.0,
-  'opacities': 0.0,
-  'quats': 0.05,
-  'features_dc': 0.0,
-  'features_rest': 0.0
-}" \
-CUSTOM_POSFIX=jquats
-bash scripts/overfit-sr-interpolants.sh
+# INTERPOLANT_TYPE=linear \
+# RANDOM_JITTER=True \
+# JITTER_MAX_LEVELS="{
+#   'means': 0.0,
+#   'scales': 0.0,
+#   'opacities': 0.0,
+#   'quats': 0.05,
+#   'features_dc': 0.0,
+#   'features_rest': 0.0
+# }" \
+# CUSTOM_POSFIX=jquats
+# bash scripts/overfit-sr-interpolants.sh
 
-INTERPOLANT_TYPE=linear \
-RANDOM_JITTER=True \
-JITTER_MAX_LEVELS="{
-  'means': 0.01,
-  'scales': 0.05,
-  'opacities': 0.1,
-  'quats': 0.05,
-  'features_dc': 0.05,
-  'features_rest': 0.1
-}" \
-CUSTOM_POSFIX=jall
-bash scripts/overfit-sr-interpolants.sh
+# INTERPOLANT_TYPE=linear \
+# RANDOM_ROTATE=True \
+# CUSTOM_POSFIX=rot \
+# bash scripts/overfit-sr-interpolants.sh
 
 INTERPOLANT_TYPE=linear \
 RANDOM_ROTATE=True \
+ROTATION_MODE=gravity_consistent \
+CUSTOM_POSFIX=rot \
 bash scripts/overfit-sr-interpolants.sh
+
+# INTERPOLANT_TYPE=linear \
+# RANDOM_JITTER=True \
+# JITTER_MAX_LEVELS="{
+#   'means': 0.01,
+#   'scales': 0.05,
+#   'opacities': 0.1,
+#   'quats': 0.05,
+#   'features_dc': 0.05,
+#   'features_rest': 0.1
+# }" \
+# CUSTOM_POSFIX=jall \
+# bash scripts/overfit-sr-interpolants.sh
+
+
+# INTERPOLANT_TYPE=linear \
+# RANDOM_JITTER=True \
+# RANDOM_ROTATE=True \
+# ROTATION_MODE=gravity_consistent \
+# JITTER_MAX_LEVELS="{
+#   'means': 0.01,
+#   'scales': 0.05,
+#   'opacities': 0.1,
+#   'quats': 0.05,
+#   'features_dc': 0.05,
+#   'features_rest': 0.1
+# }" \
+# CUSTOM_POSFIX=jall_rot \
+# bash scripts/overfit-sr-interpolants.sh

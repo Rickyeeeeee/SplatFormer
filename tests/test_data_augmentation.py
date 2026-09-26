@@ -19,6 +19,7 @@ from utils.data_augmentation import (
     rotate_camera_to_worlds,
     rotate_gaussians,
     sample_uniform_rotation_quaternion,
+    sample_uniform_z_rotation_quaternion,
 )
 
 
@@ -153,6 +154,22 @@ class DataAugmentationTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(first).all())
         torch.testing.assert_close(first, second)
         torch.testing.assert_close(torch.linalg.vector_norm(first), torch.tensor(1.0, dtype=torch.float64))
+
+    def test_uniform_z_rotation_sampler_is_seeded_and_preserves_up(self):
+        generator = torch.Generator().manual_seed(29)
+        global_state = torch.get_rng_state().clone()
+        first = sample_uniform_z_rotation_quaternion(torch.float64, "cpu", generator)
+        second = sample_uniform_z_rotation_quaternion(torch.float64, "cpu", torch.Generator().manual_seed(29))
+        half_angle = math.pi * torch.rand((), dtype=torch.float64, generator=torch.Generator().manual_seed(29))
+        expected = torch.stack((half_angle.cos(), torch.zeros(()), torch.zeros(()), half_angle.sin()))
+        self.assertEqual(first.shape, (4,))
+        self.assertTrue(torch.isfinite(first).all())
+        self.assertTrue(torch.equal(global_state, torch.get_rng_state()))
+        torch.testing.assert_close(first, second)
+        torch.testing.assert_close(first, expected)
+        torch.testing.assert_close(torch.linalg.vector_norm(first), torch.tensor(1.0, dtype=torch.float64))
+        up = torch.tensor((0.0, 0.0, 1.0), dtype=torch.float64)
+        torch.testing.assert_close(_quaternion_to_rotation_matrix(first) @ up, up, atol=1e-12, rtol=0)
 
     def test_invalid_parameter_and_sh_degree_are_rejected(self):
         with self.assertRaises(ValueError):

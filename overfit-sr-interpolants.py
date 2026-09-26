@@ -14,11 +14,12 @@ from models.diffusion_gaussian_predictor import DiffusionGaussianPredictor
 from models.feature_flow_predictor import GSFlowPredictor
 from models.feature_predictor import FeaturePredictor  # Registers legacy Gin keys.
 from sr import flow, interpolants
-from utils.gs_normalization import GaussianStandardizer
+from utils.gs_normalization import GaussianStandardizer, QUATERNION_REPRESENTATIONS
 from sr.alignment import prepare_alignment
 from utils import gpu_utils, gs_utils, loss_utils
 from utils.data_augmentation import (GAUSSIAN_PARAMETERS, jitter_gaussian_parameters, rotate_camera_to_worlds,
-                                     rotate_gaussians, sample_uniform_rotation_quaternion)
+                                     rotate_gaussians, sample_uniform_rotation_quaternion,
+                                     sample_uniform_z_rotation_quaternion)
 from utils.gpu_utils import seed_everything
 from utils.gs_utils import make_grid
 from utils.log_utils import ProcessSafeLogger
@@ -52,7 +53,7 @@ flags.DEFINE_multi_string("gin_param", "", "Newline separated list of Gin parame
 
 FLAGS = flags.FLAGS
 PREDICTORS = {"ptv3": GSFlowPredictor, "dipt": DiffusionGaussianPredictor}
-EVAL_FLOW_STEPS = [50]
+EVAL_FLOW_STEPS = [1, 5, 10]
 MEANS_LOSS_REDUCTION = "mean"  # Set to "sum" to match PUFM-style summed point loss.
 
 
@@ -66,8 +67,10 @@ def set_seed(seed):
 def flow_matching(flow_steps=10, flow_noise_std=1.0, flow_t_eps=1e-4, loss_type="velocity",
                   interpolant_type="linear", loss_rollout_steps=10, eval_noise_seed=0,
                   fixed_train_noise=False, train_noise_seed=0,
-                  normalization_variance_floor=1e-8,
+                  normalization_variance_floor=1e-8, quaternion_representation="raw_standardized",
                   gs_statistics_path="/project/ricky/splatformer-sr-data-scaled/gs_statistics.json"):
+    if quaternion_representation not in QUATERNION_REPRESENTATIONS:
+        raise ValueError(f"Unsupported quaternion_representation={quaternion_representation!r}")
     if loss_type not in ("velocity", "x1"):
         raise ValueError(f"Unsupported flow_matching.loss_type={loss_type!r}")
     interpolants.validate_settings(interpolant_type, flow_steps, flow_t_eps)
@@ -76,7 +79,7 @@ def flow_matching(flow_steps=10, flow_noise_std=1.0, flow_t_eps=1e-4, loss_type=
             "eval_noise_seed": eval_noise_seed, "fixed_train_noise": fixed_train_noise,
             "train_noise_seed": train_noise_seed, "flow_steps": flow_steps, "flow_noise_std": flow_noise_std, "flow_t_eps": flow_t_eps,
             "loss_type": loss_type, "normalization_variance_floor": normalization_variance_floor,
-            "gs_statistics_path": gs_statistics_path}
+            "gs_statistics_path": gs_statistics_path, "quaternion_representation": quaternion_representation}
 
 
 @gin.configurable
@@ -92,7 +95,9 @@ def loss_mixing(schedule="linear"):
 
 @gin.configurable
 def training_augmentation(random_jitter=False, random_rotate=False, jitter_max_levels=None,
-                          rotation_pivot=(0.5, 0.5, 0.5)):
+                          rotation_pivot=(0.5, 0.5, 0.5), rotation_mode="full"):
+    if rotation_mode not in ("full", "gravity_consistent"):
+        raise ValueError("rotation_mode must be 'full' or 'gravity_consistent'")
     if jitter_max_levels is None:
         jitter_max_levels = {key: 0.01 for key in GAUSSIAN_PARAMETERS}
     else:
@@ -106,7 +111,8 @@ def training_augmentation(random_jitter=False, random_rotate=False, jitter_max_l
     if len(rotation_pivot) != 3 or any(not math.isfinite(value) for value in rotation_pivot):
         raise ValueError("rotation_pivot must contain three finite values")
     return {"random_jitter": bool(random_jitter), "random_rotate": bool(random_rotate),
-            "jitter_max_levels": jitter_max_levels, "rotation_pivot": rotation_pivot}
+            "jitter_max_levels": jitter_max_levels, "rotation_pivot": rotation_pivot,
+            "rotation_mode": rotation_mode}
 
 
 def evaluate_single_scene(
@@ -242,7 +248,7 @@ def evaluate_single_scene(
     return metrics, metrics_input
 
 
-def prepare_overfit_scene(dataset, scene, output_dir, logger, device, standardizer):
+def prepare_overfit_scene(dataset, scene, output_dir, logger, device, standardizer, interpolant_type="linear"):
     """Prepare fixed alignment and normalization once for a scene."""
     os.makedirs(output_dir, exist_ok=True)
     input_resolution = dataset.src_resolution
@@ -290,7 +296,8 @@ def prepare_overfit_scene(dataset, scene, output_dir, logger, device, standardiz
             target_resolution=target_resolution,
         )
 
-    loss_target_gs = matching_target_gs
+    # Prepare matched endpoints before caching flow states or applying augmentation.
+    source_gs, loss_target_gs = standardizer.prepare_endpoints(source_gs, matching_target_gs, align_target_sign=interpolant_type != "one_sided")
     source_flow_gs = standardizer.encode(source_gs)
     target_flow_gs = standardizer.encode(loss_target_gs)
     logger.info(
@@ -355,9 +362,10 @@ def compute_microbatch_loss(model, scenes, device, flow_cfg, mix_cfg, standardiz
             source_gs = None if mode == "one_sided" else gpu_utils.move_to_device(active["source_gs"], device)
             target_gs = gpu_utils.move_to_device(active["target_gs"], device)
             if augmentation_cfg["random_rotate"]:
-                rotation = sample_uniform_rotation_quaternion(
-                    target_gs["means"].dtype, target_gs["means"].device, augmentation_generator
-                )
+                sampler = (sample_uniform_z_rotation_quaternion
+                           if augmentation_cfg.get("rotation_mode", "full") == "gravity_consistent"
+                           else sample_uniform_rotation_quaternion)
+                rotation = sampler(target_gs["means"].dtype, target_gs["means"].device, augmentation_generator)
                 pivot = augmentation_cfg["rotation_pivot"]
                 if source_gs is not None:
                     source_gs = rotate_gaussians(source_gs, rotation, pivot)
@@ -477,7 +485,7 @@ def training(
     if augmentation_cfg["random_jitter"] and flow_cfg["interpolant_type"] == "one_sided":
         raise ValueError("Random source jitter is incompatible with one_sided interpolation")
     # Load fixed target statistics before scene preparation or rendering.
-    standardizer = GaussianStandardizer(flow_cfg["gs_statistics_path"], flow_cfg["normalization_variance_floor"])
+    standardizer = GaussianStandardizer(flow_cfg["gs_statistics_path"], flow_cfg["normalization_variance_floor"], flow_cfg["quaternion_representation"])
     os.makedirs(output_dir, exist_ok=True)
     with open(os.path.join(output_dir, "normalization_statistics.json"), "w") as handle:
         json.dump(standardizer.report(), handle, indent=2)
@@ -493,7 +501,7 @@ def training(
         scene_dir = os.path.join(output_dir, "scenes", scene_name) if many else output_dir
         try:
             scene = dataset.load_scene(scene_idx, fit_alignment=FLAGS.alignment)
-            prepared = prepare_overfit_scene(dataset, scene, scene_dir, logger, device, standardizer)
+            prepared = prepare_overfit_scene(dataset, scene, scene_dir, logger, device, standardizer, flow_cfg["interpolant_type"])
         except Exception as error:
             raise RuntimeError(f"Failed to prepare scene {scene_name!r} (index {scene_idx})") from error
         view_count = len(prepared["target_images"])
@@ -702,7 +710,8 @@ def training(
                     )
                     scene_metrics[scene_name] = metrics
                     input_metrics[scene_name] = metrics_input
-                    message = f"{eval_label} scene={scene_name} flow_steps={eval_flow_steps}: {metrics}"
+                    formatted_metrics = {key: f"{value:.3f}" for key, value in metrics.items()}
+                    message = f"{eval_label} scene={scene_name} flow_steps={eval_flow_steps}: {formatted_metrics}"
                     logger.info(message)
                     print(message)
                     if FLAGS.compare_with_input:

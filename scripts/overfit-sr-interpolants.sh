@@ -48,6 +48,13 @@ flow_noise_std=${12:-${FLOW_NOISE_STD:-1.0}}
 image_l1_loss_weight=${13:-${IMAGE_L1_LOSS_WEIGHT:-1.0}}
 lpips_loss_weight=${14:-${LPIPS_LOSS_WEIGHT:-1.0}}
 normalization_variance_floor=${NORMALIZATION_VARIANCE_FLOOR:-1e-8}
+quaternion_representation=${QUATERNION_REPRESENTATION:-raw_standardized}
+quaternion_suffix=
+case "${quaternion_representation}" in
+    raw_standardized) ;;
+    unit_unstandardized) quaternion_suffix=_unit_unstandardized ;;
+    *) echo "Unsupported QUATERNION_REPRESENTATION: ${quaternion_representation}" >&2; exit 2 ;;
+esac
 gs_statistics_path=${GS_STATISTICS_PATH:-${DATASET_ROOT}/gs_statistics.json}
 flow_t_eps=${FLOW_T_EPS:-1e-4}
 ptv3_drop_path=${PTV3_DROP_PATH:-0.0}
@@ -57,6 +64,7 @@ ptv3_turn_off_bn=${PTV3_TURN_OFF_BN:-True}
 grid_resolution=${GRID_RESOLUTION:-1536}
 random_jitter=${RANDOM_JITTER:-False}
 random_rotate=${RANDOM_ROTATE:-False}
+rotation_mode=${ROTATION_MODE:-full}
 jitter_max_levels=${JITTER_MAX_LEVELS:-}
 case "${random_jitter}" in
     True|False) ;;
@@ -65,6 +73,10 @@ esac
 case "${random_rotate}" in
     True|False) ;;
     *) echo "RANDOM_ROTATE must be True or False" >&2; exit 2 ;;
+esac
+case "${rotation_mode}" in
+    full|gravity_consistent) ;;
+    *) echo "ROTATION_MODE must be full or gravity_consistent" >&2; exit 2 ;;
 esac
 
 train_noise_suffix=
@@ -104,6 +116,18 @@ if [[ "${scene_mode}" == "many" ]]; then
     scene_label=many_${scene_count}
 fi
 
+augmentation_suffix=
+if [[ "${random_jitter}" == "True" ]]; then
+    augmentation_suffix+=_jitter
+fi
+if [[ "${random_rotate}" == "True" ]]; then
+    if [[ "${rotation_mode}" == "gravity_consistent" ]]; then
+        augmentation_suffix+=_gravity_rotate
+    else
+        augmentation_suffix+=_rotate
+    fi
+fi
+
 out_name=${scene_label}_\
 ${alignment}_\
 ${attribute_init}_\
@@ -112,8 +136,8 @@ tr${target_resolution}_\
 interpolants_${interpolant_type}_${mix_schedule}_\
 noise${flow_noise_std}_steps${flow_steps}_seed${eval_noise_seed}${train_noise_suffix}_\
 grid${grid_resolution}}_\
-batch_size${batch_size}${lr_warmup_suffix}_\
-${custom_postfix}${predictor_suffix}
+batch_size${batch_size}${lr_warmup_suffix}${augmentation_suffix}_\
+${custom_postfix}${predictor_suffix}${quaternion_suffix}
 
 output_root=${OUTPUT_ROOT:-/project2/ricky/experiments/${run_date}/overfit_sr_interpolants_512_dipt}
 output_dir=${OUTPUT_DIR:-${output_root}/${out_name}}
@@ -172,6 +196,7 @@ network_gin_args+=("--gin_param=${predictor_class}.grid_resolution=${grid_resolu
 augmentation_gin_args=(
     "--gin_param=training_augmentation.random_jitter=${random_jitter}"
     "--gin_param=training_augmentation.random_rotate=${random_rotate}"
+    "--gin_param=training_augmentation.rotation_mode='${rotation_mode}'"
 )
 if [[ -n "${jitter_max_levels}" ]]; then
     augmentation_gin_args+=("--gin_param=training_augmentation.jitter_max_levels=${jitter_max_levels}")
@@ -187,6 +212,7 @@ CUDA_VISIBLE_DEVICES=${GPU_ID} python overfit-sr-interpolants.py \
     --grad_accum_steps="${grad_accum_steps}" \
     --alignment="${alignment}" \
     --attribute_init="${attribute_init}" \
+    --gin_param="flow_matching.quaternion_representation='${quaternion_representation}'" \
     --gin_param="flow_matching.normalization_variance_floor=${normalization_variance_floor}" \
     --gin_param="flow_matching.gs_statistics_path='${gs_statistics_path}'" \
     --gin_param="flow_matching.interpolant_type='${interpolant_type}'" \

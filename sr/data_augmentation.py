@@ -1,6 +1,7 @@
 """Measure the rendering impact of Gaussian parameter augmentations."""
 
 import argparse
+import ast
 import json
 import math
 from pathlib import Path
@@ -11,10 +12,15 @@ import torch
 from utils.data_augmentation import (
     GAUSSIAN_PARAMETERS,
     jitter_gaussian_parameter,
+    jitter_gaussian_parameters,
+    rotate_camera_to_worlds,
+    sample_uniform_z_rotation_quaternion,
     quaternion_inverse,
     rotate_gaussians,
     sample_uniform_rotation_quaternion,
 )
+
+from utils.gs_normalization import normalize_gaussian_quaternions
 
 
 def parse_args(argv=None):
@@ -32,7 +38,29 @@ def parse_args(argv=None):
     parser.add_argument("--preview_views", type=int, default=4, help="Number of views in each preview; 0 disables previews.")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--output_dir", type=Path, default=Path("output_data_augmentation"))
+    parser.add_argument("--mode", choices=("sweep", "configured"), default="sweep")
+    parser.add_argument("--random_jitter", choices=("True", "False"), default="False")
+    parser.add_argument("--random_rotate", choices=("True", "False"), default="False")
+    parser.add_argument("--rotation_mode", choices=("full", "gravity_consistent"), default="full")
+    parser.add_argument("--rotation_pivot", type=float, nargs=3, default=None)
+    parser.add_argument("--jitter_max_levels", default=None, help="Python dictionary of per-attribute maximum jitter levels.")
+    parser.add_argument("--mae_threshold", type=float, default=1e-5)
+    parser.add_argument("--max_error_threshold", type=float, default=1e-2)
     args = parser.parse_args(argv)
+    args.random_jitter = args.random_jitter == "True"
+    args.random_rotate = args.random_rotate == "True"
+    args.rotation_pivot = args.pivot if args.rotation_pivot is None else args.rotation_pivot
+    try:
+        levels = ast.literal_eval(args.jitter_max_levels) if args.jitter_max_levels is not None else dict.fromkeys(GAUSSIAN_PARAMETERS, .01)
+        args.jitter_max_levels = {str(key): float(value) for key, value in levels.items()}
+    except (ValueError, SyntaxError, TypeError, AttributeError):
+        parser.error("--jitter_max_levels must be a dictionary of finite non-negative numbers")
+    if set(args.jitter_max_levels) - set(GAUSSIAN_PARAMETERS) or any(not math.isfinite(v) or v < 0 for v in args.jitter_max_levels.values()):
+        parser.error("Invalid jitter parameters or levels")
+    if any(not math.isfinite(v) for v in args.rotation_pivot):
+        parser.error("--rotation_pivot must contain finite values")
+    if any(not math.isfinite(v) or v < 0 for v in (args.mae_threshold, args.max_error_threshold)):
+        parser.error("Invariance thresholds must be finite and non-negative")
     if args.trials < 1:
         parser.error("--trials must be at least 1")
     if any(not math.isfinite(level) or level < 0 for level in args.jitter_levels):
@@ -179,14 +207,14 @@ def _load_experiment(args):
         gin.bind_parameter(f"{args.dataset_scope}/SplatFactoSRDataset.load_tgt_images", True)
         gin.bind_parameter(f"{args.dataset_scope}/SplatFactoSRDataset.split_across_gpus", False)
     dataset = SplatFactoSRDataset.from_gin_scope(args.dataset_scope)
-    scene_index = dataset.scene_index(args.scene_name)
-    scene = dataset.load_scene(scene_index)
+    scene_index = dataset.scene_index(args.scene_name) if args.scene_name else 0
+    scene = dataset.load_scene(scene_index, sample_views=False) if args.mode == "configured" else dataset.load_scene(scene_index)
     gs_resolution = dataset.src_resolution if args.gs_resolution == "source" else dataset.tgt_resolution
     target_entry = scene["data"][dataset.tgt_resolution]
     return dataset, scene, scene["data"][gs_resolution]["gs_params"], target_entry["images"], target_entry["cameras"]
 
 
-def run(args):
+def run_sweep(args):
     from utils import gpu_utils
 
     torch.manual_seed(args.seed)
@@ -277,8 +305,138 @@ def run(args):
     return report
 
 
+def augment_trial(prepared, cameras, args, generator):
+    """Start one independent trial, rotating before jitter as in training."""
+    rotation = prepared["means"].new_tensor([1., 0., 0., 0.])
+    rotated, rotated_cameras = prepared, dict(cameras)
+    if args.random_rotate:
+        sampler = sample_uniform_z_rotation_quaternion if args.rotation_mode == "gravity_consistent" else sample_uniform_rotation_quaternion
+        rotation = sampler(prepared["means"].dtype, prepared["means"].device, generator)
+        rotated = rotate_gaussians(prepared, rotation, args.rotation_pivot)
+        rotated_cameras["camera_to_worlds"] = rotate_camera_to_worlds(cameras["camera_to_worlds"], rotation, args.rotation_pivot)
+    augmented, levels = rotated, dict.fromkeys(GAUSSIAN_PARAMETERS, 0.)
+    if args.random_jitter:
+        augmented, levels = jitter_gaussian_parameters(rotated, args.jitter_max_levels, generator)
+    return augmented, rotated, rotated_cameras, rotation, levels
+
+
+def render_difference(predictions, references, args):
+    """Measure unmasked floating-point RGB errors, with per-view thresholds."""
+    if not predictions or len(predictions) != len(references):
+        raise ValueError("Render comparisons require matching non-empty view lists")
+    views = []
+    for index, (prediction, reference) in enumerate(zip(predictions, references)):
+        error = prediction[..., :3].float() - reference[..., :3].float()
+        mse = error.square().mean().item()
+        mae, maximum = error.abs().mean().item(), error.abs().max().item()
+        views.append({"view": index, "mae": mae, "max_abs": maximum,
+                      "psnr": -10 * math.log10(mse) if mse > 0 else (float("inf") if mse == 0 else float("nan")),
+                      "passed": math.isfinite(mae) and math.isfinite(maximum) and mae <= args.mae_threshold and maximum <= args.max_error_threshold})
+    return {"mae": sum(v["mae"] for v in views) / len(views),
+            "max_abs": max(v["max_abs"] for v in views),
+            "psnr": sum(v["psnr"] for v in views) / len(views),
+            "passed": all(v["passed"] for v in views), "views": views}
+
+
+def quaternion_norm_summary(gs):
+    norms = gs["quats"].float().norm(dim=-1)
+    return {"min": norms.min().item(), "mean": norms.mean().item(), "max": norms.max().item()}
+
+
+def save_gaussian_artifact(path, gs, cameras, metadata):
+    """Save scene-frame Gaussian tensors and their matching cameras, not network weights."""
+    from utils.gs_utils import export_ply_forviewer
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"artifact_type": "gaussian_scene", "gs_params": {k: v.detach().cpu() for k, v in gs.items()},
+               "cameras": {k: v.detach().cpu() if torch.is_tensor(v) else v for k, v in cameras.items()},
+               "metadata": metadata}
+    torch.save(payload, path)
+    export_ply_forviewer(payload["gs_params"], path.with_suffix(".ply"))
+
+
+def run_configured(args):
+    from utils import gpu_utils
+
+    device = torch.device(args.device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested but is not available")
+    dataset, scene, original, target_images, cameras = _load_experiment(args)
+    original = gpu_utils.move_to_device(original, device)
+    cameras = gpu_utils.move_to_device(cameras, device)
+    prepared = normalize_gaussian_quaternions(original)
+    generator = torch.Generator(device=device).manual_seed(args.seed)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    evaluator = _ImageMetricEvaluator(device)
+    original_images = _render_views(original, cameras, args.chunk_size, device)
+    baseline = _render_views(prepared, cameras, args.chunk_size, device)
+    settings = {key: getattr(args, key) for key in ("random_jitter", "random_rotate", "rotation_mode", "rotation_pivot",
+                "jitter_max_levels", "seed", "trials", "mae_threshold", "max_error_threshold", "gs_resolution", "dataset_scope")}
+    metadata = {"scene_name": scene["scene_name"], "scene_idx": scene["scene_idx"], **settings,
+                "source_resolution": dataset.src_resolution, "target_resolution": dataset.tgt_resolution,
+                "coordinate_frame": scene.get("coordinate_frame"), "coordinate_frame_version": scene.get("coordinate_frame_version"),
+                "coordinate_resolution": scene.get("coordinate_resolution"),
+                "gin_files": list(args.gin_file), "gin_params": list(args.gin_param),
+                "image_names": scene["data"][dataset.tgt_resolution].get("images_name", []),
+                "quaternion_representation": "unit_unstandardized", "error_preview_gain": 100}
+    normalization = render_difference(baseline, original_images, args)
+    report = {"metadata": metadata, "normalization": normalization, "passed": normalization["passed"],
+              "original_norms": quaternion_norm_summary(original), "normalized_norms": quaternion_norm_summary(prepared),
+              "original_vs_ground_truth": evaluator.evaluate(original_images, target_images, args.chunk_size),
+              "normalized_vs_ground_truth": evaluator.evaluate(baseline, target_images, args.chunk_size), "trials": []}
+    save_gaussian_artifact(args.output_dir / "normalized.pt", prepared, cameras, metadata)
+    if args.preview_views:
+        _save_preview(args.output_dir / "previews/normalization.png",
+                      {"original": original_images, "normalized": baseline,
+                       "error x100": [(a - b).abs() * 100 for a, b in zip(baseline, original_images)]}, args.preview_views)
+    for index in range(args.trials):
+        augmented, rotated, trial_cameras, rotation, levels = augment_trial(prepared, cameras, args, generator)
+        rotated_images = _render_views(rotated, trial_cameras, args.chunk_size, device) if args.random_rotate else baseline
+        trial = {"trial": index, "rotation_wxyz": rotation.cpu().tolist(), "jitter_levels": levels,
+                 "quaternion_norms": quaternion_norm_summary(augmented)}
+        if args.random_rotate:
+            inverse = quaternion_inverse(rotation)
+            restored = rotate_gaussians(rotated, inverse, args.rotation_pivot)
+            restored_cameras = {**trial_cameras, "camera_to_worlds": rotate_camera_to_worlds(trial_cameras["camera_to_worlds"], inverse, args.rotation_pivot)}
+            restored_images = _render_views(restored, restored_cameras, args.chunk_size, device)
+            trial["rotation"] = render_difference(rotated_images, baseline, args)
+            trial["restoration"] = render_difference(restored_images, baseline, args)
+            trial["roundtrip_errors"] = _roundtrip_errors(prepared, restored)
+            report["passed"] &= trial["rotation"]["passed"] and trial["restoration"]["passed"]
+        images = _render_views(augmented, trial_cameras, args.chunk_size, device) if args.random_jitter else rotated_images
+        # Jitter changes images intentionally; only zero jitter is an invariance check.
+        jitter_difference = render_difference(images, rotated_images, args)
+        trial["jitter_difference"] = {k: v for k, v in jitter_difference.items() if k != "passed"}
+        trial["jitter_difference"]["views"] = [{k: v for k, v in view.items() if k != "passed"} for view in jitter_difference["views"]]
+        if not any(levels.values()):
+            trial["zero_jitter_passed"] = jitter_difference["passed"]
+            report["passed"] &= jitter_difference["passed"]
+        trial["vs_ground_truth"] = evaluator.evaluate(images, target_images, args.chunk_size)
+        artifact = f"trial_{index:03d}.pt"
+        trial["checkpoint"] = artifact
+        save_gaussian_artifact(args.output_dir / artifact, augmented, trial_cameras, {**metadata, **trial})
+        if args.preview_views:
+            _save_preview(args.output_dir / f"previews/trial_{index:03d}.png",
+                          {"normalized": baseline, "rotated": rotated_images, "augmented": images,
+                           "rotation error x100": [(a - b).abs() * 100 for a, b in zip(rotated_images, baseline)],
+                           "jitter error x100": [(a - b).abs() * 100 for a, b in zip(images, rotated_images)]}, args.preview_views)
+        report["trials"].append(trial)
+    with (args.output_dir / "metrics.json").open("w") as handle:
+        json.dump(_json_safe(report), handle, indent=2, allow_nan=False)
+        handle.write("\n")
+    print(f"Wrote {args.output_dir / 'metrics.json'}; invariance passed={report['passed']}")
+    return report
+
+
+def run(args):
+    return run_configured(args) if args.mode == "configured" else run_sweep(args)
+
+
 def main(argv=None):
-    run(parse_args(argv))
+    args = parse_args(argv)
+    report = run(args)
+    if report.get("passed") is False:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

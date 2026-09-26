@@ -48,6 +48,99 @@ class InterpolantTests(unittest.TestCase):
         self.flow = load_functions(ROOT / "sr/flow.py", {"sample_stochastic_interpolant", "predict_x1_from_velocity", "apply_feature_update", "loss_mix_weights"},
                                    {"torch": torch, "SUPPORTED_GS_KEYS": list(STATISTIC_KEYS), "FLOW_EPSILON": 1e-6})
 
+    def test_unit_endpoints_preserve_source_sign_and_align_only_target(self):
+        norm = GaussianStandardizer(self.path, quaternion_representation="unit_unstandardized")
+        source = {**self.source, "quats": torch.tensor([[-2., 0, 0, 0], [2., 0, 0, 0],
+                                                       [2., 0, 0, 0], [0, 0, 0, 3.]])}
+        target = {**self.source, "quats": torch.tensor([[3., 0, 0, 0], [4., 0, 0, 0],
+                                                       [0, -3., 0, 0], [0, 0, 0, -2.]])}
+        original = target["quats"].clone()
+        prepared_source, prepared_target = norm.prepare_endpoints(source, target)
+        torch.testing.assert_close(prepared_source["quats"], torch.nn.functional.normalize(source["quats"], dim=-1))
+        expected = torch.tensor([[-1., 0, 0, 0], [1., 0, 0, 0], [0, -1., 0, 0], [0, 0, 0, 1.]])
+        torch.testing.assert_close(prepared_target["quats"], expected)
+        torch.testing.assert_close(target["quats"], original)
+        for key in STATISTIC_KEYS:
+            if key != "quats":
+                torch.testing.assert_close(prepared_source[key], source[key])
+                torch.testing.assert_close(prepared_target[key], target[key])
+        _, unaligned = norm.prepare_endpoints(source, target, align_target_sign=False)
+        _, source_free = norm.prepare_endpoints(None, target, align_target_sign=False)
+        torch.testing.assert_close(unaligned["quats"], source_free["quats"])
+        torch.testing.assert_close(unaligned["quats"], torch.nn.functional.normalize(original, dim=-1))
+        for bad in (0., float("nan"), float("inf")):
+            invalid = {**source, "quats": torch.full_like(source["quats"], bad)}
+            with self.assertRaisesRegex(ValueError, "finite and non-zero"):
+                norm.prepare_endpoints(invalid)
+        with self.assertRaisesRegex(ValueError, "quaternion_representation"):
+            GaussianStandardizer(self.path, quaternion_representation="invalid")
+
+    def test_unit_representation_bypasses_only_quaternion_statistics(self):
+        norm = GaussianStandardizer(self.path, quaternion_representation="unit_unstandardized")
+        encoded = norm.encode(self.source)
+        legacy = self.normalizer.encode(self.source)
+        for key in STATISTIC_KEYS:
+            torch.testing.assert_close(encoded[key], self.source[key] if key == "quats" else legacy[key])
+        encoded = {key: value.detach().requires_grad_() for key, value in encoded.items()}
+        decoded = norm.decode(encoded)
+        sum(value.sum() for value in decoded.values()).backward()
+        for key in STATISTIC_KEYS:
+            torch.testing.assert_close(decoded[key], self.source[key])
+            torch.testing.assert_close(encoded[key].grad, torch.full_like(encoded[key], 1. if key == "quats" else 2.))
+        report = norm.report()
+        self.assertEqual(report["quaternion_representation"], "unit_unstandardized")
+        self.assertEqual(report["attributes"]["quats"]["effective_mean"], [0.] * 4)
+        self.assertEqual(report["attributes"]["quats"]["effective_scale"], [1.] * 4)
+        self.assertEqual(report["attributes"]["quats"]["variance"], [4.] * 4)
+
+    def test_unit_linear_sampling_keeps_additive_nonunit_intermediate_states(self):
+        norm = GaussianStandardizer(self.path, quaternion_representation="unit_unstandardized")
+        raw_source = {**self.source, "quats": torch.tensor([[2., 0, 0, 0]]).repeat(4, 1)}
+        raw_target = {**self.source, "quats": torch.tensor([[0., 3., 0, 0]]).repeat(4, 1)}
+        source, target = norm.prepare_endpoints(raw_source, raw_target)
+        source_flow, target_flow = norm.encode(source), norm.encode(target)
+        path = interpolants.construct_path(source_flow, target_flow, .5, "linear", source["means"], target["means"])
+        self.assertTrue((path["query"]["quats"].norm(dim=-1) < 1).all())
+        calls = []
+        class ExactVelocity(torch.nn.Module):
+            def forward(inner, batch_flow_gs, **kwargs):
+                calls.append(batch_flow_gs[0])
+                return [path["velocity"]]
+        result = interpolants.sample_flow_model(ExactVelocity(), raw_source, 0, 2, norm)
+        for key in STATISTIC_KEYS:
+            torch.testing.assert_close(calls[0][key], source_flow[key])
+            torch.testing.assert_close(calls[1][key], path["query"][key])
+            torch.testing.assert_close(result[key], target[key])
+        loss, _, _ = interpolants.attribute_mse(norm.encode(result), target_flow)
+        self.assertLess(loss.item(), 1e-12)
+
+    def test_unit_training_matches_sampling_with_augmentation_and_x1_loss(self):
+        norm = GaussianStandardizer(self.path, quaternion_representation="unit_unstandardized")
+        source, target = norm.prepare_endpoints(self.source, {**self.source, "quats": -2 * self.source["quats"]})
+        namespace = {"torch": torch, "np": np, "flow": self.flow, "interpolants": interpolants,
+                     "gpu_utils": SimpleNamespace(move_to_device=lambda value, device: value),
+                     "rotate_gaussians": data_augmentation.rotate_gaussians,
+                     "sample_uniform_rotation_quaternion": lambda *args: torch.tensor([1., 0, 0, 0])}
+        module = load_functions(ROOT / "overfit-sr-interpolants.py", {"compute_microbatch_loss"}, namespace)
+        scene = {"source_gs": source, "target_gs": target, "source_flow_gs": norm.encode(source),
+                 "target_flow_gs": norm.encode(target), "scene_idx": 0}
+        class ZeroVelocity(torch.nn.Module):
+            def forward(inner, batch_flow_gs, **kwargs):
+                return [{key: torch.zeros_like(value) for key, value in gs.items()} for gs in batch_flow_gs]
+        for loss_type in ("velocity", "x1"):
+            for rotate in (False, True):
+                config = {"flow_t_eps": 1e-4, "flow_noise_std": 1., "loss_type": loss_type,
+                          "interpolant_type": "linear", "loss_rollout_steps": 2}
+                augmentation = {"random_jitter": False, "random_rotate": rotate, "rotation_pivot": (.5, .5, .5)}
+                loss, _ = module.compute_microbatch_loss(ZeroVelocity(), [scene], "cpu", config,
+                    {"schedule": "fm-only"}, norm, 0., 0., None, False, augmentation)
+                self.assertLess(loss.item(), 1e-12)
+        rotation = data_augmentation.sample_uniform_rotation_quaternion()
+        rotated_source = data_augmentation.rotate_gaussians(source, rotation, (.5, .5, .5))
+        rotated_target = data_augmentation.rotate_gaussians(target, rotation, (.5, .5, .5))
+        torch.testing.assert_close(rotated_source["quats"].norm(dim=-1), torch.ones(4))
+        self.assertTrue(((rotated_source["quats"] * rotated_target["quats"]).sum(-1) >= 0).all())
+
     def test_roundtrip_shapes_and_decode_gradients(self):
         encoded = self.normalizer.encode(self.source)
         decoded = self.normalizer.decode(encoded)
@@ -201,6 +294,70 @@ class InterpolantTests(unittest.TestCase):
         for key in self.source:
             torch.testing.assert_close(scene["source_gs"][key], self.source[key])
 
+    def test_gravity_rotation_co_rotates_scene_and_camera_before_jitter(self):
+        observed = {}
+        def render(gs, cameras):
+            observed["render_gs"] = gs
+            observed["cameras"] = cameras
+            return [torch.zeros(2, 2, 3)], None
+        namespace = {
+            "torch": torch, "np": np, "flow": self.flow, "interpolants": interpolants,
+            "SUPPORTED_GS_KEYS": list(STATISTIC_KEYS),
+            "gpu_utils": SimpleNamespace(move_to_device=lambda value, device: value),
+            "gs_utils": SimpleNamespace(rasterize_gaussians_to_multiimgs=render),
+            "sample_uniform_rotation_quaternion": data_augmentation.sample_uniform_rotation_quaternion,
+            "sample_uniform_z_rotation_quaternion": data_augmentation.sample_uniform_z_rotation_quaternion,
+            "rotate_gaussians": data_augmentation.rotate_gaussians,
+            "rotate_camera_to_worlds": data_augmentation.rotate_camera_to_worlds,
+            "jitter_gaussian_parameters": data_augmentation.jitter_gaussian_parameters,
+        }
+        module = load_functions(ROOT / "overfit-sr-interpolants.py", {"compute_microbatch_loss"}, namespace)
+        class Model(torch.nn.Module):
+            def forward(inner, batch_flow_gs, batch_scene_idx, batch_reference_means, t):
+                observed["query"] = batch_flow_gs[0]
+                observed["reference_means"] = batch_reference_means[0]
+                return [{key: torch.zeros_like(value) for key, value in batch_flow_gs[0].items()}]
+        target_gs = {key: value + 0.2 for key, value in self.source.items()}
+        camera_to_worlds = torch.eye(4)[None]
+        camera_to_worlds[0, :3, 3] = torch.tensor((1.0, 0.0, 0.7))
+        scene = {
+            "source_gs": self.source, "target_gs": target_gs,
+            "source_flow_gs": self.normalizer.encode(self.source),
+            "target_flow_gs": self.normalizer.encode(target_gs),
+            "scene_idx": 0, "render_view_count": 1,
+            "target_images": [torch.zeros(2, 2, 3)],
+            "target_cameras": {"camera_to_worlds": camera_to_worlds},
+        }
+        augmentation_cfg = {"random_jitter": True, "random_rotate": True,
+                            "rotation_mode": "gravity_consistent", "jitter_max_levels": {"means": 0.1},
+                            "rotation_pivot": (0.5, 0.5, 0.5)}
+        expected_generator = torch.Generator().manual_seed(31)
+        rotation = data_augmentation.sample_uniform_z_rotation_quaternion(torch.float32, "cpu", expected_generator)
+        rotated_source = data_augmentation.rotate_gaussians(self.source, rotation, augmentation_cfg["rotation_pivot"])
+        rotated_target = data_augmentation.rotate_gaussians(target_gs, rotation, augmentation_cfg["rotation_pivot"])
+        expected_source, levels = data_augmentation.jitter_gaussian_parameters(
+            rotated_source, augmentation_cfg["jitter_max_levels"], expected_generator)
+        expected_target_flow = self.normalizer.encode(rotated_target)
+        expected_query = {key: .75 * value + .25 * expected_target_flow[key]
+                          for key, value in self.normalizer.encode(expected_source).items()}
+        expected_cameras = data_augmentation.rotate_camera_to_worlds(camera_to_worlds, rotation,
+                                                                       augmentation_cfg["rotation_pivot"])
+        with mock.patch.object(torch.Tensor, "uniform_", lambda value, *args: value.fill_(.25)), \
+             mock.patch.object(interpolants, "rollout", return_value=expected_target_flow):
+            _, statistics = module.compute_microbatch_loss(
+                Model(), [scene], "cpu",
+                {"flow_t_eps": 1e-4, "flow_noise_std": 0., "loss_type": "velocity",
+                 "interpolant_type": "linear", "loss_rollout_steps": 2}, {"schedule": "linear"},
+                self.normalizer, 1., 0., None, False, augmentation_cfg, torch.Generator().manual_seed(31))
+        for key in self.source:
+            torch.testing.assert_close(observed["query"][key], expected_query[key])
+        torch.testing.assert_close(observed["reference_means"], expected_source["means"])
+        torch.testing.assert_close(observed["render_gs"]["means"], rotated_target["means"])
+        torch.testing.assert_close(observed["cameras"]["camera_to_worlds"], expected_cameras)
+        torch.testing.assert_close(observed["cameras"]["camera_to_worlds"][..., 2, 3], camera_to_worlds[..., 2, 3])
+        self.assertEqual(statistics["jitter_means_level"], levels["means"])
+        torch.testing.assert_close(scene["target_cameras"]["camera_to_worlds"], camera_to_worlds)
+
     def test_one_sided_rejects_source_jitter(self):
         namespace = {"torch": torch, "np": np, "flow": self.flow, "interpolants": interpolants,
                      "SUPPORTED_GS_KEYS": list(STATISTIC_KEYS),
@@ -216,8 +373,12 @@ class InterpolantTests(unittest.TestCase):
                                 {"math": __import__("math"), "GAUSSIAN_PARAMETERS": tuple(STATISTIC_KEYS)})
         defaults = module.training_augmentation()
         self.assertTrue(all(value == 0.01 for value in defaults["jitter_max_levels"].values()))
+        self.assertEqual(defaults["rotation_mode"], "full")
         partial = module.training_augmentation(True, True, {"means": 0.2})
         self.assertEqual(partial["jitter_max_levels"], {"means": 0.2})
+        self.assertEqual(module.training_augmentation(rotation_mode="gravity_consistent")["rotation_mode"], "gravity_consistent")
+        with self.assertRaisesRegex(ValueError, "rotation_mode"):
+            module.training_augmentation(rotation_mode="invalid")
 
     def test_euler_uses_scene_references_and_decodes(self):
         calls = []
@@ -391,10 +552,13 @@ class InterpolantTests(unittest.TestCase):
                    NORMALIZATION_VARIANCE_FLOOR="1e-6", FLOW_NOISE_STD="0.7", INTERPOLANT_TYPE="encoding_decoding",
                    LOSS_ROLLOUT_STEPS="6", EVAL_NOISE_SEED="42", FLOW_STEPS="10", FIXED_TRAIN_NOISE="True",
                    TRAIN_NOISE_SEED="9", LR_WARMUP_STEPS="500", LR_WARMUP_START_FACTOR="0.05",
-                   RANDOM_JITTER="True", RANDOM_ROTATE="True", JITTER_MAX_LEVELS="{'means': 0.03}")
+                   RANDOM_JITTER="True", RANDOM_ROTATE="True", JITTER_MAX_LEVELS="{'means': 0.03}",
+                   QUATERNION_REPRESENTATION="unit_unstandardized")
         command = 'python() { printf "%s\\n" "$@"; }; launcher="$1"; shift; source "$launcher"'
         result = subprocess.run(["bash", "-c", command, "test", str(ROOT / "scripts/overfit-sr-interpolants.sh")],
                                 env=env, capture_output=True, text=True, check=True)
+        self.assertIn("flow_matching.quaternion_representation='unit_unstandardized'", result.stdout)
+        self.assertIn("_unit_unstandardized", result.stdout)
         self.assertIn("overfit-sr-interpolants.py", result.stdout)
         self.assertIn("flow_matching.normalization_variance_floor=1e-6", result.stdout)
         self.assertIn("flow_matching.flow_noise_std=0.7", result.stdout)
@@ -410,8 +574,29 @@ class InterpolantTests(unittest.TestCase):
         self.assertIn("train2D/build_scheduler.warmup_start_factor=0.05", result.stdout)
         self.assertIn("training_augmentation.random_jitter=True", result.stdout)
         self.assertIn("training_augmentation.random_rotate=True", result.stdout)
+        self.assertIn("training_augmentation.rotation_mode='full'", result.stdout)
         self.assertIn("training_augmentation.jitter_max_levels={'means': 0.03}", result.stdout)
         self.assertIn("_jitter_rotate_", result.stdout)
+
+    def test_launcher_forwards_gravity_rotation_mode(self):
+        env = dict(os.environ, RANDOM_ROTATE="True", ROTATION_MODE="gravity_consistent", RANDOM_JITTER="False")
+        command = 'python() { printf "%s\\n" "$@"; }; launcher="$1"; shift; source "$launcher"'
+        result = subprocess.run(["bash", "-c", command, "test", str(ROOT / "scripts/overfit-sr-interpolants.sh")],
+                                env=env, capture_output=True, text=True, check=True)
+        self.assertIn("training_augmentation.rotation_mode='gravity_consistent'", result.stdout)
+        self.assertIn("_gravity_rotate_", result.stdout)
+
+        env["RANDOM_ROTATE"] = "False"
+        disabled = subprocess.run(["bash", "-c", command, "test", str(ROOT / "scripts/overfit-sr-interpolants.sh")],
+                                  env=env, capture_output=True, text=True, check=True)
+        self.assertIn("training_augmentation.rotation_mode='gravity_consistent'", disabled.stdout)
+        self.assertNotIn("_gravity_rotate_", disabled.stdout)
+
+        env["ROTATION_MODE"] = "invalid"
+        invalid = subprocess.run(["bash", "-c", command, "test", str(ROOT / "scripts/overfit-sr-interpolants.sh")],
+                                 env=env, capture_output=True, text=True, check=False)
+        self.assertEqual(invalid.returncode, 2)
+        self.assertIn("ROTATION_MODE", invalid.stderr)
 
 
 if __name__ == "__main__":

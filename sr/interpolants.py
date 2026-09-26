@@ -119,6 +119,7 @@ def sample_flow_model(model, source, scene_idx, flow_steps, standardizer, mode="
                                  dtype=torch.float32, generator=generator) for key, mean in standardizer.means.items()}
         state, source_means = None, None
     else:
+        source, _ = standardizer.prepare_endpoints(source)
         state, source_means = standardizer.encode(source), source["means"]
     endpoint = rollout(model, state, scene_idx, flow_steps, mode, source_means, target_means, noise, t_eps)
     return standardizer.decode(endpoint)

@@ -2,6 +2,8 @@
 
 import argparse
 import ast
+import json
+import tempfile
 from pathlib import Path
 import threading
 import time
@@ -14,6 +16,7 @@ import numpy as np
 import torch
 
 from sr import interpolants
+from utils.gs_normalization import GaussianStandardizer, STATISTIC_KEYS, QUATERNION_REPRESENTATIONS
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -53,6 +56,50 @@ class InterpolantViewerTests(unittest.TestCase):
         self.noise = interpolants.seeded_noise_like(self.target, 17)
         namespace = {"np": np, "torch": torch, "interpolants": interpolants}
         self.viewer = load_definitions({"analytic_state"}, namespace)
+
+    def test_flow_settings_preserve_legacy_default_and_accept_unit_representation(self):
+        viewer = load_definitions({"flow_matching"}, {"QUATERNION_REPRESENTATIONS": QUATERNION_REPRESENTATIONS})
+        self.assertEqual(viewer.flow_matching()["quaternion_representation"], "raw_standardized")
+        settings = viewer.flow_matching(quaternion_representation="unit_unstandardized", interpolant_type="one_sided")
+        self.assertEqual(settings["quaternion_representation"], "unit_unstandardized")
+        self.assertEqual(settings["interpolant_type"], "one_sided")
+        with self.assertRaises(ValueError):
+            viewer.flow_matching(quaternion_representation="invalid")
+
+    def test_loader_prepares_endpoints_and_records_representation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "statistics.json"
+            attributes = {stored: {"mean": torch.full(SHAPES[key], .3).tolist(),
+                                   "variance": torch.full(SHAPES[key], 4.).tolist()}
+                          for key, stored in STATISTIC_KEYS.items()}
+            path.write_text(json.dumps({"aggregate": {"normalized": {"output": attributes}}}))
+            raw_target = {**self.source, "quats": -2 * self.source["quats"]}
+            scene = {"scene_name": "test", "scene_idx": 0,
+                     "data": {32: {"gs_params": self.source}}, "fit_lr_to_hr": {"tgt_gs": raw_target}}
+            dataset = SimpleNamespace(src_resolution=32, tgt_resolution=128, scene_index=lambda name: 0,
+                                      load_scene=lambda *args, **kwargs: scene)
+            config = {"gs_statistics_path": str(path), "normalization_variance_floor": 1e-8,
+                      "eval_noise_seed": 0, "flow_noise_std": 1., "interpolant_type": "linear",
+                      "quaternion_representation": "unit_unstandardized"}
+            namespace = {"torch": torch, "np": np, "Path": Path, "gin": mock.Mock(), "interpolants": interpolants,
+                         "GaussianStandardizer": GaussianStandardizer, "flow_matching": lambda: config,
+                         "SplatFactoSRDataset": SimpleNamespace(from_gin_scope=lambda *args, **kwargs: dataset)}
+            viewer = load_definitions({"load_scene", "cpu_snapshot", "analytic_state"}, namespace)
+            for representation in ("raw_standardized", "unit_unstandardized"):
+                for mode in ("linear", "one_sided"):
+                    config.update(quaternion_representation=representation, interpolant_type=mode)
+                    source, target, source_flow, target_flow, noise, norm, metadata = viewer.load_scene("config.gin", "test")
+                    self.assertEqual(metadata["quaternion_representation"], representation)
+                    if representation == "unit_unstandardized":
+                        expected = torch.nn.functional.normalize(self.source["quats"], dim=-1)
+                        torch.testing.assert_close(source_flow["quats"], expected)
+                        torch.testing.assert_close(target_flow["quats"], -expected if mode == "one_sided" else expected)
+                    else:
+                        torch.testing.assert_close(source["quats"], self.source["quats"])
+                        torch.testing.assert_close(source_flow["quats"], (self.source["quats"] - .3) / 2)
+                    end = viewer.analytic_state(mode, 1., 1., source, target, source_flow, target_flow, noise, norm)
+                    torch.testing.assert_close(end["quats"], target["quats"])
+            torch.testing.assert_close(raw_target["quats"], -2 * self.source["quats"])
 
     def test_states_match_construct_path(self):
         for mode in interpolants.MODES:

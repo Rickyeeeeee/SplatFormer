@@ -24,5 +24,5 @@ DiffusionGaussianTransformer.patch_size = (256, 512, 1024, 1024, 256, 512, 1024,
 DiffusionGaussianTransformer.frequency_embedding_size = 256
 DiffusionGaussianTransformer.drop_path = 0.0
 DiffusionGaussianTransformer.shuffle_orders = True
-DiffusionGaussianTransformer.shuffle_orders_eval = True
+DiffusionGaussianTransformer.shuffle_orders_eval = False
 DiffusionGaussianTransformer.enable_flash = True

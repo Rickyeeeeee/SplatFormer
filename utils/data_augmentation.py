@@ -73,6 +73,13 @@ def sample_uniform_rotation_quaternion(dtype=torch.float32, device=None, generat
     return F.normalize(quaternion, dim=-1)
 
 
+def sample_uniform_z_rotation_quaternion(dtype=torch.float32, device=None, generator=None):
+    """Sample a uniform yaw around world Z as a scalar-first quaternion."""
+    half_angle = math.pi * torch.rand((), dtype=dtype, device=device, generator=generator)
+    zero = torch.zeros_like(half_angle)
+    return torch.stack((half_angle.cos(), zero, zero, half_angle.sin()))
+
+
 def jitter_gaussian_parameter(gs_params, parameter, level, generator=None):
     """Jitter one parameter relative to its per-channel population deviation."""
     if parameter not in GAUSSIAN_PARAMETERS:

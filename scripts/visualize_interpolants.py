@@ -30,7 +30,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from dataset.GS_SR import SplatFactoSRDataset
 from sr import interpolants
-from utils.gs_normalization import GaussianStandardizer
+from utils.gs_normalization import GaussianStandardizer, QUATERNION_REPRESENTATIONS
 from utils.gs_utils import _prepare_render_inputs
 
 
@@ -49,10 +49,15 @@ def flow_matching(
     fixed_train_noise=False,
     train_noise_seed=0,
     normalization_variance_floor=1e-8,
+    quaternion_representation="raw_standardized",
     gs_statistics_path="/project/ricky/splatformer-sr-data-scaled/gs_statistics.json",
 ):
     """Register and return the subset of training flow settings used here."""
+    if quaternion_representation not in QUATERNION_REPRESENTATIONS:
+        raise ValueError(f"Unsupported quaternion_representation={quaternion_representation!r}")
     return {
+        "quaternion_representation": quaternion_representation,
+        "interpolant_type": interpolant_type,
         "flow_noise_std": float(flow_noise_std),
         "eval_noise_seed": int(eval_noise_seed),
         "normalization_variance_floor": float(normalization_variance_floor),
@@ -124,7 +129,8 @@ def load_scene(config, scene_name, split="test", bindings=(), noise_seed=None, n
     for key in source:
         if key not in target or source[key].shape != target[key].shape:
             raise ValueError(f"fit_lr_to_hr is not identity-paired for {key}")
-    standardizer = GaussianStandardizer(flow_cfg["gs_statistics_path"], flow_cfg["normalization_variance_floor"])
+    standardizer = GaussianStandardizer(flow_cfg["gs_statistics_path"], flow_cfg["normalization_variance_floor"], flow_cfg["quaternion_representation"])
+    source, target = standardizer.prepare_endpoints(source, target, align_target_sign=flow_cfg["interpolant_type"] != "one_sided")
     source_flow, target_flow = standardizer.encode(source), standardizer.encode(target)
     resolved_seed = flow_cfg["eval_noise_seed"] if noise_seed is None else int(noise_seed)
     resolved_scale = flow_cfg["flow_noise_std"] if noise_scale is None else float(noise_scale)
@@ -133,6 +139,7 @@ def load_scene(config, scene_name, split="test", bindings=(), noise_seed=None, n
         "scene_name": scene["scene_name"], "scene_idx": scene_idx, "split": split,
         "source_resolution": dataset.src_resolution, "target_resolution": dataset.tgt_resolution,
         "noise_seed": resolved_seed, "noise_scale": resolved_scale,
+        "quaternion_representation": flow_cfg["quaternion_representation"],
     }
     return source, target, source_flow, target_flow, noise, standardizer, metadata
 
