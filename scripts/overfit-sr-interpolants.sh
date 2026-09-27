@@ -65,6 +65,7 @@ grid_resolution=${GRID_RESOLUTION:-1536}
 random_jitter=${RANDOM_JITTER:-False}
 random_rotate=${RANDOM_ROTATE:-False}
 rotation_mode=${ROTATION_MODE:-full}
+rotation_max_degrees=${ROTATION_MAX_DEGREES:-None}
 jitter_max_levels=${JITTER_MAX_LEVELS:-}
 case "${random_jitter}" in
     True|False) ;;
@@ -192,10 +193,19 @@ if [[ "${predictor}" == "ptv3" ]]; then
         "--gin_param=PointTransformerV3FlowModel.turn_off_bn=${ptv3_turn_off_bn}"
     )
 fi
+if [[ "${predictor}" == "dipt" ]]; then
+    shift_negative_grid_coords=${GS_SHIFT_NEGATIVE_GRID_COORDS:-False}
+    case "${shift_negative_grid_coords}" in
+        True|False) ;;
+        *) echo "GS_SHIFT_NEGATIVE_GRID_COORDS must be True or False" >&2; exit 2 ;;
+    esac
+    network_gin_args+=("--gin_param=DiffusionGaussianPredictor.shift_negative_grid_coords=${shift_negative_grid_coords}")
+fi
 network_gin_args+=("--gin_param=${predictor_class}.grid_resolution=${grid_resolution}")
 augmentation_gin_args=(
     "--gin_param=training_augmentation.random_jitter=${random_jitter}"
     "--gin_param=training_augmentation.random_rotate=${random_rotate}"
+    "--gin_param=training_augmentation.rotation_max_degrees=${rotation_max_degrees}"
     "--gin_param=training_augmentation.rotation_mode='${rotation_mode}'"
 )
 if [[ -n "${jitter_max_levels}" ]]; then

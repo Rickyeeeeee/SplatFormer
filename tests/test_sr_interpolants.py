@@ -120,7 +120,7 @@ class InterpolantTests(unittest.TestCase):
         namespace = {"torch": torch, "np": np, "flow": self.flow, "interpolants": interpolants,
                      "gpu_utils": SimpleNamespace(move_to_device=lambda value, device: value),
                      "rotate_gaussians": data_augmentation.rotate_gaussians,
-                     "sample_uniform_rotation_quaternion": lambda *args: torch.tensor([1., 0, 0, 0])}
+                     "sample_uniform_rotation_quaternion": lambda *args, **kwargs: torch.tensor([1., 0, 0, 0])}
         module = load_functions(ROOT / "overfit-sr-interpolants.py", {"compute_microbatch_loss"}, namespace)
         scene = {"source_gs": source, "target_gs": target, "source_flow_gs": norm.encode(source),
                  "target_flow_gs": norm.encode(target), "scene_idx": 0}
@@ -329,10 +329,10 @@ class InterpolantTests(unittest.TestCase):
             "target_cameras": {"camera_to_worlds": camera_to_worlds},
         }
         augmentation_cfg = {"random_jitter": True, "random_rotate": True,
-                            "rotation_mode": "gravity_consistent", "jitter_max_levels": {"means": 0.1},
+                            "rotation_mode": "gravity_consistent", "rotation_max_degrees": 10, "jitter_max_levels": {"means": 0.1},
                             "rotation_pivot": (0.5, 0.5, 0.5)}
         expected_generator = torch.Generator().manual_seed(31)
-        rotation = data_augmentation.sample_uniform_z_rotation_quaternion(torch.float32, "cpu", expected_generator)
+        rotation = data_augmentation.sample_uniform_z_rotation_quaternion(torch.float32, "cpu", expected_generator, max_degrees=10)
         rotated_source = data_augmentation.rotate_gaussians(self.source, rotation, augmentation_cfg["rotation_pivot"])
         rotated_target = data_augmentation.rotate_gaussians(target_gs, rotation, augmentation_cfg["rotation_pivot"])
         expected_source, levels = data_augmentation.jitter_gaussian_parameters(
@@ -374,6 +374,11 @@ class InterpolantTests(unittest.TestCase):
         defaults = module.training_augmentation()
         self.assertTrue(all(value == 0.01 for value in defaults["jitter_max_levels"].values()))
         self.assertEqual(defaults["rotation_mode"], "full")
+        self.assertIsNone(defaults["rotation_max_degrees"])
+        self.assertEqual(module.training_augmentation(rotation_max_degrees=10)["rotation_max_degrees"], 10)
+        for invalid in (-1, 181, float("nan")):
+            with self.assertRaisesRegex(ValueError, "rotation_max_degrees"):
+                module.training_augmentation(rotation_max_degrees=invalid)
         partial = module.training_augmentation(True, True, {"means": 0.2})
         self.assertEqual(partial["jitter_max_levels"], {"means": 0.2})
         self.assertEqual(module.training_augmentation(rotation_mode="gravity_consistent")["rotation_mode"], "gravity_consistent")
@@ -579,12 +584,13 @@ class InterpolantTests(unittest.TestCase):
         self.assertIn("_jitter_rotate_", result.stdout)
 
     def test_launcher_forwards_gravity_rotation_mode(self):
-        env = dict(os.environ, RANDOM_ROTATE="True", ROTATION_MODE="gravity_consistent", RANDOM_JITTER="False")
+        env = dict(os.environ, RANDOM_ROTATE="True", ROTATION_MODE="gravity_consistent", RANDOM_JITTER="False", ROTATION_MAX_DEGREES="10")
         command = 'python() { printf "%s\\n" "$@"; }; launcher="$1"; shift; source "$launcher"'
         result = subprocess.run(["bash", "-c", command, "test", str(ROOT / "scripts/overfit-sr-interpolants.sh")],
                                 env=env, capture_output=True, text=True, check=True)
         self.assertIn("training_augmentation.rotation_mode='gravity_consistent'", result.stdout)
         self.assertIn("_gravity_rotate_", result.stdout)
+        self.assertIn("training_augmentation.rotation_max_degrees=10", result.stdout)
 
         env["RANDOM_ROTATE"] = "False"
         disabled = subprocess.run(["bash", "-c", command, "test", str(ROOT / "scripts/overfit-sr-interpolants.sh")],

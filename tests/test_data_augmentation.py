@@ -147,6 +147,33 @@ class DataAugmentationTests(unittest.TestCase):
                 actual = torch.where((actual * expected).sum(dim=-1, keepdim=True) < 0, -actual, actual)
             torch.testing.assert_close(actual, expected, atol=2e-12, rtol=2e-12)
 
+    def test_bounded_rotation_angles_and_legacy_sampling(self):
+        for sampler in (sample_uniform_rotation_quaternion, sample_uniform_z_rotation_quaternion):
+            for limit in (0, 1, 10, 45, 180):
+                generator = torch.Generator().manual_seed(42)
+                samples = torch.stack([sampler(torch.float64, "cpu", generator, max_degrees=limit) for _ in range(128)])
+                angles = 2 * torch.atan2(samples[:, 1:].norm(dim=-1), samples[:, 0].abs()) * 180 / math.pi
+                self.assertLessEqual(angles.max().item(), limit + 1e-10)
+                torch.testing.assert_close(samples.norm(dim=-1), torch.ones(128, dtype=torch.float64))
+                repeat = sampler(torch.float64, "cpu", torch.Generator().manual_seed(42), max_degrees=limit)
+                torch.testing.assert_close(samples[0], repeat)
+                if limit == 0:
+                    torch.testing.assert_close(samples, torch.tensor([1., 0, 0, 0], dtype=torch.float64).expand(128, 4))
+                if sampler is sample_uniform_z_rotation_quaternion and limit > 0:
+                    self.assertTrue((samples[:, 3] < 0).any() and (samples[:, 3] > 0).any())
+            for invalid in (-1, 181, float("nan"), float("inf")):
+                with self.assertRaisesRegex(ValueError, "rotation_max_degrees"):
+                    sampler(max_degrees=invalid)
+            generator = torch.Generator().manual_seed(9)
+            actual = sampler(torch.float64, "cpu", generator)
+            generator.manual_seed(9)
+            if sampler is sample_uniform_rotation_quaternion:
+                expected = F.normalize(torch.randn(4, dtype=torch.float64, generator=generator), dim=-1)
+            else:
+                half = math.pi * torch.rand((), dtype=torch.float64, generator=generator)
+                expected = torch.stack((half.cos(), half * 0, half * 0, half.sin()))
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
     def test_uniform_rotation_sampler_is_seeded_and_unit_length(self):
         first = sample_uniform_rotation_quaternion(torch.float64, "cpu", torch.Generator().manual_seed(19))
         second = sample_uniform_rotation_quaternion(torch.float64, "cpu", torch.Generator().manual_seed(19))

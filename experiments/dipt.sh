@@ -86,11 +86,18 @@ export QUATERNION_REPRESENTATION=${QUATERNION_REPRESENTATION:-unit_unstandardize
 # CUSTOM_POSFIX=rot \
 # bash scripts/overfit-sr-interpolants.sh
 
-INTERPOLANT_TYPE=linear \
-RANDOM_ROTATE=True \
-ROTATION_MODE=gravity_consistent \
-CUSTOM_POSFIX=rot \
-bash scripts/overfit-sr-interpolants.sh
+# INTERPOLANT_TYPE=linear \
+# RANDOM_ROTATE=True \
+# ROTATION_MODE=gravity_consistent \
+# CUSTOM_POSFIX=rot \
+# bash scripts/overfit-sr-interpolants.sh
+
+# INTERPOLANT_TYPE=linear \
+# RANDOM_ROTATE=True \
+# ROTATION_MODE=gravity_consistent \
+# CUSTOM_POSFIX=rot \
+# GS_SHIFT_NEGATIVE_GRID_COORDS=True \
+# bash scripts/overfit-sr-interpolants.sh
 
 # INTERPOLANT_TYPE=linear \
 # RANDOM_JITTER=True \
@@ -106,17 +113,18 @@ bash scripts/overfit-sr-interpolants.sh
 # bash scripts/overfit-sr-interpolants.sh
 
 
-# INTERPOLANT_TYPE=linear \
-# RANDOM_JITTER=True \
-# RANDOM_ROTATE=True \
-# ROTATION_MODE=gravity_consistent \
-# JITTER_MAX_LEVELS="{
-#   'means': 0.01,
-#   'scales': 0.05,
-#   'opacities': 0.1,
-#   'quats': 0.05,
-#   'features_dc': 0.05,
-#   'features_rest': 0.1
-# }" \
-# CUSTOM_POSFIX=jall_rot \
-# bash scripts/overfit-sr-interpolants.sh
+INTERPOLANT_TYPE=linear \
+RANDOM_JITTER=True \
+RANDOM_ROTATE=True \
+ROTATION_MODE=gravity_consistent \
+GS_SHIFT_NEGATIVE_GRID_COORDS=True \
+JITTER_MAX_LEVELS="{
+  'means': 0.01,
+  'scales': 0.05,
+  'opacities': 0.1,
+  'quats': 0.05,
+  'features_dc': 0.05,
+  'features_rest': 0.1
+}" \
+CUSTOM_POSFIX=jall_rot \
+bash scripts/overfit-sr-interpolants.sh

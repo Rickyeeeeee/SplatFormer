@@ -1,0 +1,16 @@
+#!/bin/bash
+set -euo pipefail
+export GPU_ID=${GPU_ID:-1}
+
+# Keep jitter off to isolate the effect of rotation range; 0 degrees is identity.
+for angle in ${ROTATION_RANGES:-0 1 10 45}; do
+    INTERPOLANT_TYPE=linear \
+    RANDOM_JITTER=False \
+    RANDOM_ROTATE=True \
+    ROTATION_MODE=${ROTATION_MODE:-gravity_consistent} \
+    ROTATION_MAX_DEGREES="$angle" \
+    GS_SHIFT_NEGATIVE_GRID_COORDS=True \
+    QUATERNION_REPRESENTATION=unit_unstandardized \
+    OUTPUT_DIR="${OUTPUT_ROOT:-/project2/ricky/experiments/rotation_range}/${ROTATION_MODE:-gravity_consistent}_${angle}deg" \
+    bash scripts/overfit-sr-interpolants.sh "$@"
+done

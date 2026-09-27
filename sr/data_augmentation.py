@@ -40,6 +40,7 @@ def parse_args(argv=None):
     parser.add_argument("--output_dir", type=Path, default=Path("output_data_augmentation"))
     parser.add_argument("--mode", choices=("sweep", "configured"), default="sweep")
     parser.add_argument("--random_jitter", choices=("True", "False"), default="False")
+    parser.add_argument("--rotation_max_degrees", type=float, default=None)
     parser.add_argument("--random_rotate", choices=("True", "False"), default="False")
     parser.add_argument("--rotation_mode", choices=("full", "gravity_consistent"), default="full")
     parser.add_argument("--rotation_pivot", type=float, nargs=3, default=None)
@@ -49,6 +50,8 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     args.random_jitter = args.random_jitter == "True"
     args.random_rotate = args.random_rotate == "True"
+    if args.rotation_max_degrees is not None and not 0 <= args.rotation_max_degrees <= 180:
+        parser.error("rotation_max_degrees must be finite and between 0 and 180")
     args.rotation_pivot = args.pivot if args.rotation_pivot is None else args.rotation_pivot
     try:
         levels = ast.literal_eval(args.jitter_max_levels) if args.jitter_max_levels is not None else dict.fromkeys(GAUSSIAN_PARAMETERS, .01)
@@ -311,7 +314,7 @@ def augment_trial(prepared, cameras, args, generator):
     rotated, rotated_cameras = prepared, dict(cameras)
     if args.random_rotate:
         sampler = sample_uniform_z_rotation_quaternion if args.rotation_mode == "gravity_consistent" else sample_uniform_rotation_quaternion
-        rotation = sampler(prepared["means"].dtype, prepared["means"].device, generator)
+        rotation = sampler(prepared["means"].dtype, prepared["means"].device, generator, max_degrees=args.rotation_max_degrees)
         rotated = rotate_gaussians(prepared, rotation, args.rotation_pivot)
         rotated_cameras["camera_to_worlds"] = rotate_camera_to_worlds(cameras["camera_to_worlds"], rotation, args.rotation_pivot)
     augmented, levels = rotated, dict.fromkeys(GAUSSIAN_PARAMETERS, 0.)
@@ -370,7 +373,7 @@ def run_configured(args):
     evaluator = _ImageMetricEvaluator(device)
     original_images = _render_views(original, cameras, args.chunk_size, device)
     baseline = _render_views(prepared, cameras, args.chunk_size, device)
-    settings = {key: getattr(args, key) for key in ("random_jitter", "random_rotate", "rotation_mode", "rotation_pivot",
+    settings = {key: getattr(args, key) for key in ("random_jitter", "random_rotate", "rotation_mode", "rotation_max_degrees", "rotation_pivot",
                 "jitter_max_levels", "seed", "trials", "mae_threshold", "max_error_threshold", "gs_resolution", "dataset_scope")}
     metadata = {"scene_name": scene["scene_name"], "scene_idx": scene["scene_idx"], **settings,
                 "source_resolution": dataset.src_resolution, "target_resolution": dataset.tgt_resolution,

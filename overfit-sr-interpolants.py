@@ -95,9 +95,13 @@ def loss_mixing(schedule="linear"):
 
 @gin.configurable
 def training_augmentation(random_jitter=False, random_rotate=False, jitter_max_levels=None,
-                          rotation_pivot=(0.5, 0.5, 0.5), rotation_mode="full"):
+                          rotation_pivot=(0.5, 0.5, 0.5), rotation_mode="full", rotation_max_degrees=None):
     if rotation_mode not in ("full", "gravity_consistent"):
         raise ValueError("rotation_mode must be 'full' or 'gravity_consistent'")
+    if rotation_max_degrees is not None:
+        rotation_max_degrees = float(rotation_max_degrees)
+        if not math.isfinite(rotation_max_degrees) or not 0 <= rotation_max_degrees <= 180:
+            raise ValueError("rotation_max_degrees must be finite and between 0 and 180")
     if jitter_max_levels is None:
         jitter_max_levels = {key: 0.01 for key in GAUSSIAN_PARAMETERS}
     else:
@@ -112,7 +116,7 @@ def training_augmentation(random_jitter=False, random_rotate=False, jitter_max_l
         raise ValueError("rotation_pivot must contain three finite values")
     return {"random_jitter": bool(random_jitter), "random_rotate": bool(random_rotate),
             "jitter_max_levels": jitter_max_levels, "rotation_pivot": rotation_pivot,
-            "rotation_mode": rotation_mode}
+            "rotation_mode": rotation_mode, "rotation_max_degrees": rotation_max_degrees}
 
 
 def evaluate_single_scene(
@@ -365,7 +369,8 @@ def compute_microbatch_loss(model, scenes, device, flow_cfg, mix_cfg, standardiz
                 sampler = (sample_uniform_z_rotation_quaternion
                            if augmentation_cfg.get("rotation_mode", "full") == "gravity_consistent"
                            else sample_uniform_rotation_quaternion)
-                rotation = sampler(target_gs["means"].dtype, target_gs["means"].device, augmentation_generator)
+                rotation = sampler(target_gs["means"].dtype, target_gs["means"].device, augmentation_generator,
+                                   max_degrees=augmentation_cfg.get("rotation_max_degrees"))
                 pivot = augmentation_cfg["rotation_pivot"]
                 if source_gs is not None:
                     source_gs = rotate_gaussians(source_gs, rotation, pivot)

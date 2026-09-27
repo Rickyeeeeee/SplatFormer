@@ -67,15 +67,29 @@ def _quaternion_to_rotation_matrix(quaternion):
     ).reshape(quaternion.shape[:-1] + (3, 3))
 
 
-def sample_uniform_rotation_quaternion(dtype=torch.float32, device=None, generator=None):
-    """Sample one uniform SO(3) rotation as a unit scalar-first quaternion."""
+def validate_rotation_max_degrees(max_degrees):
+    """Validate an optional physical rotation angle bound."""
+    if max_degrees is not None and (not math.isfinite(float(max_degrees)) or not 0 <= float(max_degrees) <= 180):
+        raise ValueError("rotation_max_degrees must be finite and between 0 and 180")
+
+
+def sample_uniform_rotation_quaternion(dtype=torch.float32, device=None, generator=None, max_degrees=None):
+    """Sample a uniform SO(3) rotation, or a bounded uniform angle and axis."""
+    validate_rotation_max_degrees(max_degrees)
+    if max_degrees is not None:
+        # Bounded sampling is uniform in angle and axis, not Haar measure on SO(3).
+        axis = F.normalize(torch.randn(3, dtype=dtype, device=device, generator=generator), dim=-1)
+        half_angle = torch.rand((), dtype=dtype, device=device, generator=generator) * math.radians(float(max_degrees)) / 2
+        return torch.cat((half_angle.cos().reshape(1), axis * half_angle.sin()))
     quaternion = torch.randn(4, dtype=dtype, device=device, generator=generator)
     return F.normalize(quaternion, dim=-1)
 
 
-def sample_uniform_z_rotation_quaternion(dtype=torch.float32, device=None, generator=None):
+def sample_uniform_z_rotation_quaternion(dtype=torch.float32, device=None, generator=None, max_degrees=None):
     """Sample a uniform yaw around world Z as a scalar-first quaternion."""
-    half_angle = math.pi * torch.rand((), dtype=dtype, device=device, generator=generator)
+    validate_rotation_max_degrees(max_degrees)
+    sample = torch.rand((), dtype=dtype, device=device, generator=generator)
+    half_angle = math.pi * sample if max_degrees is None else (sample - 0.5) * math.radians(float(max_degrees))
     zero = torch.zeros_like(half_angle)
     return torch.stack((half_angle.cos(), zero, zero, half_angle.sin()))
 

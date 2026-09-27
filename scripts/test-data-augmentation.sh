@@ -17,6 +17,9 @@ args=(
     --gin_param "SplatFactoSRDataset.src_resolution=${INPUT_RESOLUTION:-32}"
     --gin_param "SplatFactoSRDataset.tgt_resolution=${TARGET_RESOLUTION:-128}"
 )
+if [[ -n "${ROTATION_MAX_DEGREES:-}" ]]; then
+    args+=(--rotation_max_degrees "$ROTATION_MAX_DEGREES")
+fi
 if [[ -n "${JITTER_MAX_LEVELS:-}" ]]; then
     args+=(--jitter_max_levels "$JITTER_MAX_LEVELS")
 fi

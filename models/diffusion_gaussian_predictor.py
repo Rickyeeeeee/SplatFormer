@@ -49,6 +49,7 @@ class DiffusionGaussianPredictor(nn.Module):
         fourier_include_raw=True,
         fourier_log_sampling=True,
         fourier_max_frequency_log2=None,
+        shift_negative_grid_coords=False,
     ):
         super().__init__()
         if quat_residual_mode != "add":
@@ -60,6 +61,7 @@ class DiffusionGaussianPredictor(nn.Module):
         self.output_features = list(output_features)
         self.input_feat_to_mlp = input_feat_to_mlp
         self.grid_resolution = grid_resolution
+        self.shift_negative_grid_coords = shift_negative_grid_coords
         self.resume_ckpt = resume_ckpt
         self.quat_residual_mode = quat_residual_mode
         self.backbone_type = "DIPT"
@@ -140,10 +142,18 @@ class DiffusionGaussianPredictor(nn.Module):
         if timesteps.numel() != len(batch_flow_gs):
             raise ValueError(f"Expected one timestep per scene, got {timesteps.numel()}")
 
+        # Translate only negative grid axes, independently for each scene.
+        batch_grid_coords = []
+        for reference_means in batch_reference_means:
+            grid = torch.floor(reference_means * self.grid_resolution).int()
+            if self.shift_negative_grid_coords:
+                grid = grid - grid.amin(dim=0, keepdim=True).clamp(max=0)
+            batch_grid_coords.append(grid)
+
         # Reference means fix spatial serialization while feat carries the noisy state.
         model_input = {
             "coord": coord,
-            "grid_coord": torch.floor(coord * self.grid_resolution).int(),
+            "grid_coord": torch.cat(batch_grid_coords, dim=0),
             "grid_size": coord.new_full((3,), 1.0 / self.grid_resolution),
             "offset": offset,
             "feat": feat,
