@@ -29,6 +29,7 @@ SHAPES = {
 
 def load_definitions(names, namespace):
     tree = ast.parse(VIEWER.read_text())
+    tree.body.extend(ast.parse((ROOT / "utils/gaussian_viewer.py").read_text()).body)
     tree.body = [
         node for node in tree.body
         if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in names

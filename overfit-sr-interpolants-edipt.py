@@ -96,7 +96,10 @@ def loss_mixing(schedule="linear"):
 
 @gin.configurable
 def training_augmentation(random_jitter=False, random_rotate=False, jitter_max_levels=None,
-                          rotation_pivot=(0.5, 0.5, 0.5), rotation_mode="full", rotation_max_degrees=None):
+                          rotation_pivot=(0.5, 0.5, 0.5), rotation_mode="full", rotation_max_degrees=None,
+                          serialization_reference="augmented"):
+    if serialization_reference not in ("augmented", "unaugmented"):
+        raise ValueError("serialization_reference must be augmented or unaugmented")
     if rotation_mode not in ("full", "gravity_consistent"):
         raise ValueError("rotation_mode must be 'full' or 'gravity_consistent'")
     if rotation_max_degrees is not None:
@@ -117,7 +120,8 @@ def training_augmentation(random_jitter=False, random_rotate=False, jitter_max_l
         raise ValueError("rotation_pivot must contain three finite values")
     return {"random_jitter": bool(random_jitter), "random_rotate": bool(random_rotate),
             "jitter_max_levels": jitter_max_levels, "rotation_pivot": rotation_pivot,
-            "rotation_mode": rotation_mode, "rotation_max_degrees": rotation_max_degrees}
+            "rotation_mode": rotation_mode, "rotation_max_degrees": rotation_max_degrees,
+            "serialization_reference": serialization_reference}
 
 
 def evaluate_single_scene(
@@ -164,6 +168,7 @@ def evaluate_single_scene(
         out_gs = interpolants.sample_flow_model(model, source_flow_gs, scene_idx, flow_steps, standardizer,
                                                mode=flow_cfg["interpolant_type"], target_means=gt_gs["means"],
                                                t_eps=flow_cfg["flow_t_eps"], noise_seed=flow_cfg["eval_noise_seed"], rotation_noise_std=flow_cfg["rotation_noise_std"])
+        out_gs = interpolants.restore_evaluation_sh(model, out_gs, gt_gs)
         pred_preview = []
         gt_preview = []
 
@@ -350,6 +355,8 @@ def compute_microbatch_loss(model, scenes, device, flow_cfg, mix_cfg, standardiz
     augmentation_cfg = augmentation_cfg or {"random_jitter": False, "random_rotate": False}
     if augmentation_cfg["random_jitter"] and mode == "one_sided":
         raise ValueError("Random source jitter is incompatible with one_sided interpolation")
+    if not getattr(model, "use_features_rest", True) and not is_fm_only:
+        raise ValueError("SH-disabled isolation requires fm-only training")
     samples = []
     for active in scenes:
         t = torch.empty(1, device=device).uniform_(float(flow_cfg["flow_t_eps"]), 1.0 - float(flow_cfg["flow_t_eps"]))
@@ -394,7 +401,15 @@ def compute_microbatch_loss(model, scenes, device, flow_cfg, mix_cfg, standardiz
             target = gpu_utils.move_to_device(active["target_flow_gs"], device)
             source_means = None if mode == "one_sided" else active["source_gs"]["means"].to(device)
             target_means = active["target_gs"]["means"].to(device)
+        # Reference rows stay aligned with prepared endpoints, independently of augmentation.
+        if augmentation_cfg.get("serialization_reference", "augmented") == "unaugmented":
+            source_means = None if mode == "one_sided" else active["source_gs"]["means"].to(device)
+            target_means = active["target_gs"]["means"].to(device)
+        source = interpolants.active_attributes(model, source)
+        target = interpolants.active_attributes(model, target)
         noise = gpu_utils.move_to_device(active["fixed_train_noise"], device) if flow_cfg.get("fixed_train_noise", False) else None
+        if noise is not None:
+            noise = {**noise, "euclidean": interpolants.active_attributes(model, noise["euclidean"])}
         path = interpolants.construct_path(source, target, t, mode, source_means, target_means,
                                            float(flow_cfg["flow_noise_std"]), noise=noise, rotation_noise_std=flow_cfg["rotation_noise_std"])
         samples.append({**path, "source": source, "target": target, "t": t,
@@ -501,6 +516,9 @@ def training(
         handle.write("\n")
 
     model = EquivariantGaussianDiPTPredictor().to(device)
+    if not model.use_features_rest and mix_cfg["schedule"] != "fm-only":
+        raise ValueError("SH-disabled isolation requires fm-only training")
+    logger.info(f"use_features_rest={model.use_features_rest} evaluation_ground_truth_SH={not model.use_features_rest}")
     expected_rest = ((model.sh_degree + 1) ** 2 - 1, 3)
     if tuple(standardizer.means["features_rest"].shape) != expected_rest:
         raise ValueError(f"Model SH degree {model.sh_degree} does not match statistics SH shape")
@@ -526,7 +544,7 @@ def training(
         prepared["render_view_count"] = 0 if is_fm_only else min(dataset.image_per_scene or view_count, view_count)
         if flow_cfg["fixed_train_noise"]:
             prepared["fixed_train_noise"] = interpolants.seeded_noise_like(
-                prepared["target_flow_gs"], int(flow_cfg["train_noise_seed"]) + int(prepared["scene_idx"])
+                interpolants.active_attributes(model, prepared["target_flow_gs"]), int(flow_cfg["train_noise_seed"]) + int(prepared["scene_idx"])
             )
         if not prepared["target_images"]:
             raise ValueError(f"Scene {scene_name!r} has no target views")
@@ -669,6 +687,7 @@ def training(
                     model, source_flow_gs, active["scene_idx"], int(flow_cfg["flow_steps"]), standardizer,
                     mode=flow_cfg["interpolant_type"], target_means=active["target_gs"]["means"].to(device),
                     t_eps=flow_cfg["flow_t_eps"], noise_seed=flow_cfg["eval_noise_seed"], rotation_noise_std=flow_cfg["rotation_noise_std"])
+                train_out_gs = interpolants.restore_evaluation_sh(model, train_out_gs, active["target_gs"])
                 pred_imgs, _ = gs_utils.rasterize_gaussians_to_multiimgs(train_out_gs, gpu_utils.move_to_device(active["target_cameras"], device))
                 pred_imgs_uint8 = [(im * 255).detach().cpu().numpy().astype(np.uint8) for im in pred_imgs[:9]]
                 if len(pred_imgs_uint8) > 0:

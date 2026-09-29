@@ -1,6 +1,7 @@
 """Gaussian attribute velocities around EDiPT; no training/rollout integration.
 
-Color coefficients are ordinary features with no SH basis conversion. Attribute
+Color coefficients are ordinary features with no SH basis conversion.
+use_features_rest=False removes higher-order SH from both inputs and heads. Attribute
 velocities use caller coordinates; position and quaternion derivatives use the
 explicit physical geometry. Quaternion derivatives need compatible tangent
 training targets, not the existing additive quaternion endpoint differences.
@@ -18,18 +19,19 @@ from utils.data_augmentation import quaternion_multiply, quaternion_to_rotation_
 @gin.configurable
 class EquivariantGaussianDiPTPredictor(nn.Module):
     def __init__(self, sh_degree=1, input_feat_to_mlp=True, output_head_width=64,
-                 grid_resolution=1536, zeroinit=True):
+                 grid_resolution=1536, zeroinit=True, use_features_rest=True):
         super().__init__()
         if not isinstance(sh_degree, int) or sh_degree < 0:
             raise ValueError("sh_degree must be a nonnegative integer")
         if not math.isfinite(grid_resolution) or grid_resolution <= 0:
             raise ValueError("grid_resolution must be finite and positive")
         self.sh_degree = sh_degree
+        self.use_features_rest = use_features_rest
         self.grid_resolution = grid_resolution
         self.input_feat_to_mlp = input_feat_to_mlp
         self.backbone_type = 'EDIPT'
         self.feature_channels = {'scales': 3, 'opacities': 1, 'features_dc': 3}
-        if sh_degree:
+        if sh_degree and use_features_rest:
             self.feature_channels['features_rest'] = 3 * ((sh_degree + 1) ** 2 - 1)
         self.input_features = list(self.feature_channels)
         self.output_features = ['means', 'quats', *self.input_features]
@@ -109,7 +111,7 @@ class EquivariantGaussianDiPTPredictor(nn.Module):
             output['means'] = torch.einsum('nij,nj->ni', rotations, output['means'].float())
             angular = output['quats'].float()
             output['quats'] = 0.5 * quaternion_multiply(quats, torch.cat([torch.zeros_like(angular[:, :1]), angular], dim=-1))
-        if self.sh_degree:
+        if self.sh_degree and self.use_features_rest:
             output['features_rest'] = output['features_rest'].reshape(len(feat), -1, 3)
         splits = {key: value.split(counts) for key, value in output.items()}
         return [{key: pieces[index] for key, pieces in splits.items()} for index in range(scenes)]

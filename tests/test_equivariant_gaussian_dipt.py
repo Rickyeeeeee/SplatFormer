@@ -67,6 +67,31 @@ EquivariantGaussianDiPT.frequency_embedding_size = 8
                 self.assertNotIn('features_rest', outputs[0])
             self.assertFalse(any('SubMConv' in type(m).__name__ for m in model.modules()))
 
+    def test_excluded_sh_has_no_effect_or_gradients(self):
+        states, geometry = self.scenes()
+        model = EquivariantGaussianDiPTPredictor(use_features_rest=False, zeroinit=False).eval()
+        self.assertEqual(model.gs_features_dim, 7)
+        self.assertNotIn('features_rest', model.features_outputhead)
+        for state in states:
+            state['features_rest'].requires_grad_()
+        baseline = model(states, t=.3, batch_geometry=geometry)
+        sum(value.square().sum() for out in baseline for value in out.values()).backward()
+        for state in states:
+            self.assertIsNone(state['features_rest'].grad)
+        changed = [{**state, 'features_rest': torch.full_like(state['features_rest'], float('nan'))} for state in states]
+        result = model(changed, t=.3, batch_geometry=geometry)
+        for first, second in zip(baseline, result):
+            self.assertNotIn('features_rest', second)
+            for key in first:
+                torch.testing.assert_close(first[key], second[key], atol=0, rtol=0)
+
+        flipped = [{**geom, 'quats': -geom['quats']} for geom in geometry]
+        flipped_output = model(states, t=.3, batch_geometry=flipped)
+        for geom, first, second in zip(geometry, baseline, flipped_output):
+            torch.testing.assert_close((geom['quats'] * first['quats']).sum(-1), torch.zeros(len(geom['quats'])), atol=1e-6, rtol=0)
+            for key in first:
+                torch.testing.assert_close(second[key], -first[key] if key == 'quats' else first[key])
+
     def test_predictor_rigid_transform_and_quaternion_sign(self):
         states, geometry = self.scenes()
         model = EquivariantGaussianDiPTPredictor(zeroinit=False).eval()
@@ -178,15 +203,17 @@ EquivariantGaussianDiPT.frequency_embedding_size = 8
         states, geometry = self.scenes()
         states = [{k: v.cuda() for k, v in s.items()} for s in states]
         geometry = [{k: v.cuda().requires_grad_() for k, v in g.items()} for g in geometry]
-        model = EquivariantGaussianDiPTPredictor(zeroinit=False).cuda().train()
-        with torch.autocast('cuda', dtype=torch.float16):
-            outputs = model(states, t=.5, batch_geometry=geometry)
-            loss = sum(v.float().square().mean() for out in outputs for v in out.values())
-        loss.backward()
-        self.assertTrue(torch.isfinite(loss))
-        for parameter in model.parameters():
-            self.assertIsNotNone(parameter.grad)
-            self.assertTrue(torch.isfinite(parameter.grad).all())
+        for use_rest in (True, False):
+            model = EquivariantGaussianDiPTPredictor(zeroinit=False, use_features_rest=use_rest).cuda().train()
+            with torch.autocast('cuda', dtype=torch.float16):
+                outputs = model(states, t=.5, batch_geometry=geometry)
+                loss = sum(v.float().square().mean() for out in outputs for v in out.values())
+            loss.backward()
+            self.assertTrue(torch.isfinite(loss))
+            for parameter in model.parameters():
+                self.assertIsNotNone(parameter.grad)
+                self.assertTrue(torch.isfinite(parameter.grad).all())
+
 
 
 if __name__ == '__main__':

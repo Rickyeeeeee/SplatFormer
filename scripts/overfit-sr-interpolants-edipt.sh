@@ -110,6 +110,16 @@ if [[ "${random_rotate}" == "True" ]]; then
     fi
 fi
 
+serialization_reference=${SERIALIZATION_REFERENCE:-augmented}
+case "$serialization_reference" in
+    augmented) ;;
+    unaugmented) augmentation_suffix+=_unaugmented_serialization ;;
+    *) echo "Invalid SERIALIZATION_REFERENCE: $serialization_reference" >&2; exit 1 ;;
+esac
+if [[ "${GS_USE_FEATURES_REST:-True}" == "False" ]]; then
+    augmentation_suffix+=_no_rest_gtsh_eval
+fi
+
 out_name=${scene_label}_\
 ${alignment}_\
 ${attribute_init}_\
@@ -134,7 +144,7 @@ for network in "${backbone_class}" "${predictor_class}"; do
             ;;
         EquivariantGaussianDiPTPredictor)
             prefix=GS
-            parameters=(sh_degree input_feat_to_mlp output_head_width zeroinit)
+            parameters=(sh_degree input_feat_to_mlp output_head_width zeroinit use_features_rest)
             ;;
     esac
     for parameter in "${parameters[@]}"; do
@@ -147,6 +157,7 @@ for network in "${backbone_class}" "${predictor_class}"; do
 done
 network_gin_args+=("--gin_param=${predictor_class}.grid_resolution=${grid_resolution}")
 augmentation_gin_args=(
+    "--gin_param=training_augmentation.serialization_reference='$serialization_reference'"
     "--gin_param=training_augmentation.random_jitter=${random_jitter}"
     "--gin_param=training_augmentation.random_rotate=${random_rotate}"
     "--gin_param=training_augmentation.rotation_max_degrees=${rotation_max_degrees}"

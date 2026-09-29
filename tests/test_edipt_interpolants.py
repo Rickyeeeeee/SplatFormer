@@ -29,7 +29,10 @@ class ConstantField(torch.nn.Module):
         self.last_geometry = None
 
     def forward(self, batch_flow_gs, batch_scene_idx, batch_geometry, batch_reference_means, t):
+        self.last_time = t
         self.last_geometry = batch_geometry
+        self.last_references = batch_reference_means
+        self.last_states = batch_flow_gs
         result = []
         for state, geometry in zip(batch_flow_gs, batch_geometry):
             output = {key: torch.zeros_like(value) + self.angular[0] for key, value in state.items()}
@@ -171,6 +174,60 @@ class ManifoldTests(unittest.TestCase):
                     compute(b, [scene], 'cpu', cfg, {'schedule': 'fm-only'}, self.standardizer, 0., 0., None, False)[0].div(2).backward()
                 torch.testing.assert_close(a.angular.grad, b.angular.grad, atol=1e-5, rtol=1e-4)
 
+    def test_isolation_paths_sampling_and_oracle_sh(self):
+        model = ConstantField()
+        model.use_features_rest = False
+        model.sh_degree = 1
+        source, target = flow.active_attributes(model, self.x0), flow.active_attributes(model, self.x1)
+        for mode in flow.MODES:
+            for time in (.25, .5, .75):
+                path = flow.construct_path(source, target, time, mode, self.source['means'], self.target['means'])
+                self.assertNotIn('features_rest', path['query'])
+                self.assertNotIn('features_rest', path['velocity'])
+                self.assertNotIn('features_rest', path['noise']['euclidean'])
+                expected = self.target['means'] if mode == 'one_sided' or (mode == 'encoding_decoding' and time >= .5) else self.source['means']
+                torch.testing.assert_close(path['reference_means'], expected)
+            sampled = flow.sample_flow_model(model, self.source, 0, 4, self.standardizer, mode,
+                                              target_means=self.target['means'])
+            self.assertNotIn('features_rest', sampled)
+            restored = flow.restore_evaluation_sh(model, sampled, self.target)
+            torch.testing.assert_close(restored['features_rest'], self.target['features_rest'], atol=0, rtol=0)
+            self.assertNotEqual(restored['features_rest'].data_ptr(), self.target['features_rest'].data_ptr())
+            with self.assertRaises(ValueError):
+                flow.restore_evaluation_sh(model, sampled, {**self.target, 'features_rest': self.target['features_rest'][:1]})
+
+    def test_unaugmented_microbatch_references(self):
+        tree = ast.parse((ROOT / 'overfit-sr-interpolants-edipt.py').read_text())
+        node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'compute_microbatch_loss')
+        namespace = {'torch': torch, 'np': np, 'gpu_utils': gpu_utils, 'interpolants': flow,
+                     'flow': SimpleNamespace(loss_mix_weights=loss_mix_weights)}
+        for name in ('sample_uniform_z_rotation_quaternion', 'sample_uniform_rotation_quaternion',
+                     'rotate_gaussians', 'rotate_camera_to_worlds', 'jitter_gaussian_parameters'):
+            namespace[name] = getattr(data_augmentation, name)
+        exec(compile(ast.Module(body=[node], type_ignores=[]), '<edipt-isolation>', 'exec'), namespace)
+        scene = {'source_gs': self.source, 'target_gs': self.target, 'source_flow_gs': self.x0,
+                 'target_flow_gs': self.x1, 'scene_idx': 0}
+        model = ConstantField()
+        model.use_features_rest = False
+        for mode in flow.MODES:
+            for angle in (1., 45., 180.):
+                cfg = {'interpolant_type': mode, 'flow_t_eps': 1e-4, 'flow_noise_std': .2,
+                       'rotation_noise_std': .3, 'rotation_loss_weight': 1., 'loss_type': 'velocity', 'loss_rollout_steps': 4}
+                augmentation = {'random_rotate': True, 'random_jitter': mode != 'one_sided',
+                                'rotation_pivot': (0., 0., 0.), 'rotation_max_degrees': angle,
+                                'jitter_max_levels': {'means': .01}, 'serialization_reference': 'unaugmented'}
+                loss, _ = namespace['compute_microbatch_loss'](model, [scene, scene], 'cpu', cfg,
+                         {'schedule': 'fm-only'}, self.standardizer, 0., 0., None, False, augmentation)
+                self.assertTrue(torch.isfinite(loss))
+                for time, ref, geom, state in zip(model.last_time, model.last_references, model.last_geometry, model.last_states):
+                    expected = self.target['means'] if mode == 'one_sided' or (mode == 'encoding_decoding' and time >= .5) else self.source['means']
+                    torch.testing.assert_close(ref, expected, atol=0, rtol=0)
+                    self.assertFalse(torch.equal(ref, geom['means']))
+                    self.assertNotIn('features_rest', state)
+                with self.assertRaisesRegex(ValueError, 'fm-only'):
+                    namespace['compute_microbatch_loss'](model, [scene], 'cpu', cfg,
+                        {'schedule': 'linear'}, self.standardizer, 1., 0., None, False, augmentation)
+
     @unittest.skipUnless(torch.cuda.is_available(), 'CUDA unavailable')
     def test_cuda_edipt_training_objectives(self):
         import gin
@@ -212,12 +269,15 @@ EquivariantGaussianDiPT.frequency_embedding_size = 8
         executable.write_text('#!/bin/bash\nprintf "%s\\n" "$@"\n')
         executable.chmod(0o755)
         env = {**os.environ, 'PATH': self.temp.name + ':' + os.environ['PATH'], 'EDIPT_DEPTH': '2', 'GS_SH_DEGREE': '1',
-               'ROTATION_NOISE_STD': '.4', 'ROTATION_LOSS_WEIGHT': '2', 'QUATERNION_REPRESENTATION': 'unit_unstandardized'}
+               'SERIALIZATION_REFERENCE': 'unaugmented', 'GS_USE_FEATURES_REST': 'False', 'ROTATION_NOISE_STD': '.4', 'ROTATION_LOSS_WEIGHT': '2', 'QUATERNION_REPRESENTATION': 'unit_unstandardized'}
         command = ['bash', 'scripts/overfit-sr-interpolants-edipt.sh', '2', '1', '1', '1']
         result = subprocess.run(command, cwd=ROOT, env=env, text=True, capture_output=True, check=True)
         self.assertIn('overfit-sr-interpolants-edipt.py', result.stdout)
         self.assertIn('EquivariantGaussianDiPT.depth=2', result.stdout)
         self.assertIn('flow_matching.rotation_noise_std=.4', result.stdout)
+        self.assertIn("training_augmentation.serialization_reference='unaugmented'", result.stdout)
+        self.assertIn('EquivariantGaussianDiPTPredictor.use_features_rest=False', result.stdout)
+        self.assertIn('_unaugmented_serialization_no_rest_gtsh_eval', result.stdout)
         self.assertNotIn('--predictor=', result.stdout)
         self.assertNotIn('DiffusionGaussianPredictor.', result.stdout)
         env['QUATERNION_REPRESENTATION'] = 'raw_standardized'

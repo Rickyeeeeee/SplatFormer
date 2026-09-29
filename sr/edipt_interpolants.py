@@ -15,6 +15,25 @@ from utils.rotation_flow import (integrate_rotation, quaternion_derivative_to_bo
                                  relative_rotation, rotation_exp)
 
 
+def active_attributes(model, state):
+    """Select flow attributes without changing stored dataset/statistics tensors."""
+    if state is None:
+        return None
+    return {key: value for key, value in state.items()
+            if key != 'features_rest' or getattr(model, 'use_features_rest', True)}
+
+
+def restore_evaluation_sh(model, prediction, matched_target):
+    """Attach oracle SH only after sampling; target rows must match prepared endpoints."""
+    if getattr(model, 'use_features_rest', True):
+        return prediction
+    rest = matched_target['features_rest']
+    expected = (len(prediction['means']), (model.sh_degree + 1) ** 2 - 1, 3)
+    if rest.shape != expected:
+        raise ValueError(f'Matched evaluation SH must have shape {expected}')
+    return {**prediction, 'features_rest': rest.detach().to(prediction['means']).clone()}
+
+
 def evaluation_steps(mode):
     return [4, 6, 10] if mode == 'encoding_decoding' else [1, 5, 10]
 
@@ -151,6 +170,9 @@ def attribute_mse(prediction, target, loss_type='velocity', rotation_loss_weight
 def rollout(model, source, scene_idx, steps, mode, source_means, target_means, initial_noise=None,
             t_eps=1e-4, *, standardizer, rotation_noise_std=.3):
     validate_settings(mode, steps, t_eps)
+    source = active_attributes(model, source)
+    if initial_noise is not None:
+        initial_noise = {**initial_noise, 'euclidean': active_attributes(model, initial_noise['euclidean'])}
     if mode == 'one_sided':
         if initial_noise is None:
             raise ValueError('one_sided rollout requires initial noise')
@@ -180,11 +202,11 @@ def sample_flow_model(model, source, scene_idx, flow_steps, standardizer, mode='
             raise ValueError('one_sided sampling requires target reference means')
         template = {key: torch.empty((len(target_means),) + tuple(mean.shape), device=target_means.device)
                     for key, mean in standardizer.means.items()}
-        noise = seeded_noise_like(template, int(noise_seed) + int(scene_idx))
+        noise = seeded_noise_like(active_attributes(model, template), int(noise_seed) + int(scene_idx))
         state, source_means = None, None
     else:
         source, _ = standardizer.prepare_endpoints(source)
-        state, source_means = standardizer.encode(source), source['means']
+        state, source_means = active_attributes(model, standardizer.encode(source)), source['means']
     endpoint = rollout(model, state, scene_idx, flow_steps, mode, source_means, target_means, noise, t_eps,
                        standardizer=standardizer, rotation_noise_std=rotation_noise_std)
     return standardizer.decode(endpoint)
