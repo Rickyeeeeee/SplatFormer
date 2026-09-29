@@ -48,7 +48,8 @@ def quaternion_inverse(quaternion):
     return conjugate / norm_squared
 
 
-def _quaternion_to_rotation_matrix(quaternion):
+def quaternion_to_rotation_matrix(quaternion):
+    """Convert scalar-first quaternions to local-to-world rotation matrices."""
     quaternion = F.normalize(quaternion, dim=-1)
     w, x, y, z = quaternion.unbind(dim=-1)
     return torch.stack(
@@ -65,6 +66,10 @@ def _quaternion_to_rotation_matrix(quaternion):
         ),
         dim=-1,
     ).reshape(quaternion.shape[:-1] + (3, 3))
+
+
+# Preserve the existing private name for augmentation callers.
+_quaternion_to_rotation_matrix = quaternion_to_rotation_matrix
 
 
 def validate_rotation_max_degrees(max_degrees):

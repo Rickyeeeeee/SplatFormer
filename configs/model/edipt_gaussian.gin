@@ -1,0 +1,20 @@
+# Colors, including higher-order SH, remain ordinary feature channels.
+EquivariantGaussianDiPTPredictor.sh_degree = 1
+EquivariantGaussianDiPTPredictor.input_feat_to_mlp = True
+EquivariantGaussianDiPTPredictor.output_head_width = 64
+EquivariantGaussianDiPTPredictor.grid_resolution = 1536
+EquivariantGaussianDiPTPredictor.zeroinit = True
+
+EquivariantGaussianDiPT.depth = 12
+EquivariantGaussianDiPT.channels = 384
+EquivariantGaussianDiPT.num_head = 6
+EquivariantGaussianDiPT.patch_size = 256
+EquivariantGaussianDiPT.order = ('z', 'z-trans')
+EquivariantGaussianDiPT.mlp_ratio = 4
+EquivariantGaussianDiPT.frequency_embedding_size = 256
+EquivariantGaussianDiPT.geometry_channels = 16
+EquivariantGaussianDiPT.geometry_length_scale = 1.0
+EquivariantGaussianDiPT.attn_drop = 0.0
+EquivariantGaussianDiPT.proj_drop = 0.0
+EquivariantGaussianDiPT.drop_path = 0.0
+EquivariantGaussianDiPT.shuffle_orders = True
