@@ -122,7 +122,7 @@ class GSFlowPredictor(nn.Module):
     def _feature_tensor(self, gs, key):
         value = gs[key]
         if key == "features_rest":
-            return value.view(value.shape[0], -1)
+            return value.reshape(value.shape[0], -1)
         return value
 
     def _input_feature_tensor(self, gs, key):

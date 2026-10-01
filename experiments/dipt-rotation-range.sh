@@ -1,6 +1,6 @@
 #!/bin/bash
 set -euo pipefail
-export GPU_ID=${GPU_ID:-3}
+export GPU_ID=${GPU_ID:-1}
 
 # RANDOM_JITTER=True \
 # JITTER_MAX_LEVELS="{
@@ -12,26 +12,27 @@ export GPU_ID=${GPU_ID:-3}
 # 'features_rest': 0.1
 # }" \
 # Keep jitter off to isolate the effect of rotation range; 0 degrees is identity.
-for angle in ${ROTATION_RANGES:-90 180}; do
-    INTERPOLANT_TYPE=linear \
-    RANDOM_JITTER=False \
-    RANDOM_ROTATE=True \
-    ROTATION_MODE=${ROTATION_MODE:-gravity_consistent} \
-    ROTATION_MAX_DEGREES="$angle" \
-    GS_SHIFT_NEGATIVE_GRID_COORDS=True \
-    QUATERNION_REPRESENTATION=unit_unstandardized \
-    OUTPUT_DIR="${OUTPUT_ROOT:-/project2/ricky/experiments/rotation_range}/${ROTATION_MODE:-gravity_consistent}_${angle}deg" \
-    bash scripts/overfit-sr-interpolants.sh "$@"
-done
+# for angle in ${ROTATION_RANGES:-90 180}; do
+#     INTERPOLANT_TYPE=linear \
+#     RANDOM_JITTER=False \
+#     RANDOM_ROTATE=True \
+#     ROTATION_MODE=${ROTATION_MODE:-gravity_consistent} \
+#     ROTATION_MAX_DEGREES="$angle" \
+#     GS_SHIFT_NEGATIVE_GRID_COORDS=True \
+#     QUATERNION_REPRESENTATION=unit_unstandardized \
+#     OUTPUT_DIR="${OUTPUT_ROOT:-/project2/ricky/experiments/0929/rotation_range}/${ROTATION_MODE:-gravity_consistent}_${angle}deg" \
+#     bash scripts/overfit-sr-interpolants.sh "$@"
+# done
 
-for angle in ${ROTATION_RANGES:-90 180}; do
+for angle in ${ROTATION_RANGES:-0 45 90 180}; do
     INTERPOLANT_TYPE=linear \
+    BATCH_SIZE=8 \
     RANDOM_JITTER=True \
     RANDOM_ROTATE=True \
     ROTATION_MODE=${ROTATION_MODE:-gravity_consistent} \
     ROTATION_MAX_DEGREES="$angle" \
     GS_SHIFT_NEGATIVE_GRID_COORDS=True \
     QUATERNION_REPRESENTATION=unit_unstandardized \
-    OUTPUT_DIR="${OUTPUT_ROOT:-/project2/ricky/experiments/rotation_range}/${ROTATION_MODE:-gravity_consistent}_${angle}deg" \
+    OUTPUT_DIR="${OUTPUT_ROOT:-/project2/ricky/experiments/0929/rotation_range_512}/${ROTATION_MODE:-gravity_consistent}_${angle}deg" \
     bash scripts/overfit-sr-interpolants.sh "$@"
 done
