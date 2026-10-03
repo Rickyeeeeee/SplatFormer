@@ -14,6 +14,7 @@ import torch
 from scripts import visualize_augmentations as script
 from sr import edipt_interpolants, interpolants
 from utils import augmentation_viewer as viewer
+from utils.dipt_partitions import attention_layout, neighborhood, partition_views, rotated_orders
 from utils.data_augmentation import (GAUSSIAN_PARAMETERS, jitter_gaussian_parameter,
                                      jitter_gaussian_parameters, rotate_gaussians,
                                      sample_uniform_rotation_quaternion, sample_uniform_z_rotation_quaternion)
@@ -169,6 +170,41 @@ class AugmentationViewerTests(unittest.TestCase):
                     torch.testing.assert_close(actual["offsets"], offsets.long())
                     expected_ids = unpad[order.argsort()] // actual["effective_size"]
                     torch.testing.assert_close(actual["ids"], expected_ids)
+
+    def test_shifted_partitions_keep_scenes_separate_and_show_actual_neighbors(self):
+        order = torch.tensor([3, 1, 0, 2, 8, 4, 5, 6, 7])
+        offset = torch.tensor([4, 9])
+        layout = attention_layout(order, offset, 4, shift=1)
+        self.assertEqual(layout["offsets"].tolist(), [0, 3, 4, 7, 9])
+        self.assertEqual(neighborhood(layout, 3).tolist(), [0, 1, 3])
+        self.assertEqual(neighborhood(layout, 8).tolist(), [4, 5, 8])
+        for query in range(4):
+            self.assertTrue((neighborhood(layout, query) < 4).all())
+        for query in range(4, 9):
+            self.assertTrue((neighborhood(layout, query) >= 4).all())
+
+    def test_rotated_orders_and_seven_distinct_both_views(self):
+        means = torch.tensor([[.6, .5, .5], [.5, .6, .5], [.4, .5, .5], [.5, .4, .5]])
+        offset = torch.tensor([4])
+        orders = rotated_orders(means, offset, 16, True, ("z", "z-trans"), 4)
+        self.assertEqual([name for name, _, _ in partition_views("both", 8)],
+                         ["0°", "90°", "180°", "270°", "shift 1/4 K", "shift 2/4 K", "shift 3/4 K"])
+        for turn in (1, 2, 3):
+            for row in orders[turn]:
+                self.assertEqual(sorted(row.tolist()), list(range(4)))
+        self.assertFalse(torch.equal(orders[1][0], orders[2][0]))
+
+    def test_viewer_partition_layouts_and_union_exclude_borrowed_duplicates(self):
+        comparison = self.comparison()
+        comparison.augment(self.augmentation, 53)
+        views = comparison.partition_layouts("Source", "linear", 0., "augmented", 0, "z", 4, "both")
+        self.assertEqual(len(views), 7)
+        for pair in views.values():
+            for layout in pair:
+                self.assertEqual(len(layout["ids"]), len(self.source["means"]))
+                self.assertLessEqual(len(neighborhood(layout, 0)), layout["effective_size"])
+        zero = comparison.layouts("Source", "linear", 0., "augmented", 0, "z", 4)
+        torch.testing.assert_close(views["0°"][0]["members"], zero[0]["members"])
 
     def test_edipt_patch_members_and_masks_match_attention(self):
         from models.equivariant_gaussian_dipt import GeometricAttention

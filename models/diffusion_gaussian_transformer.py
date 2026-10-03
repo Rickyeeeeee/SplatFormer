@@ -15,6 +15,8 @@ from pointcept.models.point_prompt_training import PDNorm
 from pointcept.models.point_transformer_v3 import Block, Embedding
 from pointcept.models.utils.misc import offset2bincount
 from pointcept.models.utils.structure import Point
+from pointcept.models.point_transformer_v3.point_transformer_v3m1_base import flash_attn
+from utils.dipt_partitions import PARTITION_MODES, attention_layout, partition_views, rotated_orders
 
 
 class TimestepEmbedding(nn.Module):
@@ -42,8 +44,9 @@ class TimestepEmbedding(nn.Module):
 class GaussianDiffusionBlock(Block):
     """Apply per-scene time modulation to a Pointcept transformer block."""
 
-    def __init__(self, channels, time_channels, **kwargs):
+    def __init__(self, channels, time_channels, partition_mode="single", **kwargs):
         super().__init__(channels=channels, **kwargs)
+        self.partition_mode = partition_mode
         self.time_projection = nn.Identity() if time_channels == channels else nn.Linear(time_channels, channels)
         self.adaLN_modulation = nn.Sequential(nn.GELU(), nn.Linear(channels, 6 * channels))
 
@@ -68,7 +71,25 @@ class GaussianDiffusionBlock(Block):
                 if key.startswith("rel_pos_"):
                     point.pop(key)
             point.attention_patch_size = patch_size
-        point = self.drop_path(self.attn(point))
+        if self.partition_mode == "single":
+            point = self.drop_path(self.attn(point))
+        else:
+            # Project once, then attend independently from the same modulated input.
+            source_feat = point.feat
+            qkv = self.attn.qkv(source_feat)
+            result = torch.zeros_like(source_feat)
+            views = partition_views(self.partition_mode, patch_size)
+            for _, turn, shift in views:
+                order = point.partition_orders[turn][self.attn.order_index]
+                layout = attention_layout(order, point.offset, patch_size, shift)
+                packed = qkv[layout["members"]].half().reshape(-1, 3, self.attn.num_heads, self.attn.channels // self.attn.num_heads)
+                attended = flash_attn.flash_attn_varlen_qkvpacked_func(
+                    packed, layout["offsets"], max_seqlen=patch_size,
+                    dropout_p=self.attn.attn_drop if self.training else 0,
+                    softmax_scale=self.attn.scale,
+                ).reshape(-1, self.attn.channels).to(qkv.dtype)
+                result = result + self.attn.proj_drop(self.attn.proj(attended[layout["restore"]]))
+            point.feat = self.drop_path(result / len(views))
         point.feat = shortcut + gate_msa * point.feat
         if not self.pre_norm:
             point = self.norm1(point)
@@ -118,6 +139,8 @@ class DiffusionGaussianTransformer(nn.Module):
         pdnorm_affine=True,
         pdnorm_conditions=("Gaussian",),
         pdnorm_condition="Gaussian",
+        partition_mode="single",
+        partition_rotation_pivot=(0.5, 0.5, 0.5),
     ):
         super().__init__()
         self.patch_size = (patch_size,) * depth if isinstance(patch_size, int) else tuple(patch_size)
@@ -128,6 +151,15 @@ class DiffusionGaussianTransformer(nn.Module):
         if any(p <= 0 for p in self.patch_size) or any(h <= 0 or c <= 0 or c % h for c, h in zip(self.channels, self.num_head)):
             raise ValueError("patch sizes must be positive and channels must be divisible by positive head counts")
         self.order = (order,) if isinstance(order, str) else tuple(order)
+        if partition_mode not in PARTITION_MODES:
+            raise ValueError(f"Unknown DiPT partition mode: {partition_mode}")
+        if partition_mode != "single" and (not enable_flash or enable_rpe or flash_attn is None):
+            raise ValueError("Multi-partition DiPT requires Flash Attention and does not support relative positional encoding")
+        if partition_mode != "single":
+            for size in self.patch_size:
+                partition_views(partition_mode, size)
+        self.partition_mode = partition_mode
+        self.partition_rotation_pivot = tuple(partition_rotation_pivot)
         self.shuffle_orders = shuffle_orders
         self.shuffle_orders_eval = shuffle_orders if shuffle_orders_eval is None else shuffle_orders_eval
         self.output_dim = self.channels[-1]
@@ -164,6 +196,7 @@ class DiffusionGaussianTransformer(nn.Module):
                 GaussianDiffusionBlock(
                     channels=self.channels[index],
                     time_channels=self.channels[0],
+                    partition_mode=partition_mode,
                     num_heads=self.num_head[index],
                     patch_size=self.patch_size[index],
                     mlp_ratio=mlp_ratio,
@@ -188,7 +221,23 @@ class DiffusionGaussianTransformer(nn.Module):
     def forward(self, data_dict):
         point = Point(data_dict)
         shuffle_orders = self.shuffle_orders if self.training else self.shuffle_orders_eval
-        point.serialization(order=self.order, shuffle_orders=shuffle_orders)
+        if self.partition_mode == "single":
+            point.serialization(order=self.order, shuffle_orders=shuffle_orders)
+        else:
+            point.serialization(order=self.order, shuffle_orders=False)
+            order_names = self.order
+            if shuffle_orders:
+                permutation = torch.randperm(len(self.order))
+                for key in ("serialized_code", "serialized_order", "serialized_inverse"):
+                    point[key] = point[key][permutation]
+                order_names = tuple(self.order[index] for index in permutation.tolist())
+            point.partition_orders = {0: point.serialized_order}
+            if self.partition_mode in ("rotated", "both"):
+                resolution = int(round(1 / float(point.grid_size[0])))
+                point.partition_orders.update(rotated_orders(
+                    point.coord, point.offset, resolution, point.shift_negative_grid_coords,
+                    order_names, point.serialized_depth, self.partition_rotation_pivot,
+                ))
         point.sparsify()
         point.time_condition = self.timestep_embedding(point.timesteps)
         point.condition = self.pdnorm_condition

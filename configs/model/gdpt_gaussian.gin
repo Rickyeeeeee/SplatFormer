@@ -1,0 +1,26 @@
+# Global Gaussian velocity predictor with pointwise spatial embedding.
+DiffusionGaussianPredictor.sh_degree = 1
+DiffusionGaussianPredictor.input_features = ['means', 'scales', 'opacities', 'quats', 'features_dc', 'features_rest']
+DiffusionGaussianPredictor.output_features = ['means', 'scales', 'opacities', 'quats', 'features_dc', 'features_rest']
+DiffusionGaussianPredictor.input_feat_to_mlp = True
+DiffusionGaussianPredictor.output_head_nlayer = 2
+DiffusionGaussianPredictor.output_head_type = 'mlp-relu'
+DiffusionGaussianPredictor.output_head_width = 64
+DiffusionGaussianPredictor.grid_resolution = 1536
+DiffusionGaussianPredictor.resume_ckpt = None
+DiffusionGaussianPredictor.zeroinit = True
+DiffusionGaussianPredictor.backbone_type = 'gdpt'
+DiffusionGaussianPredictor.fourier_input_features = []
+DiffusionGaussianPredictor.fourier_num_frequencies = {}
+DiffusionGaussianPredictor.fourier_include_raw = True
+DiffusionGaussianPredictor.fourier_log_sampling = True
+DiffusionGaussianPredictor.fourier_max_frequency_log2 = {}
+
+GlobalDiffusionPointTransformer.depth = 12
+GlobalDiffusionPointTransformer.channels = 384
+GlobalDiffusionPointTransformer.num_head = 6
+GlobalDiffusionPointTransformer.mlp_ratio = 4
+GlobalDiffusionPointTransformer.frequency_embedding_size = 256
+GlobalDiffusionPointTransformer.attention_backend = 'flash'
+GlobalDiffusionPointTransformer.attn_drop = 0.0
+GlobalDiffusionPointTransformer.proj_drop = 0.0

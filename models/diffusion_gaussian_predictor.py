@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 
 from .diffusion_gaussian_transformer import DiffusionGaussianTransformer
+from .global_diffusion_point_transformer import GlobalDiffusionPointTransformer
 from utils.fourier_features import build_fourier_feature_encoders
 
 gin.external_configurable(torch.nn.Identity)
@@ -50,6 +51,7 @@ class DiffusionGaussianPredictor(nn.Module):
         fourier_log_sampling=True,
         fourier_max_frequency_log2=None,
         shift_negative_grid_coords=False,
+        backbone_type="dipt",
     ):
         super().__init__()
         if quat_residual_mode != "add":
@@ -64,7 +66,9 @@ class DiffusionGaussianPredictor(nn.Module):
         self.shift_negative_grid_coords = shift_negative_grid_coords
         self.resume_ckpt = resume_ckpt
         self.quat_residual_mode = quat_residual_mode
-        self.backbone_type = "DIPT"
+        if backbone_type not in ("dipt", "gdpt"):
+            raise ValueError("backbone_type must be dipt or gdpt")
+        self.backbone_type = backbone_type.upper()
         self.res_feature_activation = nn.ModuleDict(res_feature_activation)
 
         self.fourier_encoders, input_feature_channels = build_fourier_feature_encoders(
@@ -74,7 +78,8 @@ class DiffusionGaussianPredictor(nn.Module):
         )
         in_channels = sum(input_feature_channels[feature] for feature in self.input_features)
         self.gs_features_dim = in_channels
-        self.backbone = DiffusionGaussianTransformer(in_channels=in_channels)
+        backbone_class = DiffusionGaussianTransformer if backbone_type == "dipt" else GlobalDiffusionPointTransformer
+        self.backbone = backbone_class(in_channels=in_channels)
         head_input_dim = self.backbone.output_dim + (in_channels if input_feat_to_mlp else 0)
 
         self.features_outputhead = nn.ModuleDict()
@@ -155,6 +160,7 @@ class DiffusionGaussianPredictor(nn.Module):
             "coord": coord,
             "grid_coord": torch.cat(batch_grid_coords, dim=0),
             "grid_size": coord.new_full((3,), 1.0 / self.grid_resolution),
+            "shift_negative_grid_coords": self.shift_negative_grid_coords,
             "offset": offset,
             "feat": feat,
             "timesteps": timesteps,

@@ -12,6 +12,7 @@ from utils.data_augmentation import (GAUSSIAN_PARAMETERS, jitter_gaussian_parame
                                      sample_uniform_rotation_quaternion,
                                      sample_uniform_z_rotation_quaternion, validate_rotation_max_degrees)
 from utils.rotation_flow import rotation_exp
+from utils.dipt_partitions import attention_layout, partition_views, rotated_orders
 
 
 @gin.configurable
@@ -49,7 +50,7 @@ def model_settings(backend):
 
     settings = {}
     for cls, names in ((Predictor, ("grid_resolution", "shift_negative_grid_coords")),
-                       (Backbone, ("depth", "order", "patch_size", "shuffle_orders", "enable_flash"))):
+                       (Backbone, ("depth", "order", "patch_size", "shuffle_orders", "enable_flash", "partition_mode", "partition_rotation_pivot"))):
         defaults = inspect.signature(cls.__init__).parameters
         for name in names:
             if name not in defaults:
@@ -63,6 +64,8 @@ def model_settings(backend):
             settings[name] = value
     settings["shift_negative_grid_coords"] = backend == "edipt" or settings.get("shift_negative_grid_coords", False)
     settings["enable_flash"] = settings.get("enable_flash", True)
+    settings["partition_mode"] = settings.get("partition_mode", "single") if backend == "dipt" else "single"
+    settings["partition_rotation_pivot"] = settings.get("partition_rotation_pivot", (0.5, 0.5, 0.5))
     settings["order"] = (settings["order"],) if isinstance(settings["order"], str) else tuple(settings["order"])
     sizes = settings.pop("patch_size")
     settings["patch_sizes"] = (sizes,) * settings["depth"] if isinstance(sizes, int) else tuple(sizes)
@@ -145,7 +148,7 @@ def serialize_reference(reference, settings):
     return point.serialized_order.clone()
 
 
-def patch_layout(order, patch_size, backend, enable_flash=True):
+def patch_layout(order, patch_size, backend, enable_flash=True, shift=0):
     """Return query ownership and exact attention members, including padding."""
     if int(patch_size) != patch_size or patch_size < 1 or len(order) == 0:
         raise ValueError("Expected a positive integer patch size and nonempty order")
@@ -153,6 +156,10 @@ def patch_layout(order, patch_size, backend, enable_flash=True):
     count = len(order)
     if backend == "dipt" and not enable_flash:
         size = min(size, count)
+    if backend == "dipt":
+        layout = attention_layout(order, order.new_tensor([count]), size, shift)
+        layout["offsets"] = layout["offsets"].long()
+        return layout
     primary = torch.empty_like(order)
     primary[order] = torch.arange(count, device=order.device) // size
     remainder = count % size
@@ -240,18 +247,41 @@ class AugmentationComparison:
                 for pair, flow in zip(endpoints, (self.base_flow, self.current_flow))]
 
     def layouts(self, selection, mode, t, reference_mode, block, order_name, patch_size):
+        return self.partition_layouts(selection, mode, t, reference_mode, block, order_name, patch_size, "single")["0°"]
+
+    def partition_layouts(self, selection, mode, t, reference_mode, block, order_name, patch_size, partition_mode):
+        if self.backend == "dipt" and partition_mode != "single" and not self.settings["enable_flash"]:
+            raise ValueError("Multi-partition DiPT requires Flash Attention")
         use_target = selection == "Fitted target" or (selection == "Interpolant" and
                      (mode == "one_sided" or (mode == "encoding_decoding" and t >= .5)))
         endpoint = "target" if use_target else "source"
         references = [self.target if use_target else self.source,
                       self.current_target if use_target else self.current_source]
         row = self.order_rows[block % len(self.order_rows)] if order_name == "Block default" else self.settings["order"].index(order_name)
-        layouts = []
+        views = partition_views(partition_mode if self.backend == "dipt" else "single", patch_size)
+        layouts = {name: [] for name, _, _ in views}
         for index, reference in enumerate(references):
             variant = "baseline" if index == 0 or reference_mode == "unaugmented" else "current"
             key = (variant, endpoint)
             if key not in self.order_cache:
                 actual = references[0] if variant == "baseline" else reference
                 self.order_cache[key] = serialize_reference(actual["means"], self.settings)
-            layouts.append(patch_layout(self.order_cache[key][row], patch_size, self.backend, self.settings["enable_flash"]))
+            actual = references[0] if variant == "baseline" else reference
+            for name, turn, shift in views:
+                if turn:
+                    rotated_key = (variant, endpoint, turn)
+                    if rotated_key not in self.order_cache:
+                        count = len(actual["means"])
+                        base_depth = int(torch.floor(actual["means"] * self.settings["grid_resolution"]).max()).bit_length()
+                        rotations = rotated_orders(
+                            actual["means"], torch.tensor([count]), self.settings["grid_resolution"],
+                            self.settings["shift_negative_grid_coords"], self.settings["order"], base_depth,
+                            self.settings["partition_rotation_pivot"],
+                        )
+                        for rotation_turn, rows in rotations.items():
+                            self.order_cache[(variant, endpoint, rotation_turn)] = rows
+                    order = self.order_cache[rotated_key][row]
+                else:
+                    order = self.order_cache[key][row]
+                layouts[name].append(patch_layout(order, patch_size, self.backend, self.settings["enable_flash"], shift))
         return layouts

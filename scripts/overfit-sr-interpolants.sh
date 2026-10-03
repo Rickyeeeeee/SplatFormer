@@ -10,6 +10,7 @@ FIT_HR_TO_LR_ROOT=${FIT_HR_TO_LR_ROOT:-${DATASET_ROOT}/test-set-4x-up/objaverse}
 echo "Using GPU: ${GPU_ID}"
 
 # Example: SCENE_MODE=many SCENE_COUNT=4 BATCH_SIZE=8 GRAD_ACCUM_STEPS=4 bash scripts/overfit-sr-interpolants.sh
+# Global attention: PREDICTOR=gdpt GDPT_ATTENTION_BACKEND=flash bash scripts/overfit-sr-interpolants.sh
 scene_mode=${SCENE_MODE:-one}
 scene_count=${SCENE_COUNT:-1}
 batch_size=${BATCH_SIZE:-16}
@@ -103,12 +104,27 @@ case "${predictor}" in
         model_gin_file=configs/model/dipt_gaussian.gin
         predictor_suffix=_dipt
         ;;
+    gdpt)
+        predictor_class=DiffusionGaussianPredictor
+        backbone_class=GlobalDiffusionPointTransformer
+        model_gin_file=configs/model/gdpt_gaussian.gin
+        predictor_suffix=_gdpt
+        ;;
     *)
-        echo "Unsupported PREDICTOR: ${predictor}; expected ptv3 or dipt" >&2
+        echo "Unsupported PREDICTOR: ${predictor}; expected ptv3, dipt, or gdpt" >&2
         exit 2
         ;;
 esac
 echo "Using predictor: ${predictor}"
+dipt_partition_suffix=
+if [[ "${predictor}" == "dipt" ]]; then
+    DIPT_PARTITION_MODE=${DIPT_PARTITION_MODE:-single}
+    case "${DIPT_PARTITION_MODE}" in
+        single) ;;
+        rotated|shifted|both) dipt_partition_suffix=_partition_${DIPT_PARTITION_MODE} ;;
+        *) echo "DIPT_PARTITION_MODE must be single, rotated, shifted, or both" >&2; exit 2 ;;
+    esac
+fi
 run_date=$(date +%m%d)
 custom_postfix=${CUSTOM_POSFIX:-run}
 
@@ -138,9 +154,13 @@ interpolants_${interpolant_type}_${mix_schedule}_\
 noise${flow_noise_std}_steps${flow_steps}_seed${eval_noise_seed}${train_noise_suffix}_\
 grid${grid_resolution}}_\
 batch_size${batch_size}${lr_warmup_suffix}${augmentation_suffix}_\
-${custom_postfix}${predictor_suffix}${quaternion_suffix}
+${custom_postfix}${predictor_suffix}${quaternion_suffix}${dipt_partition_suffix}
 
-output_root=${OUTPUT_ROOT:-/project2/ricky/experiments/${run_date}/overfit_sr_interpolants_512_dipt}
+default_output_root=/project2/ricky/experiments/${run_date}/overfit_sr_interpolants_512_dipt
+if [[ "${predictor}" == "gdpt" ]]; then
+    default_output_root=/project2/ricky/experiments/${run_date}/overfit_sr_interpolants_512_gdpt
+fi
+output_root=${OUTPUT_ROOT:-${default_output_root}}
 output_dir=${OUTPUT_DIR:-${output_root}/${out_name}}
 
 # Optional architecture overrides retain Gin/model defaults when unset or empty.
@@ -159,7 +179,11 @@ for network in "${backbone_class}" "${predictor_class}"; do
             ;;
         DiffusionGaussianTransformer)
             prefix=DIPT
-            parameters=(order depth channels num_head patch_size mlp_ratio frequency_embedding_size qkv_bias qk_scale attn_drop proj_drop drop_path pre_norm shuffle_orders shuffle_orders_eval enable_rpe enable_flash upcast_attention upcast_softmax pdnorm_bn pdnorm_ln pdnorm_decouple pdnorm_adaptive pdnorm_affine pdnorm_conditions pdnorm_condition)
+            parameters=(order depth channels num_head patch_size partition_mode partition_rotation_pivot mlp_ratio frequency_embedding_size qkv_bias qk_scale attn_drop proj_drop drop_path pre_norm shuffle_orders shuffle_orders_eval enable_rpe enable_flash upcast_attention upcast_softmax pdnorm_bn pdnorm_ln pdnorm_decouple pdnorm_adaptive pdnorm_affine pdnorm_conditions pdnorm_condition)
+            ;;
+        GlobalDiffusionPointTransformer)
+            prefix=GDPT
+            parameters=(depth channels num_head mlp_ratio frequency_embedding_size attention_backend attn_drop proj_drop)
             ;;
         GSFlowPredictor|DiffusionGaussianPredictor)
             prefix=GS
@@ -171,7 +195,7 @@ for network in "${backbone_class}" "${predictor_class}"; do
         value=${!env_name:-}
         if [[ -n "${value}" ]]; then
             case "${parameter}" in
-                embedding_type|pretrained_ckpt|output_head_type|quat_residual_mode|pdnorm_condition)
+                embedding_type|pretrained_ckpt|output_head_type|quat_residual_mode|pdnorm_condition|partition_mode|attention_backend)
                     # Escape ordinary strings as Gin string literals, including checkpoint paths.
                     value=${value//\\/\\\\}
                     value=${value//\'/\\\'}

@@ -31,7 +31,7 @@ from utils.optimizers import build_optimizer, build_scheduler
 flags.DEFINE_string("output_dir", "output_overfit_interpolants", "Output directory")
 flags.DEFINE_string("eval_subdir", "eval_final", "Eval subdirectory")
 flags.DEFINE_string("scene_name", "", "Scene name to overfit in one mode")
-flags.DEFINE_enum("predictor", "ptv3", ["ptv3", "dipt"], "Gaussian velocity predictor")
+flags.DEFINE_enum("predictor", "ptv3", ["ptv3", "dipt", "gdpt"], "Gaussian velocity predictor")
 flags.DEFINE_enum("scene_mode", "one", ["one", "many"], "Overfit one scene or a fixed random scene set")
 flags.DEFINE_integer("scene_count", 1, "Number of scenes selected in many mode")
 flags.DEFINE_integer("batch_size", 1, "Total scene samples per optimizer update")
@@ -52,7 +52,7 @@ flags.DEFINE_multi_string("gin_file", None, "List of paths to the config files."
 flags.DEFINE_multi_string("gin_param", "", "Newline separated list of Gin parameter bindings.")
 
 FLAGS = flags.FLAGS
-PREDICTORS = {"ptv3": GSFlowPredictor, "dipt": DiffusionGaussianPredictor}
+PREDICTORS = {"ptv3": GSFlowPredictor, "dipt": DiffusionGaussianPredictor, "gdpt": DiffusionGaussianPredictor}
 EVAL_FLOW_STEPS = [1, 5, 10]
 MEANS_LOSS_REDUCTION = "mean"  # Set to "sum" to match PUFM-style summed point loss.
 
@@ -559,6 +559,8 @@ def training(
     os.makedirs(os.path.join(output_dir, "checkpoints"), exist_ok=True)
     predictor_class = PREDICTORS[FLAGS.predictor]
     model = predictor_class().to(device)
+    if FLAGS.predictor in ("dipt", "gdpt") and model.backbone_type.lower() != FLAGS.predictor:
+        raise ValueError(f"Predictor {FLAGS.predictor} requires a matching backbone_type in the model Gin file")
     logger.info(f"Predictor={FLAGS.predictor} class={predictor_class.__name__}")
     missing_outputs = sorted(set(SUPPORTED_GS_KEYS) - set(model.output_features))
     if missing_outputs:

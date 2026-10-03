@@ -31,6 +31,7 @@ from utils.augmentation_viewer import (AugmentationComparison, compose_compariso
 from utils.data_augmentation import GAUSSIAN_PARAMETERS
 from utils.gaussian_viewer import GsplatBackgroundRenderer, _rgb_from_gaussians, _validate_gsplat_available
 from utils.gs_normalization import GaussianStandardizer
+from utils.dipt_partitions import PARTITION_MODES, neighborhood, partition_views
 
 
 def parse_args(argv=None):
@@ -161,7 +162,16 @@ class AugmentationViewer:
             self.block = gui.add_dropdown("Block", tuple(str(i + 1) for i in range(comparison.settings["depth"])))
             self.order = gui.add_dropdown("Serialization order", ("Block default", *comparison.settings["order"]))
             self.patch_size = gui.add_slider("Attention patch size", 1, max(4096, max(comparison.settings["patch_sizes"])), 1, comparison.settings["patch_sizes"][0])
+            self.partition_mode = gui.add_dropdown("Partition mode", PARTITION_MODES if args.backend == "dipt" else ("single",),
+                                                   initial_value=comparison.settings["partition_mode"])
+            self.patch_view = gui.add_dropdown("Patch-color view", ("0°",))
+            self.patch_view.options = tuple(name for name, _, _ in partition_views(
+                comparison.settings["partition_mode"], comparison.settings["patch_sizes"][0]))
+            self.show_neighborhood = gui.add_checkbox("Show neighborhood", initial_value=False)
+            self.query_index = gui.add_number("Gaussian index", initial_value=0, min=0,
+                                              max=len(comparison.source["means"]) - 1, step=1)
             self.patch_info = gui.add_markdown("")
+            self.neighborhood_info = gui.add_markdown("")
         with gui.add_folder("Display"):
             self.view_mode = gui.add_dropdown("Rendering", ("Point cloud", "GSplat background"),
                                               initial_value="Point cloud" if args.initial_view_mode == "pointcloud" else "GSplat background")
@@ -181,8 +191,10 @@ class AugmentationViewer:
             control.on_update(self.on_augmentation)
         for control in (self.selection, self.time, self.noise_scale, self.rotation_noise):
             control.on_update(self.on_state)
-        for control in (self.reference, self.order, self.patch_size, self.color_mode, self.count, self.point_size):
+        for control in (self.reference, self.order, self.patch_size, self.patch_view, self.show_neighborhood,
+                        self.query_index, self.color_mode, self.count, self.point_size):
             control.on_update(self.on_display)
+        self.partition_mode.on_update(self.on_partition_mode)
         self.mode.on_update(self.on_mode)
         self.block.on_update(self.on_block)
         self.view_mode.on_update(self.on_view_mode)
@@ -221,23 +233,51 @@ class AugmentationViewer:
         if recompute_state:
             self.gaussians = self.comparison.states(self.selection.value, self.mode.value, self.time.value,
                                                      self.noise_scale.value, self.rotation_noise.value)
-        layouts = self.comparison.layouts(self.selection.value, self.mode.value, self.time.value,
-                                           self.reference_labels[self.reference.value], int(self.block.value) - 1,
-                                           self.order.value, int(self.patch_size.value))
+        layout_sets = self.comparison.partition_layouts(self.selection.value, self.mode.value, self.time.value,
+                                                         self.reference_labels[self.reference.value], int(self.block.value) - 1,
+                                                         self.order.value, int(self.patch_size.value), self.partition_mode.value)
+        selected_view = self.patch_view.value if self.patch_view.value in layout_sets else next(iter(layout_sets))
+        layouts = layout_sets[selected_view]
         displayed, combined = compose_comparison(*self.gaussians, layouts, self.color_mode.value, self.pivot.value)
         self.renderer.update_gaussians(combined)
         for handle in self.handles:
             handle.remove()
         self.handles.clear()
         indices = self.permutation[:self.count_labels[self.count.value]]
-        for name, gaussians in zip(("Baseline", "Current"), displayed):
+        query = int(self.query_index.value)
+        if self.show_neighborhood.value and (query != self.query_index.value or not 0 <= query < len(self.permutation)):
+            self.status.content = "**Gaussian index must be an integer within this scene.**"
+            return
+        summaries = []
+        palette = np.array([[255, 80, 80], [80, 190, 255], [110, 235, 125], [255, 195, 75],
+                            [205, 125, 255], [80, 235, 220], [255, 125, 205]], dtype=np.uint8)
+        for variant_index, (name, gaussians) in enumerate(zip(("Baseline", "Current"), displayed)):
             points = gaussians["means"]
             self.handles.append(self.server.scene.add_point_cloud(f"/{name}/points", points=points[indices].numpy(),
                                colors=_rgb_from_gaussians(gaussians, indices), point_size=self.point_size.value,
                                point_shape="circle", visible=self.state["view_mode"] == "pointcloud"))
-            label_position = ((points.amin(0) + points.amax(0)) / 2).numpy()
-            label_position[2] = float(points[:, 2].max()) + .05 * self.diagonal
-            self.handles.append(self.server.scene.add_label(f"/{name}/label", name, position=label_position))
+            if self.show_neighborhood.value:
+                memberships = []
+                for view_index, (view_name, pair) in enumerate(layout_sets.items()):
+                    neighbors = neighborhood(pair[variant_index], query)
+                    neighbors = neighbors[neighbors != query]
+                    memberships.append(neighbors)
+                    if len(neighbors):
+                        color = palette[view_index % len(palette)]
+                        self.handles.append(self.server.scene.add_point_cloud(
+                            f"/{name}/neighbors/{view_index}", points=points[neighbors].numpy(),
+                            colors=np.tile(color, (len(neighbors), 1)),
+                            point_size=self.point_size.value * (2.4 - .16 * view_index), point_shape="circle"))
+                counts = torch.zeros(len(points), dtype=torch.int32)
+                for neighbors in memberships:
+                    counts[neighbors] += 1
+                summaries.append(f"**{name}**: " + " · ".join(
+                    f"{view_name} {len(neighbors):,}" for view_name, neighbors in zip(layout_sets, memberships))
+                    + f" · union {int((counts > 0).sum()):,} · overlap {int((counts > 1).sum()):,}")
+                self.handles.append(self.server.scene.add_point_cloud(
+                    f"/{name}/query", points=points[query:query + 1].numpy(),
+                    colors=np.array([[255, 255, 255]], dtype=np.uint8), point_size=self.point_size.value * 3.2,
+                    point_shape="circle"))
         self.display_bounds = (combined["means"].amin(0), combined["means"].amax(0))
         row = self.comparison.order_rows[(int(self.block.value) - 1) % len(self.comparison.order_rows)]
         actual_order = self.comparison.settings["order"][row] if self.order.value == "Block default" else self.order.value
@@ -245,6 +285,8 @@ class AugmentationViewer:
         self.patch_info.content = (f"**{actual_order}** · {layout['patch_count']:,} patches per variant · effective size {layout['effective_size']}\n\n"
                                    f"Borrowed padding: {layout['borrowed']} · masked padding: {layout['masked']}\n\n"
                                    "Colors identify primary query patches. Borrowed padding also participates in the final DiPT patch.")
+        self.neighborhood_info.content = (f"**Gaussian {query}** · unique neighbors exclude the query\n\n"
+                                          + "\n\n".join(summaries)) if self.show_neighborhood.value else ""
         self.status.content = ""
         if self.state["view_mode"] == "gsplat":
             self.renderer.render_all()
@@ -270,11 +312,25 @@ class AugmentationViewer:
 
     def on_display(self, event):
         with self.lock:
-            self.refresh(recompute_state=False)
+            try:
+                self.refresh(recompute_state=False)
+            except ValueError as error:
+                self.status.content = f"**Cannot display partitions:** {error}"
 
     def on_block(self, event):
         with self.lock:
             self.patch_size.value = self.comparison.settings["patch_sizes"][int(self.block.value) - 1]
+            self.refresh(recompute_state=False)
+
+    def on_partition_mode(self, event):
+        with self.lock:
+            try:
+                views = partition_views(self.partition_mode.value, int(self.patch_size.value))
+            except ValueError as error:
+                self.status.content = f"**Cannot display partitions:** {error}"
+                return
+            self.patch_view.options = tuple(name for name, _, _ in views)
+            self.patch_view.value = views[0][0]
             self.refresh(recompute_state=False)
 
     def on_view_mode(self, event):
@@ -350,6 +406,18 @@ def validate_comparison(comparison, flow_cfg, augmentation_cfg, seed):
                         layouts = comparison.layouts("Interpolant", mode, t, reference, block, "Block default", size)
                         if any(len(layout["ids"]) != len(comparison.source["means"]) for layout in layouts):
                             raise ValueError("Patch ownership must cover every Gaussian")
+    if comparison.backend == "dipt":
+        for block, size in enumerate(comparison.settings["patch_sizes"]):
+            if size % 4:
+                continue
+            for partition_mode in PARTITION_MODES[1:]:
+                layout_sets = comparison.partition_layouts("Source", "linear", 0., "augmented", block,
+                                                            "Block default", size, partition_mode)
+                for pair in layout_sets.values():
+                    for layout in pair:
+                        if len(layout["ids"]) != len(comparison.source["means"]):
+                            raise ValueError("Patch ownership must cover every Gaussian")
+                        neighborhood(layout, 0)
 
 
 def main(argv=None):
