@@ -17,10 +17,12 @@ DiffusionGaussianPredictor.fourier_log_sampling = True
 DiffusionGaussianPredictor.fourier_max_frequency_log2 = {}
 
 GlobalDiffusionPointTransformer.depth = 12
-GlobalDiffusionPointTransformer.channels = 384
-GlobalDiffusionPointTransformer.num_head = 6
+GlobalDiffusionPointTransformer.channels = 768
+GlobalDiffusionPointTransformer.num_head = 12
 GlobalDiffusionPointTransformer.mlp_ratio = 4
 GlobalDiffusionPointTransformer.frequency_embedding_size = 256
 GlobalDiffusionPointTransformer.attention_backend = 'flash'
 GlobalDiffusionPointTransformer.attn_drop = 0.0
 GlobalDiffusionPointTransformer.proj_drop = 0.0
+# Add DiPT-style 3x3x3 sparse position encoding in every block.
+GlobalDiffusionPointTransformer.use_sparse_conv = False

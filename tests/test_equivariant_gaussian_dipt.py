@@ -1,5 +1,8 @@
 """EDiPT geometry, real Pointcept ordering, packing, and gradient checks."""
 import copy
+import os
+from pathlib import Path
+import subprocess
 import unittest
 from unittest import mock
 
@@ -182,6 +185,98 @@ EquivariantGaussianDiPT.frequency_embedding_size = 8
             torch.testing.assert_close(value.grad, reference_value.grad, atol=1e-5, rtol=1e-4)
         for (name, value), (_, reference_value) in zip(attention.named_parameters(), reference.named_parameters()):
             torch.testing.assert_close(value.grad, reference_value.grad, atol=1e-5, rtol=1e-4, msg=name)
+
+    def test_global_dense_matches_tiled_outputs_and_gradients(self):
+        dense = GeometricAttention(12, 3).train()
+        tiled = copy.deepcopy(dense)
+        inputs = (torch.randn(7, 12, requires_grad=True), torch.randn(7, 3, requires_grad=True),
+                  torch.randn(7, 3, 3, requires_grad=True))
+        tiled_inputs = tuple(value.detach().clone().requires_grad_() for value in inputs)
+        expected = dense.attend_global(*inputs, [5, 2])
+        actual = tiled.attend_global(*tiled_inputs, [5, 2], query_chunk_size=2)
+        torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-4)
+        expected.square().sum().backward()
+        actual.square().sum().backward()
+        for value, tiled_value in zip(inputs, tiled_inputs):
+            torch.testing.assert_close(tiled_value.grad, value.grad, atol=1e-5, rtol=1e-4)
+        for (name, value), (_, tiled_value) in zip(dense.named_parameters(), tiled.named_parameters()):
+            torch.testing.assert_close(tiled_value.grad, value.grad, atol=1e-5, rtol=1e-4, msg=name)
+
+    def test_global_scene_isolation_permutation_and_rigid_transform(self):
+        gin.bind_parameter('EquivariantGaussianDiPT.attention_mode', 'global')
+        _, geometry = self.scenes(counts=(5, 2))
+        fields = self.packed(geometry)
+        del fields['grid_coord']
+        model = EquivariantGaussianDiPT(in_channels=7).eval()
+        result = model(fields)
+        self.assertNotIn('serialized_order', result)
+        permutation = torch.cat([torch.randperm(5), 5 + torch.randperm(2)])
+        shuffled = {**fields, **{key: fields[key][permutation] for key in ('feat', 'coord', 'rotations')}}
+        torch.testing.assert_close(model(shuffled).feat, result.feat[permutation], atol=1e-5, rtol=1e-4)
+        changed = {**fields, 'feat': fields['feat'].clone()}
+        changed['feat'][5:] += 10
+        torch.testing.assert_close(model(changed).feat[:5], result.feat[:5], atol=1e-5, rtol=1e-4)
+        rotation = quaternion_to_rotation_matrix(torch.tensor([.5, .5, .5, .5]))
+        transformed = {**fields, 'coord': fields['coord'] @ rotation.T + 3,
+                       'rotations': rotation @ fields['rotations']}
+        torch.testing.assert_close(model(transformed).feat, result.feat, atol=1e-5, rtol=1e-4)
+
+    def test_global_gin_predictor_optimizer_step_and_equivariance(self):
+        gin.clear_config()
+        gin.parse_config_file(str(Path(__file__).resolve().parents[1] / 'configs/model/edipt_gaussian.gin'))
+        for key, value in (('depth', 2), ('channels', 12), ('num_head', 3), ('frequency_embedding_size', 8),
+                           ('attention_mode', 'global'), ('global_query_chunk_size', 2)):
+            gin.bind_parameter(f'EquivariantGaussianDiPT.{key}', value)
+        states, geometry = self.scenes(counts=(5, 2))
+        model = EquivariantGaussianDiPTPredictor(zeroinit=False).train()
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+        baseline = model(states, t=[.2, .7], batch_geometry=geometry)
+        global_q = torch.nn.functional.normalize(torch.tensor([.7, -.1, .4, .5]), dim=0)
+        rotation = quaternion_to_rotation_matrix(global_q)
+        transformed = [{'means': g['means'] @ rotation.T + torch.tensor([.1, -.2, .3]),
+                        'quats': quaternion_multiply(global_q, g['quats'])} for g in geometry]
+        rotated = model(states, t=[.2, .7], batch_geometry=transformed)
+        for first, second in zip(baseline, rotated):
+            torch.testing.assert_close(second['means'], first['means'] @ rotation.T, atol=1e-5, rtol=1e-4)
+            torch.testing.assert_close(second['quats'], quaternion_multiply(global_q, first['quats']), atol=1e-5, rtol=1e-4)
+            for key in model.input_features:
+                torch.testing.assert_close(second[key], first[key], atol=1e-5, rtol=1e-4)
+        loss = sum(value.square().mean() for output in baseline for value in output.values())
+        loss.backward()
+        self.assertTrue(torch.isfinite(loss))
+        self.assertTrue(all(parameter.grad is not None and torch.isfinite(parameter.grad).all()
+                            for parameter in model.parameters()))
+        optimizer.step()
+
+    def test_global_launcher_arguments(self):
+        command = 'python() { printf "%s\\n" "$@"; }; source "$1"'
+        environment = dict(os.environ, EDIPT_ATTENTION_MODE='global', EDIPT_GLOBAL_QUERY_CHUNK_SIZE='128')
+        path = Path(__file__).resolve().parents[1] / 'scripts/overfit-sr-interpolants-edipt.sh'
+        result = subprocess.run(['bash', '-c', command, 'test', str(path)], env=environment,
+                                capture_output=True, text=True, check=True)
+        self.assertIn("--gin_param=EquivariantGaussianDiPT.attention_mode='global'", result.stdout)
+        self.assertIn('--gin_param=EquivariantGaussianDiPT.global_query_chunk_size=128', result.stdout)
+
+    @unittest.skipUnless(torch.cuda.is_available(), 'CUDA unavailable')
+    def test_global_cuda_autocast_backward(self):
+        gin.bind_parameter('EquivariantGaussianDiPT.attention_mode', 'global')
+        states, geometry = self.scenes(counts=(5, 2))
+        states = [{key: value.cuda() for key, value in scene.items()} for scene in states]
+        for chunk_size in (None, 2):
+            gin.bind_parameter('EquivariantGaussianDiPT.global_query_chunk_size', chunk_size)
+            active_geometry = [{key: value.cuda().requires_grad_() for key, value in scene.items()} for scene in geometry]
+            model = EquivariantGaussianDiPTPredictor(zeroinit=False).cuda().train()
+            with torch.autocast('cuda', dtype=torch.float16):
+                outputs = model(states, t=[.2, .7], batch_geometry=active_geometry)
+                loss = sum(value.float().square().mean() for output in outputs for value in output.values())
+            loss.backward()
+            self.assertTrue(torch.isfinite(loss))
+            for scene in active_geometry:
+                for value in scene.values():
+                    self.assertTrue(torch.isfinite(value.grad).all())
+            for parameter in model.parameters():
+                self.assertIsNotNone(parameter.grad)
+                self.assertTrue(torch.isfinite(parameter.grad).all())
 
     def test_validation(self):
         states, geometry = self.scenes()

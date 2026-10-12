@@ -18,5 +18,7 @@ EquivariantGaussianDiPT.attn_drop = 0.0
 EquivariantGaussianDiPT.proj_drop = 0.0
 EquivariantGaussianDiPT.drop_path = 0.0
 EquivariantGaussianDiPT.shuffle_orders = True
+EquivariantGaussianDiPT.attention_mode = 'serialized'
+EquivariantGaussianDiPT.global_query_chunk_size = None
 
 EquivariantGaussianDiPTPredictor.use_features_rest = True

@@ -68,8 +68,15 @@ class GlobalAttention(nn.Module):
 
 
 class GlobalDiffusionBlock(nn.Module):
-    def __init__(self, channels, num_heads, mlp_ratio, attention_backend, attn_drop, proj_drop):
+    def __init__(self, channels, num_heads, mlp_ratio, attention_backend, attn_drop, proj_drop, use_sparse_conv=False):
         super().__init__()
+        if use_sparse_conv:
+            import spconv.pytorch as spconv
+            self.cpe_conv = spconv.SubMConv3d(channels, channels, kernel_size=3, bias=True)
+            self.cpe_linear = nn.Linear(channels, channels)
+            self.cpe_norm = nn.LayerNorm(channels)
+        else:
+            self.cpe_conv = None
         self.norm1 = nn.LayerNorm(channels)
         self.norm2 = nn.LayerNorm(channels)
         self.modulation = nn.Sequential(nn.GELU(), nn.Linear(channels, 6 * channels))
@@ -78,7 +85,11 @@ class GlobalDiffusionBlock(nn.Module):
         self.mlp = nn.Sequential(nn.Linear(channels, hidden), nn.GELU(), nn.Dropout(proj_drop),
                                  nn.Linear(hidden, channels), nn.Dropout(proj_drop))
 
-    def forward(self, features, time, batch, offset):
+    def forward(self, features, time, batch, offset, sparse_tensor=None):
+        if self.cpe_conv is not None:
+            # Match DiPT's residual convolutional position encoding before attention.
+            cpe = self.cpe_conv(sparse_tensor.replace_feature(features)).features
+            features = features + self.cpe_norm(self.cpe_linear(cpe))
         shift_a, scale_a, gate_a, shift_m, scale_m, gate_m = self.modulation(time)[batch].chunk(6, dim=-1)
         query = self.norm1(features) * (1 + scale_a) + shift_a
         features = features + gate_a * self.attention(query, offset)
@@ -91,17 +102,19 @@ class GlobalDiffusionPointTransformer(nn.Module):
     """Return per-point features after global attention within each scene."""
 
     def __init__(self, in_channels, depth=12, channels=384, num_head=6, mlp_ratio=4,
-                 frequency_embedding_size=256, attention_backend="flash", attn_drop=0.0, proj_drop=0.0):
+                 frequency_embedding_size=256, attention_backend="flash", attn_drop=0.0, proj_drop=0.0,
+                 use_sparse_conv=False):
         super().__init__()
         if depth < 1 or channels <= 0 or num_head <= 0 or channels % num_head or mlp_ratio <= 0:
             raise ValueError("Invalid global transformer dimensions")
         if frequency_embedding_size < 2 or attention_backend not in ("flash", "sdpa"):
             raise ValueError("Expected frequency_embedding_size >= 2 and attention_backend flash or sdpa")
         self.output_dim = channels
+        self.use_sparse_conv = use_sparse_conv
         self.embedding = nn.Sequential(nn.Linear(in_channels + 3, channels), nn.LayerNorm(channels), nn.GELU())
         self.timestep_embedding = TimestepEmbedding(channels, frequency_embedding_size)
         self.blocks = nn.ModuleList([
-            GlobalDiffusionBlock(channels, num_head, mlp_ratio, attention_backend, attn_drop, proj_drop)
+            GlobalDiffusionBlock(channels, num_head, mlp_ratio, attention_backend, attn_drop, proj_drop, use_sparse_conv)
             for _ in range(depth)
         ])
 
@@ -116,9 +129,18 @@ class GlobalDiffusionPointTransformer(nn.Module):
         if (counts <= 0).any() or coord.shape != (len(features), 3):
             raise ValueError("Each scene needs points and one reference coordinate per point")
         batch = torch.repeat_interleave(torch.arange(len(offset), device=features.device), counts)
-        # Raw reference coordinates supply spatial context without sparse convolution.
+        # Keep raw reference coordinates in both modes; sparse CPE adds local context.
         features = self.embedding(torch.cat([features, coord], dim=-1))
+        sparse_tensor = None
+        if self.use_sparse_conv:
+            import spconv.pytorch as spconv
+            grid = data_dict["grid_coord"]
+            if grid.shape != coord.shape or (grid < 0).any():
+                raise ValueError("Sparse convolution requires nonnegative grid_coord with one row per point")
+            indices = torch.cat([batch[:, None].int(), grid.int()], dim=1).contiguous()
+            sparse_shape = (grid.amax(dim=0) + 96).tolist()
+            sparse_tensor = spconv.SparseConvTensor(features, indices, sparse_shape, len(offset))
         time = self.timestep_embedding(time)
         for block in self.blocks:
-            features = block(features, time, batch, offset)
+            features = block(features, time, batch, offset, sparse_tensor)
         return SimpleNamespace(feat=features)

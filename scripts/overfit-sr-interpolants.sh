@@ -30,32 +30,16 @@ mix_schedule=${9:-${MIX_SCHEDULE:-fm-only}}
 flow_loss_type=${10:-${FLOW_LOSS_TYPE:-velocity}}
 interpolant_type=${INTERPOLANT_TYPE:-linear}
 default_flow_steps=50
-if [[ "${interpolant_type}" == "encoding_decoding" ]]; then
-    default_flow_steps=50
-fi
 flow_steps=${11:-${FLOW_STEPS:-${default_flow_steps}}}
 loss_rollout_steps=${LOSS_ROLLOUT_STEPS:-10}
 eval_noise_seed=${EVAL_NOISE_SEED:-0}
 fixed_train_noise=${FIXED_TRAIN_NOISE:-False}
 train_noise_seed=${TRAIN_NOISE_SEED:-0}
-case "${fixed_train_noise}" in
-    True|False) ;;
-    *)
-        echo "Unsupported FIXED_TRAIN_NOISE: ${fixed_train_noise}; expected True or False" >&2
-        exit 2
-        ;;
-esac
 flow_noise_std=${12:-${FLOW_NOISE_STD:-1.0}}
 image_l1_loss_weight=${13:-${IMAGE_L1_LOSS_WEIGHT:-1.0}}
 lpips_loss_weight=${14:-${LPIPS_LOSS_WEIGHT:-1.0}}
 normalization_variance_floor=${NORMALIZATION_VARIANCE_FLOOR:-1e-8}
 quaternion_representation=${QUATERNION_REPRESENTATION:-raw_standardized}
-quaternion_suffix=
-case "${quaternion_representation}" in
-    raw_standardized) ;;
-    unit_unstandardized) quaternion_suffix=_unit_unstandardized ;;
-    *) echo "Unsupported QUATERNION_REPRESENTATION: ${quaternion_representation}" >&2; exit 2 ;;
-esac
 gs_statistics_path=${GS_STATISTICS_PATH:-${DATASET_ROOT}/gs_statistics.json}
 flow_t_eps=${FLOW_T_EPS:-1e-4}
 ptv3_drop_path=${PTV3_DROP_PATH:-0.0}
@@ -183,7 +167,7 @@ for network in "${backbone_class}" "${predictor_class}"; do
             ;;
         GlobalDiffusionPointTransformer)
             prefix=GDPT
-            parameters=(depth channels num_head mlp_ratio frequency_embedding_size attention_backend attn_drop proj_drop)
+            parameters=(depth channels num_head mlp_ratio frequency_embedding_size attention_backend attn_drop proj_drop use_sparse_conv)
             ;;
         GSFlowPredictor|DiffusionGaussianPredictor)
             prefix=GS
@@ -217,7 +201,7 @@ if [[ "${predictor}" == "ptv3" ]]; then
         "--gin_param=PointTransformerV3FlowModel.turn_off_bn=${ptv3_turn_off_bn}"
     )
 fi
-if [[ "${predictor}" == "dipt" ]]; then
+if [[ "${predictor}" == "dipt" || "${predictor}" == "gdpt" ]]; then
     shift_negative_grid_coords=${GS_SHIFT_NEGATIVE_GRID_COORDS:-False}
     case "${shift_negative_grid_coords}" in
         True|False) ;;

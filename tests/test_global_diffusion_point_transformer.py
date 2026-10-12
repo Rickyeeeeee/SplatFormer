@@ -68,6 +68,38 @@ class GlobalDiffusionPointTransformerTests(unittest.TestCase):
         self.assertGreater(state["feat"].grad.abs().sum().item(), 0)
 
     @unittest.skipUnless(torch.cuda.is_available() and flash_attn is not None, "CUDA FlashAttention is required")
+    def test_sparse_conv_flash_scene_isolation_and_gradients(self):
+        state = self.make_input("cuda")
+        state["coord"] = torch.tensor([
+            [0.1, 0.1, 0.1], [0.11, 0.1, 0.1], [0.5, 0.5, 0.5],
+            [0.1, 0.1, 0.1], [0.11, 0.1, 0.1], [0.3, 0.3, 0.3],
+            [0.31, 0.3, 0.3], [0.8, 0.8, 0.8],
+        ], device="cuda")
+        state["grid_coord"] = torch.floor(state["coord"] * 100).int()
+        model = GlobalDiffusionPointTransformer(7, depth=2, channels=32, num_head=4,
+                                                frequency_embedding_size=32, attention_backend="flash",
+                                                use_sparse_conv=True).cuda().train()
+        with torch.autocast(device_type="cuda", dtype=torch.float16):
+            result = model(state).feat
+            first = model({**state, "feat": state["feat"][:3], "coord": state["coord"][:3],
+                           "grid_coord": state["grid_coord"][:3], "offset": torch.tensor([3], device="cuda"),
+                           "timesteps": state["timesteps"][:1]}).feat
+            second = model({**state, "feat": state["feat"][3:], "coord": state["coord"][3:],
+                            "grid_coord": state["grid_coord"][3:], "offset": torch.tensor([5], device="cuda"),
+                            "timesteps": state["timesteps"][1:]}).feat
+            permutation = torch.cat([torch.randperm(3, device="cuda"), 3 + torch.randperm(5, device="cuda")])
+            permuted = model({**state, "feat": state["feat"][permutation],
+                              "coord": state["coord"][permutation],
+                              "grid_coord": state["grid_coord"][permutation]}).feat
+        torch.testing.assert_close(result[:3], first, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(result[3:], second, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(permuted, result[permutation], rtol=2e-2, atol=2e-2)
+        result.square().mean().backward()
+        self.assertTrue(torch.isfinite(state["feat"].grad).all())
+        self.assertTrue(torch.isfinite(model.blocks[0].cpe_conv.weight.grad).all())
+        self.assertGreater(model.blocks[0].cpe_conv.weight.grad.abs().sum().item(), 0)
+
+    @unittest.skipUnless(torch.cuda.is_available() and flash_attn is not None, "CUDA FlashAttention is required")
     def test_gin_predictor_optimizer_step(self):
         gin.clear_config()
         try:
@@ -108,12 +140,16 @@ class GlobalDiffusionPointTransformerTests(unittest.TestCase):
 
     def test_launcher_selects_gdpt_and_backend(self):
         command = 'python() { printf "%s\\n" "$@"; }; source "$1"'
-        environment = dict(os.environ, PREDICTOR="gdpt", GDPT_ATTENTION_BACKEND="sdpa")
+        environment = dict(os.environ, PREDICTOR="gdpt", GDPT_ATTENTION_BACKEND="sdpa",
+                           GDPT_USE_SPARSE_CONV="True", GS_SHIFT_NEGATIVE_GRID_COORDS="True",
+                           quaternion_suffix="")
         result = subprocess.run(["bash", "-c", command, "test", str(ROOT / "scripts/overfit-sr-interpolants.sh")],
                                 env=environment, capture_output=True, text=True, check=True)
         self.assertIn("--predictor=gdpt", result.stdout)
         self.assertIn("--gin_file=configs/model/gdpt_gaussian.gin", result.stdout)
         self.assertIn("--gin_param=GlobalDiffusionPointTransformer.attention_backend='sdpa'", result.stdout)
+        self.assertIn("--gin_param=GlobalDiffusionPointTransformer.use_sparse_conv=True", result.stdout)
+        self.assertIn("--gin_param=DiffusionGaussianPredictor.shift_negative_grid_coords=True", result.stdout)
         self.assertIn("_gdpt", next(line for line in result.stdout.splitlines() if line.startswith("--output_dir=")))
 
 

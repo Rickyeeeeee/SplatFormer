@@ -28,32 +28,17 @@ target_resolution=${8:-128}
 mix_schedule=${9:-${MIX_SCHEDULE:-fm-only}}
 flow_loss_type=${10:-${FLOW_LOSS_TYPE:-velocity}}
 interpolant_type=${INTERPOLANT_TYPE:-linear}
-default_flow_steps=50
-if [[ "${interpolant_type}" == "encoding_decoding" ]]; then
-    default_flow_steps=50
-fi
-flow_steps=${11:-${FLOW_STEPS:-${default_flow_steps}}}
+flow_steps=${11:-${FLOW_STEPS:-10}}
 loss_rollout_steps=${LOSS_ROLLOUT_STEPS:-10}
 eval_noise_seed=${EVAL_NOISE_SEED:-0}
 fixed_train_noise=${FIXED_TRAIN_NOISE:-False}
 train_noise_seed=${TRAIN_NOISE_SEED:-0}
-case "${fixed_train_noise}" in
-    True|False) ;;
-    *)
-        echo "Unsupported FIXED_TRAIN_NOISE: ${fixed_train_noise}; expected True or False" >&2
-        exit 2
-        ;;
-esac
+train_noise_suffix=
 flow_noise_std=${12:-${FLOW_NOISE_STD:-1.0}}
 image_l1_loss_weight=${13:-${IMAGE_L1_LOSS_WEIGHT:-1.0}}
 lpips_loss_weight=${14:-${LPIPS_LOSS_WEIGHT:-1.0}}
 normalization_variance_floor=${NORMALIZATION_VARIANCE_FLOOR:-1e-8}
 quaternion_representation=${QUATERNION_REPRESENTATION:-unit_unstandardized}
-if [[ "${quaternion_representation}" != "unit_unstandardized" ]]; then
-    echo "EDiPT requires QUATERNION_REPRESENTATION=unit_unstandardized" >&2
-    exit 2
-fi
-quaternion_suffix=_unit_unstandardized
 rotation_noise_std=${ROTATION_NOISE_STD:-0.3}
 rotation_loss_weight=${ROTATION_LOSS_WEIGHT:-1.0}
 gs_statistics_path=${GS_STATISTICS_PATH:-${DATASET_ROOT}/gs_statistics.json}
@@ -64,27 +49,7 @@ random_rotate=${RANDOM_ROTATE:-False}
 rotation_mode=${ROTATION_MODE:-full}
 rotation_max_degrees=${ROTATION_MAX_DEGREES:-None}
 jitter_max_levels=${JITTER_MAX_LEVELS:-}
-case "${random_jitter}" in
-    True|False) ;;
-    *) echo "RANDOM_JITTER must be True or False" >&2; exit 2 ;;
-esac
-case "${random_rotate}" in
-    True|False) ;;
-    *) echo "RANDOM_ROTATE must be True or False" >&2; exit 2 ;;
-esac
-case "${rotation_mode}" in
-    full|gravity_consistent) ;;
-    *) echo "ROTATION_MODE must be full or gravity_consistent" >&2; exit 2 ;;
-esac
 
-train_noise_suffix=
-if [[ "${fixed_train_noise}" == "True" ]]; then
-    train_noise_suffix=_fixedtrainnoise${train_noise_seed}
-fi
-lr_warmup_suffix=
-if (( lr_warmup_steps > 0 )); then
-    lr_warmup_suffix=_warmup${lr_warmup_steps}
-fi
 predictor_class=EquivariantGaussianDiPTPredictor
 backbone_class=EquivariantGaussianDiPT
 model_gin_file=configs/model/edipt_gaussian.gin
@@ -111,11 +76,6 @@ if [[ "${random_rotate}" == "True" ]]; then
 fi
 
 serialization_reference=${SERIALIZATION_REFERENCE:-augmented}
-case "$serialization_reference" in
-    augmented) ;;
-    unaugmented) augmentation_suffix+=_unaugmented_serialization ;;
-    *) echo "Invalid SERIALIZATION_REFERENCE: $serialization_reference" >&2; exit 1 ;;
-esac
 if [[ "${GS_USE_FEATURES_REST:-True}" == "False" ]]; then
     augmentation_suffix+=_no_rest_gtsh_eval
 fi
@@ -126,10 +86,10 @@ ${attribute_init}_\
 ir${input_resolution}_\
 tr${target_resolution}_\
 interpolants_${interpolant_type}_${mix_schedule}_\
-noise${flow_noise_std}_rotnoise${rotation_noise_std}_rotweight${rotation_loss_weight}_steps${flow_steps}_seed${eval_noise_seed}${train_noise_suffix}_\
+noise${flow_noise_std}_${train_noise_suffix}_\
 grid${grid_resolution}_\
-batch_size${batch_size}${lr_warmup_suffix}${augmentation_suffix}_\
-${custom_postfix}${predictor_suffix}${quaternion_suffix}
+batch_size${batch_size}${augmentation_suffix}_\
+${custom_postfix}
 
 output_root=${OUTPUT_ROOT:-/project2/ricky/experiments/${run_date}/overfit_sr_interpolants_edipt}
 output_dir=${OUTPUT_DIR:-${output_root}/${out_name}}
@@ -140,7 +100,7 @@ for network in "${backbone_class}" "${predictor_class}"; do
     case "${network}" in
         EquivariantGaussianDiPT)
             prefix=EDIPT
-            parameters=(depth channels num_head patch_size order mlp_ratio frequency_embedding_size geometry_channels geometry_length_scale attn_drop proj_drop drop_path shuffle_orders)
+            parameters=(depth channels num_head patch_size order mlp_ratio frequency_embedding_size geometry_channels geometry_length_scale attn_drop proj_drop drop_path shuffle_orders attention_mode global_query_chunk_size)
             ;;
         EquivariantGaussianDiPTPredictor)
             prefix=GS
@@ -151,6 +111,9 @@ for network in "${backbone_class}" "${predictor_class}"; do
         env_name=${prefix}_${parameter^^}
         value=${!env_name:-}
         if [[ -n "${value}" ]]; then
+            if [[ "${parameter}" == attention_mode ]]; then
+                value="'${value}'"
+            fi
             network_gin_args+=("--gin_param=${network}.${parameter}=${value}")
         fi
     done

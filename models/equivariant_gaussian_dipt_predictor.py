@@ -55,24 +55,26 @@ class EquivariantGaussianDiPTPredictor(nn.Module):
         scenes = len(batch_flow_gs)
         if not scenes or len(batch_geometry) != scenes:
             raise ValueError("Expected one geometry dictionary per nonempty scene batch")
-        if batch_reference_means is None:
-            batch_reference_means = [geometry['means'] for geometry in batch_geometry]
-        if len(batch_reference_means) != scenes:
-            raise ValueError("Expected one reference means tensor per scene")
+        serialized = self.backbone.attention_mode == 'serialized'
+        if serialized:
+            if batch_reference_means is None:
+                batch_reference_means = [geometry['means'] for geometry in batch_geometry]
+            if len(batch_reference_means) != scenes:
+                raise ValueError("Expected one reference means tensor per scene")
 
         features, positions, quaternions, grids, counts = [], [], [], [], []
-        for gs, geometry, reference in zip(batch_flow_gs, batch_geometry, batch_reference_means):
+        for index, (gs, geometry) in enumerate(zip(batch_flow_gs, batch_geometry)):
             means, quats = geometry['means'], geometry['quats']
             count = len(means)
-            if count == 0 or means.shape != (count, 3) or quats.shape != (count, 4) or reference.shape != (count, 3):
-                raise ValueError("Expected nonempty means/reference [N,3] and quats [N,4]")
+            if count == 0 or means.shape != (count, 3) or quats.shape != (count, 4):
+                raise ValueError("Expected nonempty means [N,3] and quats [N,4]")
             # Geometry stays physical and FP32 even when feature operations use AMP.
             means, quats = means.float(), quats.float()
             norms = quats.norm(dim=-1, keepdim=True)
             if not torch.isfinite(quats).all() or not torch.isfinite(norms).all() or (norms == 0).any():
                 raise ValueError("Geometry quaternions must be finite and nonzero")
-            if not torch.isfinite(means).all() or not torch.isfinite(reference).all():
-                raise ValueError("Current and reference positions must be finite")
+            if not torch.isfinite(means).all():
+                raise ValueError("Current positions must be finite")
             values = []
             for key, width in self.feature_channels.items():
                 value = gs[key]
@@ -84,12 +86,16 @@ class EquivariantGaussianDiPTPredictor(nn.Module):
             positions.append(means)
             quaternions.append(quats / norms)
             counts.append(count)
-            # Validate before integer conversion so large coordinates cannot wrap.
-            grid = torch.floor(reference.float() * self.grid_resolution)
-            grid = grid - grid.amin(dim=0, keepdim=True).clamp(max=0)
-            if not torch.isfinite(grid).all() or (grid >= 65536).any():
-                raise ValueError("Reference grid exceeds Pointcept's 16-bit coordinate range")
-            grids.append(grid.int())
+            if serialized:
+                reference = batch_reference_means[index]
+                if reference.shape != (count, 3) or not torch.isfinite(reference).all():
+                    raise ValueError("Expected finite reference positions [N,3]")
+                # Validate before integer conversion so large coordinates cannot wrap.
+                grid = torch.floor(reference.float() * self.grid_resolution)
+                grid = grid - grid.amin(dim=0, keepdim=True).clamp(max=0)
+                if not torch.isfinite(grid).all() or (grid >= 65536).any():
+                    raise ValueError("Reference grid exceeds Pointcept's 16-bit coordinate range")
+                grids.append(grid.int())
 
         feat, coord, quats = torch.cat(features), torch.cat(positions), torch.cat(quaternions)
         with torch.autocast(device_type=coord.device.type, enabled=False):
@@ -99,12 +105,14 @@ class EquivariantGaussianDiPTPredictor(nn.Module):
             timesteps = timesteps.expand(scenes)
         if timesteps.numel() != scenes or not torch.isfinite(timesteps).all():
             raise ValueError("Expected a finite scalar time or one time per scene")
-        point = self.backbone({
+        backbone_input = {
             'feat': feat, 'coord': coord, 'rotations': rotations,
-            'grid_coord': torch.cat(grids),
             'offset': torch.tensor(counts, device=coord.device, dtype=torch.long).cumsum(0),
             'timesteps': timesteps,
-        })
+        }
+        if serialized:
+            backbone_input['grid_coord'] = torch.cat(grids)
+        point = self.backbone(backbone_input)
         hidden = torch.cat([point.feat, feat], dim=-1) if self.input_feat_to_mlp else point.feat
         output = {key: head(hidden) for key, head in self.features_outputhead.items()}
         with torch.autocast(device_type=coord.device.type, enabled=False):
