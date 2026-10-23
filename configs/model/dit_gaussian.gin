@@ -1,0 +1,9 @@
+# Standalone classic DiT Gaussian velocity predictor; no trainer wiring.
+GaussianDiTPredictor.sh_degree = 0
+GaussianDiTPredictor.max_gaussians = 1000
+
+GaussianDiT.depth = 12
+GaussianDiT.channels = 384
+GaussianDiT.num_heads = 6
+GaussianDiT.mlp_ratio = 4
+GaussianDiT.frequency_embedding_size = 256

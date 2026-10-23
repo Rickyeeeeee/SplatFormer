@@ -1,0 +1,36 @@
+# Unconditional Gaussian flow matching against native HR scene Gaussians.
+set_seed.seed = 42
+training.total_steps = 4000
+training.eval_interval = 500
+training.save_interval = 4000
+training.log_interval = 20
+training.grad_clip_norm = 2.0
+training.enable_amp = True
+
+flow_matching.flow_steps = 10
+flow_matching.flow_t_eps = 1e-4
+flow_matching.eval_noise_seed = 0
+flow_matching.normalization_variance_floor = 1e-8
+
+GSFlowPredictor.quat_residual_mode = 'add'
+GSFlowPredictor.res_feature_activation = {
+    'means': @Identity(), 'features_dc': @Identity(), 'features_rest': @Identity(),
+    'scales': @Identity(), 'opacities': @Identity(), 'quats': @Identity(),
+}
+DiffusionGaussianPredictor.quat_residual_mode = 'add'
+DiffusionGaussianPredictor.res_feature_activation = {
+    'means': @Identity(), 'features_dc': @Identity(), 'features_rest': @Identity(),
+    'scales': @Identity(), 'opacities': @Identity(), 'quats': @Identity(),
+}
+
+train2D/build_optimizer.lr_dict = {
+    'base': 3e-4, 'embedding': 3e-4, 'backbone': 3e-4,
+    'features_dc': 3e-4, 'features_rest': 1.5e-6,
+    'scales': 3e-3, 'opacities': 3e-4, 'quats': 3e-4, 'means': 3e-4,
+}
+train2D/build_optimizer.optimizer_type = 'adam'
+train2D/build_optimizer.optimizer_params = {'eps': 1e-15}
+train2D/build_scheduler.total_step = 10000
+train2D/build_scheduler.schedule = 'cosine'
+train2D/build_scheduler.warmup_step = 0
+train2D/build_scheduler.warmup_start_factor = 0.03333333333333333

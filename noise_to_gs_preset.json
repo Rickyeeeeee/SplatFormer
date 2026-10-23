@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "attributes": {
+    "means": {
+      "strength": 1.0,
+      "clip": null
+    },
+    "scales": {
+      "strength": 1.0,
+      "clip": 1.0
+    },
+    "opacities": {
+      "strength": 1.0,
+      "clip": null
+    },
+    "quats": {
+      "strength": 1.0,
+      "clip": null
+    },
+    "features_dc": {
+      "strength": 1.0,
+      "clip": null
+    },
+    "features_rest": {
+      "strength": 1.0,
+      "clip": null
+    }
+  }
+}
