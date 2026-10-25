@@ -65,8 +65,10 @@ class SplatFactoSRDataset(torch.utils.data.IterableDataset):
         self.alignment = alignment
         self.coordinate_frame = COORDINATE_FRAME
         self.coordinate_frame_version = COORDINATE_FRAME_VERSION
-        if self.src_resolution == self.tgt_resolution:
-            raise ValueError("src_resolution and tgt_resolution must be different")
+        if self.src_resolution == self.tgt_resolution and (
+            self.load_src_gs or self.load_src_images or self.alignment is not None
+        ):
+            raise ValueError("Equal source and target resolution requires target-only loading")
 
         self.processor = GaussianProcessor(remove_outlier_ndevs, max_gs_num)
         self.filtered_scenes = []
@@ -217,6 +219,8 @@ class SplatFactoSRDataset(torch.utils.data.IterableDataset):
         valid_fit_alignments = (None, "emd", "random", "fit_lr_to_hr", "fit_hr_to_lr")
         if fit_alignment not in valid_fit_alignments:
             raise ValueError(f"Unsupported fit_alignment: {fit_alignment}")
+        if self.src_resolution == self.tgt_resolution and fit_alignment is not None:
+            raise ValueError("Equal source and target resolution does not support GS alignment")
         # 1. Calculate coordinate scaler from source GS
         src_gs_paths = scene_info["resolution_paths"][self.src_resolution]
         src_gs_raw, _ = gs_io.load_gsplat(src_gs_paths["gsplat_dir"])
@@ -281,16 +285,13 @@ class SplatFactoSRDataset(torch.utils.data.IterableDataset):
         data = {}
         camera_ids = None
         background = self.build_background()
-        for resolution in (self.src_resolution, self.tgt_resolution):
+        resolutions = ((self.tgt_resolution,) if self.src_resolution == self.tgt_resolution
+                       else (self.src_resolution, self.tgt_resolution))
+        for resolution in resolutions:
             res_data = {}
-            load_gs = (
-                self.load_src_gs if resolution == self.src_resolution
-                else self.load_tgt_gs
-            )
-            load_images = (
-                self.load_src_images if resolution == self.src_resolution
-                else self.load_tgt_images
-            )
+            is_target = resolution == self.tgt_resolution
+            load_gs = self.load_tgt_gs if is_target else self.load_src_gs
+            load_images = self.load_tgt_images if is_target else self.load_src_images
             if load_gs:
                 res_data["gs_params"] = normalized_gs[resolution]
             if load_images:

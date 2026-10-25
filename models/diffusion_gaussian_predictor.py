@@ -59,8 +59,8 @@ class DiffusionGaussianPredictor(nn.Module):
         self.sh_degree = sh_degree
         self.feature2channel = dict(FEATURE2CHANNEL)
         self.feature2channel["features_rest"] = 3 * ((sh_degree + 1) ** 2 - 1)
-        self.input_features = list(input_features)
-        self.output_features = list(output_features)
+        self.input_features = [key for key in input_features if sh_degree or key != "features_rest"]
+        self.output_features = [key for key in output_features if sh_degree or key != "features_rest"]
         self.input_feat_to_mlp = input_feat_to_mlp
         self.grid_resolution = grid_resolution
         self.shift_negative_grid_coords = shift_negative_grid_coords
@@ -182,8 +182,6 @@ class DiffusionGaussianPredictor(nn.Module):
         for right, in_gs in zip(offset.tolist(), batch_flow_gs):
             out_gs = {feature: output[feature][left:right] for feature in self.output_features}
             for feature in ALL_FEATURES:
-                if self.sh_degree == 0 and feature == "features_rest":
-                    continue
                 if feature not in out_gs and feature in in_gs:
                     out_gs[feature] = torch.zeros_like(in_gs[feature])
             out_batch_flow.append(out_gs)

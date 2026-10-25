@@ -1,9 +1,11 @@
 """Focused checks for the standalone FlashAttention Gaussian DiT."""
 
 import unittest
+from unittest import mock
 
 import gin
 import torch
+from torch import nn
 
 from models.gaussian_dit import flash_attn
 from models.gaussian_dit_predictor import GaussianDiTPredictor
@@ -13,6 +15,15 @@ SHAPES = {
     "means": (3,), "scales": (3,), "opacities": (1,), "quats": (4,),
     "features_dc": (3,), "features_rest": (3, 3),
 }
+
+
+class CPUBackbone(nn.Module):
+    def __init__(self, in_channels, out_channels, max_gaussians):
+        super().__init__()
+        self.linear = nn.Linear(in_channels, out_channels)
+
+    def forward(self, data):
+        return self.linear(data["feat"])
 
 
 class GaussianDiTTests(unittest.TestCase):
@@ -40,6 +51,18 @@ class GaussianDiTTests(unittest.TestCase):
             model([self.scene(2), self.scene(3)], t=[0.1, 0.2, 0.3])
         with self.assertRaisesRegex(RuntimeError, "flash_attn and CUDA"):
             model([self.scene(1000)], t=0.5)
+
+    def test_degree_zero_forward_and_backward_on_cpu(self):
+        scene = self.scene(3)
+        scene["features_rest"] = scene["features_rest"][:, :0, :]
+        with mock.patch("models.gaussian_dit_predictor.GaussianDiT", CPUBackbone):
+            model = GaussianDiTPredictor(sh_degree=0)
+        self.assertNotIn("features_rest", model.feature_channels)
+        prediction = model([scene], t=0.5)[0]
+        self.assertEqual(tuple(prediction["features_rest"].shape), (3, 0, 3))
+        loss = (prediction["means"] - scene["means"]).square().mean()
+        loss.backward()
+        self.assertTrue(torch.isfinite(model.backbone.linear.weight.grad).all())
 
     @unittest.skipUnless(torch.cuda.is_available() and flash_attn is not None, "CUDA FlashAttention is required")
     def test_shapes_scene_isolation_permutation_time_and_reference(self):

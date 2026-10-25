@@ -72,7 +72,10 @@ def construct_path(source, target, t, mode, source_means, target_means, noise_sc
 
 
 def attribute_mse(prediction, target):
-    losses = {key: (prediction[key].float() - target[key].float()).square().mean() for key in STATISTIC_KEYS}
+    losses = {}
+    for key in STATISTIC_KEYS:
+        delta = prediction[key].float() - target[key].float()
+        losses[key] = delta.square().mean() if delta.numel() else delta.sum()
     return sum(losses.values()), losses, dict(losses)
 
 

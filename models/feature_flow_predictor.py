@@ -75,8 +75,8 @@ class GSFlowPredictor(nn.Module):
         sh_dim = (sh_degree + 1) ** 2 - 1
         self.feature2channel = dict(FEATURE2CHANNEL)
         self.feature2channel["features_rest"] = sh_dim * 3
-        self.input_features = list(input_features)
-        self.output_features = list(output_features)
+        self.input_features = [key for key in input_features if sh_degree or key != "features_rest"]
+        self.output_features = [key for key in output_features if sh_degree or key != "features_rest"]
         self.input_feat_to_mlp = input_feat_to_mlp
         self.grid_resolution = grid_resolution
         self.shift_negative_grid_coords = shift_negative_grid_coords
@@ -218,8 +218,6 @@ class GSFlowPredictor(nn.Module):
             for feature in self.output_features:
                 out_gs[feature] = output[feature][left:right]
             for key in ALL_FEATURES:
-                if self.sh_degree == 0 and key == "features_rest":
-                    continue
                 if key not in out_gs and key in in_gs:
                     out_gs[key] = torch.zeros_like(in_gs[key])
             out_batch_flow.append(out_gs)

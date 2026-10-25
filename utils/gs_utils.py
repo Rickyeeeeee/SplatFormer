@@ -85,7 +85,7 @@ def _camera_to_viewmats(camera_to_worlds, device, dtype):
     return viewmats
 
 
-def _prepare_render_inputs(gs_params):
+def _prepare_render_inputs(gs_params, sh_degree_zero=False):
     # gsplat's CUDA kernels require float32 rather than float16 inputs.
     gs_params = {
         key: value.float() if value.dtype == torch.half else value
@@ -109,7 +109,11 @@ def _prepare_render_inputs(gs_params):
         )
 
     features_rest = gs_params.get('features_rest')
-    if features_rest is not None and features_rest.shape[1] > 0:
+    if sh_degree_zero:
+        # Native DC coefficients must reach gsplat as SH, not sigmoid colors.
+        colors = gs_params['features_dc'].unsqueeze(1)
+        sh_degree = 0
+    elif features_rest is not None and features_rest.shape[1] > 0:
         colors = torch.cat(
             [gs_params['features_dc'].unsqueeze(1), features_rest], dim=1
         )
@@ -131,10 +135,9 @@ def _rasterize_gaussians(
     width,
     height,
     background_color,
+    sh_degree_zero=False,
 ):
-    means, quats, scales, opacities, colors, sh_degree = _prepare_render_inputs(
-        gs_params
-    )
+    means, quats, scales, opacities, colors, sh_degree = _prepare_render_inputs(gs_params, sh_degree_zero=sh_degree_zero)
     viewmats = _camera_to_viewmats(
         camera_to_worlds, device=means.device, dtype=means.dtype
     )
@@ -186,7 +189,7 @@ def _rasterize_gaussians(
     return render_colors, render_alphas
 
 
-def rasterize_gaussians_to_multiimgs(gs_params, cameras, batched=False):
+def rasterize_gaussians_to_multiimgs(gs_params, cameras, batched=False, sh_degree_zero=False):
     """Render several cameras, optionally using gsplat's native camera batching."""
     camera_to_worlds = cameras['camera_to_worlds']
     if batched:
@@ -200,18 +203,21 @@ def rasterize_gaussians_to_multiimgs(gs_params, cameras, batched=False):
             width=cameras['width'],
             height=cameras['height'],
             background_color=cameras['background_color'],
+            sh_degree_zero=sh_degree_zero,
         )
         return list(rgbs.unbind(0)), list(alphas.unbind(0))
 
     rgbs, alphas = [], []
     for camera_to_world in camera_to_worlds:
-        rgb, alpha = rasterize_gaussians_to_singleimg(gs_params, camera_to_world, **cameras)
+        rgb, alpha = rasterize_gaussians_to_singleimg(gs_params, camera_to_world,
+                                                      sh_degree_zero=sh_degree_zero, **cameras)
         rgbs.append(rgb)
         alphas.append(alpha)
     return rgbs, alphas
 
 
-def rasterize_gaussians_to_singleimg(gs_params, camera_to_world, cx, cy, fx, fy, width, height, background_color, **kwargs):
+def rasterize_gaussians_to_singleimg(gs_params, camera_to_world, cx, cy, fx, fy, width, height, background_color,
+                                     sh_degree_zero=False, **kwargs):
     rgbs, alphas = _rasterize_gaussians(
         gs_params,
         camera_to_world,
@@ -222,6 +228,7 @@ def rasterize_gaussians_to_singleimg(gs_params, camera_to_world, cx, cy, fx, fy,
         width=width,
         height=height,
         background_color=background_color,
+        sh_degree_zero=sh_degree_zero,
     )
     return rgbs[0], alphas[0]
 
@@ -283,7 +290,7 @@ def prepare_viewer(cameras, dirname, sh_degree):    #1. cfg_args
         json.dump(cameras_towrite, f)
 
 
-def export_ply_forviewer(gs_params, filename):
+def export_ply_forviewer(gs_params, filename, sh_degree_zero=False):
     os.makedirs(os.path.dirname(filename), exist_ok=True)
     count = 0
     map_to_tensors = OrderedDict()
@@ -300,15 +307,18 @@ def export_ply_forviewer(gs_params, filename):
         map_to_tensors["nz"] = np.zeros(n, dtype=np.float32)
 
 
-        if 'features_rest' in gs_params and gs_params['features_rest'].shape[1]!=0:
+        has_higher_order_sh = 'features_rest' in gs_params and gs_params['features_rest'].shape[1] != 0
+        if sh_degree_zero or has_higher_order_sh:
+            # Preserve native degree-zero SH coefficients in viewer PLYs.
             shs_0 = gs_params['features_dc'].contiguous().cpu().numpy() #N,3
             for i in range(shs_0.shape[1]):
                 map_to_tensors[f"f_dc_{i}"] = shs_0[:, i, None]
-            # transpose(1, 2) was needed to match the sh order in Inria version
-            shs_rest = gs_params['features_rest'].transpose(1, 2).contiguous().cpu().numpy()
-            shs_rest = shs_rest.reshape((n, -1))
-            for i in range(shs_rest.shape[-1]):
-                map_to_tensors[f"f_rest_{i}"] = shs_rest[:, i, None]
+            if has_higher_order_sh:
+                # transpose(1, 2) was needed to match the sh order in Inria version
+                shs_rest = gs_params['features_rest'].transpose(1, 2).contiguous().cpu().numpy()
+                shs_rest = shs_rest.reshape((n, -1))
+                for i in range(shs_rest.shape[-1]):
+                    map_to_tensors[f"f_rest_{i}"] = shs_rest[:, i, None]
         else:
             #convert logit(color) to features_dc
             color = torch.sigmoid(gs_params['features_dc'])

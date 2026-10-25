@@ -10,9 +10,10 @@ from unittest import mock
 import torch
 from torch import nn
 
+from dataset.GS_SR import SplatFactoSRDataset
 from models.diffusion_gaussian_predictor import DiffusionGaussianPredictor
 from models.feature_flow_predictor import GSFlowPredictor
-from sr import noise_to_gs
+from sr import interpolants, noise_to_gs
 from utils.gs_normalization import STATISTIC_KEYS
 
 
@@ -91,6 +92,71 @@ class NoiseToGaussianTests(unittest.TestCase):
         noise_to_gs.sample_flow_model(model, 2, 1, 2, self.standardizer)
         self.assertTrue(all(reference is None for _, _, reference, _ in model.calls))
 
+    def test_degree_zero_flow_and_loss_have_empty_rest(self):
+        self.standardizer.means["features_rest"] = torch.empty((0, 3))
+        self.standardizer.stds["features_rest"] = torch.empty((0, 3))
+        target = {key: torch.ones((3,) + tuple(mean.shape)) for key, mean in self.standardizer.means.items()}
+        query, velocity = noise_to_gs.construct_path(target, 0.4)
+        model = RecordingPredictor("DIT")
+        prediction = model([query], [0], None, torch.tensor([0.4]))[0]
+        loss, parts, _ = interpolants.attribute_mse(prediction, velocity)
+        self.assertTrue(torch.isfinite(loss))
+        self.assertEqual(parts["features_rest"].item(), 0)
+        loss.backward()
+        self.assertTrue(torch.isfinite(model.anchor.grad))
+        result = noise_to_gs.sample_flow_model(model, 3, 0, 2, self.standardizer)
+        self.assertEqual(tuple(result["features_rest"].shape), (3, 0, 3))
+
+    def test_degree_zero_point_predictors_have_no_rest_head(self):
+        scene = {key: torch.randn((2,) + shape) for key, shape in SHAPES.items()}
+        scene["features_rest"] = torch.empty((2, 0, 3))
+        keys = list(SHAPES)
+        settings = dict(sh_degree=0, input_features=keys, input_feat_to_mlp=False,
+                        output_features=keys, output_head_nlayer=1, output_head_type="mlp-relu",
+                        output_head_width=4, grid_resolution=10, resume_ckpt=None, zeroinit=False,
+                        res_feature_activation={key: nn.Identity() for key in keys})
+        predictors = (
+            ("models.feature_flow_predictor.PointTransformerV3FlowModel", GSFlowPredictor, {}),
+            ("models.diffusion_gaussian_predictor.DiffusionGaussianTransformer", DiffusionGaussianPredictor, {}),
+            ("models.diffusion_gaussian_predictor.GlobalDiffusionPointTransformer", DiffusionGaussianPredictor,
+             {"backbone_type": "gdpt"}),
+        )
+        for backbone, predictor, options in predictors:
+            with self.subTest(backbone=backbone), mock.patch(backbone, RecordingBackbone):
+                model = predictor(**settings, **options)
+                result = model([scene], [0], t=0.3)[0]
+                self.assertNotIn("features_rest", model.input_features)
+                self.assertNotIn("features_rest", model.features_outputhead)
+                self.assertEqual(tuple(result["features_rest"].shape), (2, 0, 3))
+                loss, _, _ = interpolants.attribute_mse(result, scene)
+                self.assertTrue(torch.isfinite(loss))
+                loss.backward()
+                self.assertTrue(torch.isfinite(model.features_outputhead["means"][-1].weight.grad).all())
+
+    def test_equal_resolution_target_only_scene_loads_gs_and_images(self):
+        with mock.patch("dataset.GS_SR.gs_io.read_scene_names", return_value=["fixture"]):
+            dataset = SplatFactoSRDataset(
+                train_or_test="test", dataset_root="/tmp/fixture", train_scene_list="fixture.csv",
+                test_scene_list="fixture.csv", image_per_scene=1, remove_outlier_ndevs=-1,
+                max_gs_num=1000, split_across_gpus=False, fit_lr_to_hr_root="/tmp/fixture",
+                fit_hr_to_lr_root="/tmp/fixture", src_resolution=32, tgt_resolution=32,
+                load_src_gs=False, load_src_images=False, load_tgt_gs=True, load_tgt_images=True,
+            )
+        gaussians = {key: torch.zeros((2,) + shape) for key, shape in SHAPES.items()}
+        gaussians["means"][1] = 1
+        gaussians["quats"][:, 0] = 1
+        gaussians["features_rest"] = gaussians["features_rest"][:, :0, :]
+        camera = torch.eye(4).unsqueeze(0)
+        camera_meta = {"meta": {"camera_to_worlds": camera}}
+        views = ([torch.zeros((2, 2, 3))], ["view.png"], {"camera_to_worlds": camera})
+        with mock.patch("dataset.GS_SR.gs_io.load_gsplat", return_value=(gaussians, "ckpt")), \
+             mock.patch.object(dataset, "load_camera_meta", return_value=camera_meta), \
+             mock.patch.object(dataset, "load_resolution_views", return_value=views):
+            scene = dataset.load_scene(0)
+        self.assertEqual(list(scene["data"]), [32])
+        self.assertEqual(tuple(scene["data"][32]["gs_params"]["features_rest"].shape), (2, 0, 3))
+        self.assertEqual(len(scene["data"][32]["images"]), 1)
+
     def test_ptv3_and_diffusion_grid_shift_keeps_current_coordinates(self):
         means = torch.tensor([[-1.2, 0.1, -0.3], [0.4, -0.5, 0.2]])
         scene = {"means": means}
@@ -133,7 +199,8 @@ class NoiseToGaussianTests(unittest.TestCase):
     def test_launcher_selects_all_common_flow_models(self):
         command = 'python() { printf "%s\\n" "$@"; }; source "$1"'
         for predictor in ("ptv3", "dipt", "gdpt", "dit"):
-            environment = dict(os.environ, PREDICTOR=predictor, DATASET_ROOT="/tmp/noise-to-gs-test")
+            environment = dict(os.environ, PREDICTOR=predictor, DATASET_ROOT="/tmp/noise-to-gs-test",
+                               SOURCE_GS_ROOT="/tmp/mcmc-500", TARGET_GS_ROOT="/tmp/mcmc-1000", GS_SH_DEGREE="0")
             result = subprocess.run(
                 ["bash", "-c", command, "test", str(ROOT / "scripts/overfit-noise-to-gs.sh")],
                 env=environment, capture_output=True, text=True, check=True,
@@ -143,6 +210,12 @@ class NoiseToGaussianTests(unittest.TestCase):
                           result.stdout)
             self.assertIn("--gin_param=SplatFactoSRDataset.max_gs_num=1000", result.stdout)
             self.assertIn("--gin_param=SplatFactoSRDataset.load_src_gs=False", result.stdout)
+            self.assertIn("--source_gs_root=/tmp/mcmc-500", result.stdout)
+            self.assertIn("--target_gs_root=/tmp/mcmc-1000", result.stdout)
+            predictor_class = "GaussianDiTPredictor" if predictor == "dit" else (
+                "GSFlowPredictor" if predictor == "ptv3" else "DiffusionGaussianPredictor"
+            )
+            self.assertIn(f"--gin_param={predictor_class}.sh_degree=0", result.stdout)
             if predictor == "ptv3":
                 self.assertIn("--gin_param=GSFlowPredictor.shift_negative_grid_coords=True", result.stdout)
             elif predictor in ("dipt", "gdpt"):

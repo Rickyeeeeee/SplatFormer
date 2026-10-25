@@ -4,21 +4,23 @@ set -euo pipefail
 
 GPU_ID=${GPU_ID:-0}
 DATASET_ROOT=${DATASET_ROOT:-/project/ricky/splatformer-sr-data-scaled}
+SOURCE_GS_ROOT=${SOURCE_GS_ROOT:-}
+TARGET_GS_ROOT=${TARGET_GS_ROOT:-}
 TEST_SCENE_LIST=${TEST_SCENE_LIST:-${DATASET_ROOT}/test_psnr_filtered_scenes.csv}
 GS_STATISTICS_PATH=${GS_STATISTICS_PATH:-${DATASET_ROOT}/gs_statistics.json}
 SCENE_MODE=${SCENE_MODE:-one}
 SCENE_COUNT=${SCENE_COUNT:-1}
 SCENE_NAME=${SCENE_NAME:-3e288ee8aced4a0797e66d53536112b1}
 PREDICTOR=${PREDICTOR:-dit}
-BATCH_SIZE=${BATCH_SIZE:-1}
+BATCH_SIZE=${BATCH_SIZE:-16}
 GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS:-1}
 INPUT_RESOLUTION=${INPUT_RESOLUTION:-32}
 TARGET_RESOLUTION=${TARGET_RESOLUTION:-128}
-TOTAL_STEPS=${TOTAL_STEPS:-4000}
-EVAL_INTERVAL=${EVAL_INTERVAL:-500}
-SAVE_INTERVAL=${SAVE_INTERVAL:-4000}
+TOTAL_STEPS=${TOTAL_STEPS:-10000}
+EVAL_INTERVAL=${EVAL_INTERVAL:-1000}
+SAVE_INTERVAL=${SAVE_INTERVAL:-10000}
 LOG_INTERVAL=${LOG_INTERVAL:-20}
-FLOW_STEPS=${FLOW_STEPS:-10}
+FLOW_STEPS=${FLOW_STEPS:-50}
 FLOW_T_EPS=${FLOW_T_EPS:-1e-4}
 EVAL_NOISE_SEED=${EVAL_NOISE_SEED:-0}
 EVAL_MAX_VIEWS=${EVAL_MAX_VIEWS:-0}
@@ -81,7 +83,7 @@ for network in "${backbone_class}" "${predictor_class}"; do
             ;;
         GSFlowPredictor|DiffusionGaussianPredictor)
             prefix=GS
-            parameters=(output_head_nlayer output_head_width input_feat_to_mlp zeroinit fourier_input_features fourier_num_frequencies)
+            parameters=(sh_degree output_head_nlayer output_head_width input_feat_to_mlp zeroinit fourier_input_features fourier_num_frequencies)
             ;;
         GaussianDiTPredictor)
             prefix=GS
@@ -109,6 +111,8 @@ fi
 CUDA_VISIBLE_DEVICES="${GPU_ID}" python overfit-noise-to-gs.py \
     --output_dir="${OUTPUT_DIR}" \
     --scene_name="${SCENE_NAME}" \
+    --source_gs_root="${SOURCE_GS_ROOT}" \
+    --target_gs_root="${TARGET_GS_ROOT}" \
     --predictor="${PREDICTOR}" \
     --scene_mode="${SCENE_MODE}" \
     --scene_count="${SCENE_COUNT}" \

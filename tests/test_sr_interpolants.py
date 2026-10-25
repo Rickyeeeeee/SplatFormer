@@ -196,6 +196,37 @@ class InterpolantTests(unittest.TestCase):
         self.assertEqual(loss.item(), 6.)
         self.assertTrue(all(part.item() == 1 for part in parts.values()))
 
+    def test_degree_zero_standardizer_and_empty_attribute_loss(self):
+        normalizer = GaussianStandardizer(self.path, sh_degree=0)
+        source = {**self.source, "features_rest": self.source["features_rest"][:, :0, :]}
+        self.assertEqual(tuple(normalizer.means["features_rest"].shape), (0, 3))
+        encoded = normalizer.encode(source)
+        decoded = normalizer.decode(encoded)
+        for key in STATISTIC_KEYS:
+            torch.testing.assert_close(decoded[key], source[key])
+        prediction = {key: value.detach().requires_grad_() for key, value in encoded.items()}
+        loss, parts, _ = interpolants.attribute_mse(prediction, encoded)
+        self.assertTrue(torch.isfinite(loss))
+        self.assertEqual(parts["features_rest"].item(), 0)
+        loss.backward()
+        self.assertTrue(torch.isfinite(prediction["means"].grad).all())
+        self.document["aggregate"]["normalized"]["output"]["shN"] = {"mean": [], "variance": []}
+        self.path.write_text(json.dumps(self.document))
+        empty_stats = GaussianStandardizer(self.path, sh_degree=0)
+        torch.testing.assert_close(empty_stats.decode(empty_stats.encode(source))["features_rest"],
+                                   source["features_rest"])
+
+    def test_mcmc_normalized_parameters_schema(self):
+        normalized = self.document["aggregate"]["normalized"]
+        normalized["parameters"] = normalized.pop("output")
+        normalized["parameters"]["shN"] = {"mean": [], "variance": []}
+        self.path.write_text(json.dumps(self.document))
+        normalizer = GaussianStandardizer(self.path, sh_degree=0)
+        self.assertEqual(normalizer.report()["statistics_group"], "aggregate.normalized.parameters")
+        source = {**self.source, "features_rest": self.source["features_rest"][:, :0, :]}
+        for key, value in normalizer.decode(normalizer.encode(source)).items():
+            torch.testing.assert_close(value, source[key])
+
     def test_seeded_training_noise_is_fixed_without_changing_global_rng(self):
         reference = self.normalizer.encode(self.source)
         rng = torch.get_rng_state().clone()

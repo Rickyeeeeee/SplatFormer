@@ -23,13 +23,16 @@ class GaussianDiTPredictor(nn.Module):
 
     def __init__(self, sh_degree=1, max_gaussians=1000):
         super().__init__()
-        if sh_degree < 1:
-            raise ValueError("GaussianDiTPredictor requires sh_degree >= 1")
+        if sh_degree < 0:
+            raise ValueError("GaussianDiTPredictor requires sh_degree >= 0")
         self.sh_degree = sh_degree
         self.max_gaussians = max_gaussians
         self.backbone_type = "DIT"
         self.feature_channels = dict(FEATURE_CHANNELS)
-        self.feature_channels["features_rest"] = 3 * ((sh_degree + 1) ** 2 - 1)
+        if sh_degree:
+            self.feature_channels["features_rest"] = 3 * ((sh_degree + 1) ** 2 - 1)
+        else:
+            del self.feature_channels["features_rest"]
         self.input_features = list(self.feature_channels)
         self.output_features = list(self.feature_channels)
         width = sum(self.feature_channels.values())
@@ -76,9 +79,11 @@ class GaussianDiTPredictor(nn.Module):
 
         widths = list(self.feature_channels.values())
         outputs = []
-        for scene_velocity in velocity.split(counts):
+        for scene_velocity, gs in zip(velocity.split(counts), batch_flow_gs):
             attributes = {}
             for key, value in zip(self.output_features, scene_velocity.split(widths, dim=-1)):
                 attributes[key] = value.reshape(len(scene_velocity), -1, 3) if key == "features_rest" else value
+            if self.sh_degree == 0:
+                attributes["features_rest"] = torch.zeros_like(gs["features_rest"])
             outputs.append(attributes)
         return outputs

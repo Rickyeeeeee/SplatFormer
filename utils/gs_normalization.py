@@ -24,7 +24,7 @@ def normalize_gaussian_quaternions(endpoint):
 
 
 class GaussianStandardizer:
-    def __init__(self, path, variance_floor=1e-8, quaternion_representation="raw_standardized"):
+    def __init__(self, path, variance_floor=1e-8, quaternion_representation="raw_standardized", sh_degree=None):
         if quaternion_representation not in QUATERNION_REPRESENTATIONS:
             raise ValueError(f"Unsupported quaternion_representation={quaternion_representation!r}")
         self.quaternion_representation = quaternion_representation
@@ -35,9 +35,12 @@ class GaussianStandardizer:
         with open(path) as handle:
             document = json.load(handle)
         try:
-            statistics = document["aggregate"]["normalized"]["output"]
+            normalized = document["aggregate"]["normalized"]
+            group = "output" if "output" in normalized else "parameters"
+            statistics = normalized[group]
         except (KeyError, TypeError) as error:
-            raise ValueError(f"Statistics file {path} must contain aggregate.normalized.output with per-attribute mean and variance") from error
+            raise ValueError(f"Statistics file {path} must contain aggregate.normalized.output or aggregate.normalized.parameters with per-attribute mean and variance") from error
+        self.statistics_group = f"aggregate.normalized.{group}"
         self.means, self.variances, self.stds = {}, {}, {}
         for key, stored_key in STATISTIC_KEYS.items():
             try:
@@ -52,6 +55,9 @@ class GaussianStandardizer:
                     variance = variance.squeeze(0)
             if key == "opacities":
                 mean, variance = mean.reshape(-1), variance.reshape(-1)
+            if key == "features_rest" and sh_degree == 0:
+                # Degree-zero runs retain the DC statistics and discard SHN statistics.
+                mean, variance = mean.new_empty((0, 3)), variance.new_empty((0, 3))
             expected = {"means": (3,), "scales": (3,), "quats": (4,), "opacities": (1,), "features_dc": (3,)}
             if mean.shape != variance.shape or (key in expected and tuple(mean.shape) != expected[key]):
                 raise ValueError(f"Incompatible statistics shapes for {key}: {tuple(mean.shape)}, {tuple(variance.shape)}")
@@ -107,6 +113,6 @@ class GaussianStandardizer:
             attributes[key] = {"mean": self.means[key].tolist(), "variance": self.variances[key].tolist(),
                                "effective_mean": effective_mean.tolist(), "effective_scale": effective_scale.tolist(),
                                "effective_variance": effective_variance.tolist()}
-        return {"source_path": self.path, "statistics_group": "aggregate.normalized.output",
+        return {"source_path": self.path, "statistics_group": self.statistics_group,
                 "variance_floor": self.variance_floor, "quaternion_representation": self.quaternion_representation,
                 "attributes": attributes}
