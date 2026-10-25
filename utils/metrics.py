@@ -17,6 +17,35 @@ import lpips
 import json
 from utils import gpu_utils, gs_utils
 
+
+class PooledFID:
+    """Accumulate image-set FID while retaining real statistics across evaluations."""
+
+    def __init__(self, device):
+        from torchmetrics.image.fid import FrechetInceptionDistance
+
+        self.metric = FrechetInceptionDistance(feature=2048, reset_real_features=False)
+        self.metric.set_dtype(torch.float64)
+        self.metric = self.metric.to(device)
+        self.real_count = 0
+        self.generated_count = 0
+
+    def update(self, images, real):
+        self.metric.update(images.permute(0, 3, 1, 2).contiguous(), real=real)
+        if real:
+            self.real_count += len(images)
+        else:
+            self.generated_count += len(images)
+
+    def report(self):
+        result = {"fid": self.metric.compute().item(),
+                  "fid_counts": {"real": self.real_count, "generated": self.generated_count}}
+        # reset_real_features=False keeps target statistics for the next checkpoint.
+        self.metric.reset()
+        self.generated_count = 0
+        return result
+
+
 class MetricComputer:
     def __init__(self, forward_bs=8):
         lpips_fn = lpips.LPIPS(net='vgg', verbose=False).to('cuda')

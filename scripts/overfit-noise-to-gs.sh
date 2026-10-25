@@ -25,6 +25,11 @@ FLOW_STEPS=${FLOW_STEPS:-50}
 FLOW_T_EPS=${FLOW_T_EPS:-1e-4}
 EVAL_NOISE_SEED=${EVAL_NOISE_SEED:-0}
 EVAL_MAX_VIEWS=${EVAL_MAX_VIEWS:-0}
+RANDOM_ROTATE=${RANDOM_ROTATE:-False}
+ROTATION_MODE=${ROTATION_MODE:-gravity_consistent}
+ROTATION_MAX_DEGREES=${ROTATION_MAX_DEGREES:-None}
+ROTATION_PIVOT=${ROTATION_PIVOT:-"(0.5, 0.5, 0.5)"}
+EVAL_ROTATION_SEED=${EVAL_ROTATION_SEED:-0}
 LR_WARMUP_STEPS=${LR_WARMUP_STEPS:-0}
 LR_WARMUP_START_FACTOR=${LR_WARMUP_START_FACTOR:-0.03333333333333333}
 
@@ -63,8 +68,20 @@ coordinate_label=
 if [[ "${PREDICTOR}" == "dit" ]]; then
     coordinate_label=_${GS_COORDINATE_MODE}
 fi
+case "${RANDOM_ROTATE}" in
+    true|True) RANDOM_ROTATE=True ;;
+    false|False) RANDOM_ROTATE=False ;;
+    *) echo "RANDOM_ROTATE must be True or False" >&2; exit 2 ;;
+esac
+rotation_label=
+if [[ "${RANDOM_ROTATE}" == "True" ]]; then
+    rotation_label=_rot_${ROTATION_MODE}
+    if [[ "${ROTATION_MAX_DEGREES}" != "None" ]]; then
+        rotation_label+=_deg${ROTATION_MAX_DEGREES}
+    fi
+fi
 OUTPUT_ROOT=${OUTPUT_ROOT:-output_overfit_noise_to_gs}
-OUTPUT_DIR=${OUTPUT_DIR:-${OUTPUT_ROOT}/${scene_label}_${PREDICTOR}${coordinate_label}_hr${TARGET_RESOLUTION}_n1000}
+OUTPUT_DIR=${OUTPUT_DIR:-${OUTPUT_ROOT}/${scene_label}_${PREDICTOR}${coordinate_label}${rotation_label}_hr${TARGET_RESOLUTION}_n1000}
 
 # Forward architecture-specific Gin overrides without changing model defaults.
 network_gin_args=()
@@ -140,6 +157,11 @@ CUDA_VISIBLE_DEVICES="${GPU_ID}" python overfit-noise-to-gs.py \
     --gin_param="flow_matching.flow_steps=${FLOW_STEPS}" \
     --gin_param="flow_matching.flow_t_eps=${FLOW_T_EPS}" \
     --gin_param="flow_matching.eval_noise_seed=${EVAL_NOISE_SEED}" \
+    --gin_param="training_augmentation.random_rotate=${RANDOM_ROTATE}" \
+    --gin_param="training_augmentation.rotation_mode='${ROTATION_MODE}'" \
+    --gin_param="training_augmentation.rotation_max_degrees=${ROTATION_MAX_DEGREES}" \
+    --gin_param="training_augmentation.rotation_pivot=${ROTATION_PIVOT}" \
+    --gin_param="training_augmentation.eval_rotation_seed=${EVAL_ROTATION_SEED}" \
     --gin_param="training.total_steps=${TOTAL_STEPS}" \
     --gin_param="training.eval_interval=${EVAL_INTERVAL}" \
     --gin_param="training.save_interval=${SAVE_INTERVAL}" \
