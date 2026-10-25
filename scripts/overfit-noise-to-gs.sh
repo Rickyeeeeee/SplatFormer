@@ -59,8 +59,12 @@ scene_label=${SCENE_NAME}
 if [[ "${SCENE_MODE}" == "many" ]]; then
     scene_label=many_${SCENE_COUNT}
 fi
+coordinate_label=
+if [[ "${PREDICTOR}" == "dit" ]]; then
+    coordinate_label=_${GS_COORDINATE_MODE}
+fi
 OUTPUT_ROOT=${OUTPUT_ROOT:-output_overfit_noise_to_gs}
-OUTPUT_DIR=${OUTPUT_DIR:-${OUTPUT_ROOT}/${scene_label}_${PREDICTOR}_hr${TARGET_RESOLUTION}_n1000}
+OUTPUT_DIR=${OUTPUT_DIR:-${OUTPUT_ROOT}/${scene_label}_${PREDICTOR}${coordinate_label}_hr${TARGET_RESOLUTION}_n1000}
 
 # Forward architecture-specific Gin overrides without changing model defaults.
 network_gin_args=()
