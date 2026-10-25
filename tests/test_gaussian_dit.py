@@ -1,5 +1,6 @@
 """Focused checks for the standalone FlashAttention Gaussian DiT."""
 
+import math
 import unittest
 from unittest import mock
 
@@ -7,8 +8,10 @@ import gin
 import torch
 from torch import nn
 
-from models.gaussian_dit import flash_attn
+from models.gaussian_dit import GaussianDiT, flash_attn
 from models.gaussian_dit_predictor import GaussianDiTPredictor
+from sr.noise_to_gs import construct_path
+from utils.spatial_coordinates import morton_order
 
 
 SHAPES = {
@@ -18,11 +21,13 @@ SHAPES = {
 
 
 class CPUBackbone(nn.Module):
-    def __init__(self, in_channels, out_channels, max_gaussians):
+    def __init__(self, in_channels, out_channels, max_gaussians, position_mode="coordinate"):
         super().__init__()
+        self.position_mode = position_mode
         self.linear = nn.Linear(in_channels, out_channels)
 
     def forward(self, data):
+        self.last_input = data
         return self.linear(data["feat"])
 
 
@@ -63,6 +68,78 @@ class GaussianDiTTests(unittest.TestCase):
         loss = (prediction["means"] - scene["means"]).square().mean()
         loss.backward()
         self.assertTrue(torch.isfinite(model.backbone.linear.weight.grad).all())
+
+    def test_coordinate_modes_keep_flow_features_and_select_coordinates(self):
+        scenes = [self.scene(2), self.scene(3)]
+        references = [torch.randn_like(scene["means"]) for scene in scenes]
+        with mock.patch("models.gaussian_dit_predictor.GaussianDiT", CPUBackbone):
+            current = GaussianDiTPredictor(coordinate_mode="current")
+            gt = GaussianDiTPredictor(coordinate_mode="gt")
+        current(scenes, t=[0.2, 0.7], batch_reference_means=references)
+        gt(scenes, t=[0.2, 0.7], batch_reference_means=references)
+        torch.testing.assert_close(current.backbone.last_input["coord"], torch.cat([scene["means"] for scene in scenes]))
+        torch.testing.assert_close(gt.backbone.last_input["coord"], torch.cat(references))
+        torch.testing.assert_close(gt.backbone.last_input["feat"], current.backbone.last_input["feat"])
+        torch.testing.assert_close(gt.backbone.last_input["feat"][:, :3],
+                                   torch.cat([scene["means"] for scene in scenes]))
+
+    def test_gt_coordinate_mode_requires_aligned_references(self):
+        scenes = [self.scene(2), self.scene(3)]
+        with mock.patch("models.gaussian_dit_predictor.GaussianDiT", CPUBackbone):
+            with self.assertRaisesRegex(ValueError, "coordinate_mode"):
+                GaussianDiTPredictor(coordinate_mode="unknown")
+            model = GaussianDiTPredictor(coordinate_mode="gt")
+        with self.assertRaisesRegex(ValueError, "one reference means tensor per scene"):
+            model(scenes, t=0.2)
+        with self.assertRaisesRegex(ValueError, "one reference means tensor per scene"):
+            model(scenes, t=0.2, batch_reference_means=[scenes[0]["means"]])
+        with self.assertRaisesRegex(ValueError, r"shape \(3, 3\)"):
+            model(scenes, t=0.2, batch_reference_means=[scenes[0]["means"], scenes[1]["means"][:2]])
+
+    def test_morton_order_and_attribute_alignment(self):
+        means = torch.tensor([[2., 0., 0.], [0., 0., 0.], [1., 0., 0.]])
+        target = self.scene(3)
+        target["means"] = means
+        target["features_dc"][:, 0] = torch.tensor([20., 0., 10.])
+        order = morton_order(means)
+        torch.testing.assert_close(order, torch.tensor([1, 2, 0]))
+        sorted_target = {key: value[order] for key, value in target.items()}
+        noise = {key: torch.zeros_like(value) for key, value in sorted_target.items()}
+        _, velocity = construct_path(sorted_target, 0.5, noise)
+        torch.testing.assert_close(velocity["means"][:, 0], torch.tensor([0., 1., 2.]))
+        torch.testing.assert_close(velocity["features_dc"][:, 0], torch.tensor([0., 10., 20.]))
+        permuted = means[torch.tensor([2, 0, 1])]
+        torch.testing.assert_close(permuted[morton_order(permuted)], means[order])
+
+    def test_morton_rank_mode_uses_slots_without_reference_coordinates(self):
+        scenes = [self.scene(2), self.scene(3)]
+        with mock.patch("models.gaussian_dit_predictor.GaussianDiT", CPUBackbone):
+            model = GaussianDiTPredictor(coordinate_mode="morton_rank")
+        model(scenes, t=[0.2, 0.7])
+        self.assertEqual(model.backbone.position_mode, "morton_rank")
+        self.assertNotIn("coord", model.backbone.last_input)
+        torch.testing.assert_close(model.backbone.last_input["offset"], torch.tensor([2, 5]))
+        torch.testing.assert_close(model.backbone.last_input["feat"][:, :3],
+                                   torch.cat([scene["means"] for scene in scenes]))
+
+        backbone = GaussianDiT(in_channels=3, out_channels=3, max_gaussians=5, channels=32,
+                               num_heads=4, depth=1, position_mode="morton_rank")
+        self.assertFalse(hasattr(backbone, "coordinate_embedding"))
+        torch.testing.assert_close(backbone.position_embedding[0, :4], torch.tensor([0., 1., 0., 1.]))
+        torch.testing.assert_close(backbone.position_embedding[1, :2], torch.tensor([math.sin(1), math.cos(1)]))
+
+    @unittest.skipUnless(torch.cuda.is_available() and flash_attn is not None, "CUDA FlashAttention is required")
+    def test_morton_rank_batch_matches_individual_scenes(self):
+        model = GaussianDiTPredictor(coordinate_mode="morton_rank").cuda().eval()
+        with torch.no_grad():
+            torch.nn.init.normal_(model.backbone.final_layer.linear.weight, std=0.02)
+        scenes = [self.scene(3, "cuda"), self.scene(5, "cuda")]
+        with torch.no_grad():
+            batch = model(scenes, t=[0.2, 0.7])
+            separate = [model([scene], t=time)[0] for scene, time in zip(scenes, [0.2, 0.7])]
+        for actual, expected in zip(batch, separate):
+            for key in SHAPES:
+                torch.testing.assert_close(actual[key], expected[key], rtol=2e-3, atol=2e-3)
 
     @unittest.skipUnless(torch.cuda.is_available() and flash_attn is not None, "CUDA FlashAttention is required")
     def test_shapes_scene_isolation_permutation_time_and_reference(self):

@@ -92,6 +92,19 @@ class NoiseToGaussianTests(unittest.TestCase):
         noise_to_gs.sample_flow_model(model, 2, 1, 2, self.standardizer)
         self.assertTrue(all(reference is None for _, _, reference, _ in model.calls))
 
+    def test_dit_uses_fixed_gt_coordinates_at_every_rollout_step(self):
+        model = RecordingPredictor("DIT")
+        reference = torch.randn(2, 3)
+        noise_to_gs.sample_flow_model(model, 2, 1, 3, self.standardizer, reference_means=reference)
+        self.assertEqual(len(model.calls), 3)
+        for _, _, references, _ in model.calls:
+            self.assertIs(references[0], reference)
+        model.calls.clear()
+        state = noise_to_gs.sample_noise(2, self.standardizer, torch.device("cpu"))
+        noise_to_gs.predict_velocity(model, [state], [1], torch.tensor([0.5]), self.standardizer,
+                                     reference_means=[reference])
+        self.assertIs(model.calls[0][2][0], reference)
+
     def test_degree_zero_flow_and_loss_have_empty_rest(self):
         self.standardizer.means["features_rest"] = torch.empty((0, 3))
         self.standardizer.stds["features_rest"] = torch.empty((0, 3))
@@ -220,6 +233,17 @@ class NoiseToGaussianTests(unittest.TestCase):
                 self.assertIn("--gin_param=GSFlowPredictor.shift_negative_grid_coords=True", result.stdout)
             elif predictor in ("dipt", "gdpt"):
                 self.assertIn("--gin_param=DiffusionGaussianPredictor.shift_negative_grid_coords=True", result.stdout)
+
+        environment = dict(os.environ, PREDICTOR="dit", DATASET_ROOT="/tmp/noise-to-gs-test",
+                           GS_COORDINATE_MODE="gt")
+        result = subprocess.run(["bash", "-c", command, "test", str(ROOT / "scripts/overfit-noise-to-gs.sh")],
+                                env=environment, capture_output=True, text=True, check=True)
+        self.assertIn("--gin_param=GaussianDiTPredictor.coordinate_mode='gt'", result.stdout)
+
+        environment["GS_COORDINATE_MODE"] = "morton_rank"
+        result = subprocess.run(["bash", "-c", command, "test", str(ROOT / "scripts/overfit-noise-to-gs.sh")],
+                                env=environment, capture_output=True, text=True, check=True)
+        self.assertIn("--gin_param=GaussianDiTPredictor.coordinate_mode='morton_rank'", result.stdout)
 
 
 if __name__ == "__main__":

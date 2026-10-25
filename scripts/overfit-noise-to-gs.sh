@@ -87,7 +87,7 @@ for network in "${backbone_class}" "${predictor_class}"; do
             ;;
         GaussianDiTPredictor)
             prefix=GS
-            parameters=(sh_degree)
+            parameters=(sh_degree coordinate_mode)
             ;;
     esac
     for parameter in "${parameters[@]}"; do
@@ -95,7 +95,7 @@ for network in "${backbone_class}" "${predictor_class}"; do
         value=${!env_name:-}
         if [[ -n "${value}" ]]; then
             case "${parameter}" in
-                attention_backend|partition_mode) value="'${value}'" ;;
+                attention_backend|partition_mode|coordinate_mode) value="'${value}'" ;;
             esac
             network_gin_args+=("--gin_param=${network}.${parameter}=${value}")
         fi

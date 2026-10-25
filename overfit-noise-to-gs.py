@@ -23,6 +23,7 @@ from utils.log_utils import ProcessSafeLogger
 from utils.loss_utils import SUPPORTED_GS_KEYS
 from utils.metrics import MetricComputer
 from utils.optimizers import build_optimizer, build_scheduler
+from utils.spatial_coordinates import morton_order
 
 
 flags.DEFINE_string("output_dir", "output_overfit_noise_to_gs", "Output directory")
@@ -80,9 +81,12 @@ def evaluate_scene(model, scene, standardizer, flow_cfg, output_dir, ground_trut
         gaussians = gpu_utils.move_to_device(scene["gt_gs"], device)
     else:
         count = len(scene["target_gs"]["means"])
+        reference_means = (gpu_utils.move_to_device(scene["target_flow_gs"]["means"], device)
+                           if model.backbone_type == "DIT" and model.coordinate_mode == "gt" else None)
         gaussians = noise_to_gs.sample_flow_model(
             model, count, scene["scene_idx"], flow_cfg["flow_steps"], standardizer,
-            noise_seed=flow_cfg["eval_noise_seed"], t_eps=flow_cfg["flow_t_eps"]
+            noise_seed=flow_cfg["eval_noise_seed"], t_eps=flow_cfg["flow_t_eps"],
+            reference_means=reference_means
         )
     os.makedirs(output_dir, exist_ok=True)
     sh_degree_zero = gaussians["features_rest"].shape[1] == 0
@@ -144,7 +148,9 @@ def training(dataset, scene_indices, output_dir, logger, device, total_steps=400
             not isinstance(model.res_feature_activation[key], torch.nn.Identity) for key in required_outputs
         ):
             raise ValueError("Noise-to-GS requires additive quaternion velocity and identity output activations")
-    logger.info(f"Predictor={FLAGS.predictor} class={model_class.__name__} sh_degree={model.sh_degree}")
+    gt_conditioned = FLAGS.predictor == "dit" and model.coordinate_mode == "gt"
+    logger.info(f"Predictor={FLAGS.predictor} class={model_class.__name__} sh_degree={model.sh_degree} "
+                f"gt_conditioned={gt_conditioned}")
     standardizer = GaussianStandardizer(
         flow_cfg["gs_statistics_path"], flow_cfg["normalization_variance_floor"],
         sh_degree=0 if model.sh_degree == 0 else None
@@ -163,12 +169,17 @@ def training(dataset, scene_indices, output_dir, logger, device, total_steps=400
         view_count = min(FLAGS.eval_max_views, len(target["images"])) if FLAGS.eval_max_views > 0 else len(target["images"])
         cameras = {key: value[:view_count] if key == "camera_to_worlds" else value
                    for key, value in target["cameras"].items()}
+        target_flow_gs = standardizer.encode(target_gs)
+        if FLAGS.predictor == "dit" and model.coordinate_mode == "morton_rank":
+            order = morton_order(target_gs["means"])
+            # Keep every standardized target attribute aligned with its Morton slot.
+            target_flow_gs = {key: value[order] for key, value in target_flow_gs.items()}
         prepared.append({
             "scene_idx": scene_idx,
             "scene_name": raw["scene_name"],
             "gt_gs": target["gs_params"],
             "target_gs": target_gs,
-            "target_flow_gs": standardizer.encode(target_gs),
+            "target_flow_gs": target_flow_gs,
             "target_images": target["images"][:view_count],
             "target_cameras": cameras,
             "target_image_names": target["images_name"][:view_count],
@@ -225,10 +236,11 @@ def training(dataset, scene_indices, output_dir, logger, device, total_steps=400
             times = [torch.empty((), device=device).uniform_(flow_cfg["flow_t_eps"], 1 - flow_cfg["flow_t_eps"])
                      for _ in microbatch]
             paths = [noise_to_gs.construct_path(target, time) for target, time in zip(targets, times)]
+            reference_means = [target["means"] for target in targets] if gt_conditioned else None
             with torch.cuda.amp.autocast(enabled=enable_amp):
                 predictions = noise_to_gs.predict_velocity(
                     model, [query for query, _ in paths], [scene["scene_idx"] for scene in microbatch],
-                    torch.stack(times), standardizer
+                    torch.stack(times), standardizer, reference_means=reference_means
                 )
                 losses = [interpolants.attribute_mse(prediction, velocity)[0]
                           for prediction, (_, velocity) in zip(predictions, paths)]
@@ -268,13 +280,14 @@ def training(dataset, scene_indices, output_dir, logger, device, total_steps=400
                 for scene in prepared:
                     scene_dir = os.path.join(eval_dir, scene["scene_name"])
                     scene_metrics[scene["scene_name"]] = evaluate_scene(model, scene, standardizer, flow_cfg, scene_dir)
-                    logger.info(f"Eval step={step} scene={scene['scene_name']} metrics={scene_metrics[scene['scene_name']]} "
+                    logger.info(f"Eval step={step} scene={scene['scene_name']} gt_conditioned={gt_conditioned} "
+                                f"metrics={scene_metrics[scene['scene_name']]} "
                                 f"gt_gs_metrics={gt_scene_metrics[scene['scene_name']]}")
             mean = {key: sum(metrics[key] for metrics in scene_metrics.values()) / len(scene_metrics)
                     for key in next(iter(scene_metrics.values()))}
             os.makedirs(eval_dir, exist_ok=True)
             with open(os.path.join(eval_dir, "metrics.json"), "w") as handle:
-                json.dump({"mean": mean, "scenes": scene_metrics,
+                json.dump({"mean": mean, "scenes": scene_metrics, "gt_conditioned": gt_conditioned,
                            "gt_gs": {"mean": gt_mean, "scenes": gt_scene_metrics}}, handle, indent=2)
                 handle.write("\n")
         if (step + 1) % save_interval == 0:

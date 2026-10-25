@@ -19,14 +19,17 @@ FEATURE_CHANNELS = {
 
 @gin.configurable
 class GaussianDiTPredictor(nn.Module):
-    """Return one standardized velocity dictionary per Gaussian scene."""
+    """Return scene velocities; Morton-rank mode expects ordered training targets."""
 
-    def __init__(self, sh_degree=1, max_gaussians=1000):
+    def __init__(self, sh_degree=1, max_gaussians=1000, coordinate_mode="current"):
         super().__init__()
         if sh_degree < 0:
             raise ValueError("GaussianDiTPredictor requires sh_degree >= 0")
+        if coordinate_mode not in ("current", "gt", "morton_rank"):
+            raise ValueError(f"Unsupported coordinate_mode={coordinate_mode!r}; expected 'current', 'gt', or 'morton_rank'")
         self.sh_degree = sh_degree
         self.max_gaussians = max_gaussians
+        self.coordinate_mode = coordinate_mode
         self.backbone_type = "DIT"
         self.feature_channels = dict(FEATURE_CHANNELS)
         if sh_degree:
@@ -36,14 +39,16 @@ class GaussianDiTPredictor(nn.Module):
         self.input_features = list(self.feature_channels)
         self.output_features = list(self.feature_channels)
         width = sum(self.feature_channels.values())
-        self.backbone = GaussianDiT(in_channels=width, out_channels=width, max_gaussians=max_gaussians)
+        position_mode = "morton_rank" if coordinate_mode == "morton_rank" else "coordinate"
+        self.backbone = GaussianDiT(in_channels=width, out_channels=width, max_gaussians=max_gaussians,
+                                    position_mode=position_mode)
 
     def apply_feature_update(self, feature, value, update, step_scale=1.0):
         del feature
         return value + step_scale * update
 
     def forward(self, batch_flow_gs, batch_scene_idx=None, t=None, batch_reference_means=None):
-        del batch_scene_idx, batch_reference_means
+        del batch_scene_idx
         if not batch_flow_gs:
             raise ValueError("GaussianDiTPredictor requires at least one scene")
         if t is None:
@@ -52,6 +57,17 @@ class GaussianDiTPredictor(nn.Module):
         counts = [len(gs["means"]) for gs in batch_flow_gs]
         if any(count < 1 or count > self.max_gaussians for count in counts):
             raise ValueError(f"Each scene must contain 1 to {self.max_gaussians} Gaussians")
+        # GT mode fixes the coordinate embedding while features follow the flow state.
+        coordinates = [gs["means"] for gs in batch_flow_gs]
+        if self.coordinate_mode == "gt":
+            if batch_reference_means is None or len(batch_reference_means) != len(counts):
+                raise ValueError("GT coordinate mode requires one reference means tensor per scene")
+            for reference, gs, count in zip(batch_reference_means, batch_flow_gs, counts):
+                if not torch.is_tensor(reference) or reference.shape != (count, 3):
+                    raise ValueError(f"GT reference means must have shape ({count}, 3) per scene")
+                if reference.device != gs["means"].device:
+                    raise ValueError("GT reference means must be on the same device as the flow state")
+            coordinates = batch_reference_means
         packed = []
         for gs, count in zip(batch_flow_gs, counts):
             values = []
@@ -70,12 +86,14 @@ class GaussianDiTPredictor(nn.Module):
         if timesteps.numel() != len(counts):
             raise ValueError(f"Expected one timestep per scene, got {timesteps.numel()}")
         offset = torch.tensor(counts, device=device, dtype=torch.long).cumsum(0)
-        velocity = self.backbone({
+        model_input = {
             "feat": torch.cat(packed),
-            "coord": torch.cat([gs["means"] for gs in batch_flow_gs]),
             "offset": offset,
             "timesteps": timesteps,
-        })
+        }
+        if self.coordinate_mode != "morton_rank":
+            model_input["coord"] = torch.cat(coordinates)
+        velocity = self.backbone(model_input)
 
         widths = list(self.feature_channels.values())
         outputs = []

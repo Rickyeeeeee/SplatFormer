@@ -72,16 +72,30 @@ class GaussianDiT(nn.Module):
     """Predict packed Gaussian velocities with scene-wide DiT attention."""
 
     def __init__(self, in_channels, out_channels, max_gaussians=1000, depth=12, channels=384,
-                 num_heads=6, mlp_ratio=4, frequency_embedding_size=256):
+                 num_heads=6, mlp_ratio=4, frequency_embedding_size=256, position_mode="coordinate"):
         super().__init__()
         if max_gaussians < 1 or depth < 1 or channels < 1 or num_heads < 1 or channels % num_heads:
             raise ValueError("Invalid Gaussian DiT dimensions or maximum Gaussian count")
         if mlp_ratio <= 0 or frequency_embedding_size < 2:
             raise ValueError("mlp_ratio must be positive and frequency_embedding_size must be at least 2")
+        if position_mode not in ("coordinate", "morton_rank"):
+            raise ValueError(f"Unsupported position_mode={position_mode!r}")
+        if position_mode == "morton_rank" and channels < 2:
+            raise ValueError("Morton-rank position encoding requires at least two channels")
         self.max_gaussians = max_gaussians
         self.output_dim = out_channels
+        self.position_mode = position_mode
         self.feature_embedding = nn.Sequential(nn.Linear(in_channels, channels), nn.GELU(), nn.Linear(channels, channels))
-        self.coordinate_embedding = nn.Sequential(nn.Linear(3, channels), nn.GELU(), nn.Linear(channels, channels))
+        if position_mode == "coordinate":
+            self.coordinate_embedding = nn.Sequential(nn.Linear(3, channels), nn.GELU(), nn.Linear(channels, channels))
+        else:
+            positions = torch.arange(max_gaussians, dtype=torch.float32)[:, None]
+            frequencies = torch.exp(-math.log(10000) * torch.arange(channels // 2).float() / (channels // 2))
+            angles = positions * frequencies
+            embedding = torch.stack((angles.sin(), angles.cos()), dim=-1).flatten(1)
+            if channels % 2:
+                embedding = torch.cat((embedding, embedding.new_zeros(max_gaussians, 1)), dim=-1)
+            self.register_buffer("position_embedding", embedding, persistent=False)
         self.timestep_embedding = TimestepEmbedding(channels, frequency_embedding_size)
         self.blocks = nn.ModuleList([GaussianDiTBlock(channels, num_heads, mlp_ratio) for _ in range(depth)])
         self.final_layer = GaussianDiTFinalLayer(channels, out_channels)
@@ -98,19 +112,28 @@ class GaussianDiT(nn.Module):
     def forward(self, data_dict):
         if flash_attn is None or not data_dict["feat"].is_cuda:
             raise RuntimeError("GaussianDiT requires flash_attn and CUDA")
-        feat, coord = data_dict["feat"], data_dict["coord"]
+        feat = data_dict["feat"]
         offset, timesteps = data_dict["offset"], data_dict["timesteps"]
         if offset.ndim != 1 or len(offset) != len(timesteps) or not len(offset) or offset[-1] != len(feat):
             raise ValueError("Scene offsets and timesteps must cover all Gaussians")
         counts = torch.diff(torch.cat([offset.new_zeros(1), offset]))
         if (counts < 1).any() or (counts > self.max_gaussians).any():
             raise ValueError(f"Each scene must contain 1 to {self.max_gaussians} Gaussians")
-        if coord.shape != (len(feat), 3):
-            raise ValueError("Expected one current coordinate per Gaussian")
+        if self.position_mode == "coordinate":
+            coord = data_dict["coord"]
+            if coord.shape != (len(feat), 3):
+                raise ValueError("Expected one current coordinate per Gaussian")
 
         batch = torch.repeat_interleave(torch.arange(len(offset), device=feat.device), counts)
         cu_seqlens = torch.cat([offset.new_zeros(1), offset]).to(torch.int32).contiguous()
-        features = self.feature_embedding(feat) + self.coordinate_embedding(coord)
+        features = self.feature_embedding(feat)
+        if self.position_mode == "coordinate":
+            features = features + self.coordinate_embedding(coord)
+        else:
+            # Every scene starts at slot zero, regardless of its packed offset.
+            starts = torch.cat([offset.new_zeros(1), offset[:-1]])
+            indices = torch.arange(len(feat), device=feat.device) - torch.repeat_interleave(starts, counts)
+            features = features + self.position_embedding[indices].to(features.dtype)
         time = self.timestep_embedding(timesteps)
         max_seqlen = int(counts.max().item())
         for block in self.blocks:
