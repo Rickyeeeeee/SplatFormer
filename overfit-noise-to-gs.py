@@ -17,6 +17,7 @@ from models.feature_flow_predictor import GSFlowPredictor
 from models.feature_predictor import FeaturePredictor  # Registers legacy Gin keys.
 from models.gaussian_dit_predictor import GaussianDiTPredictor
 from sr import interpolants, noise_to_gs
+from sr.noise_to_gs import flow_matching
 from utils import gpu_utils, gs_utils
 from utils.data_augmentation import (rotate_gaussians, sample_uniform_rotation_quaternion,
                                      sample_uniform_z_rotation_quaternion, validate_rotation_max_degrees)
@@ -60,20 +61,6 @@ PREDICTORS = {
 def set_seed(seed=42):
     seed_everything(seed)
     return seed
-
-
-@gin.configurable
-def flow_matching(gs_statistics_path, flow_steps=10, flow_t_eps=1e-4, eval_noise_seed=0,
-                  normalization_variance_floor=1e-8):
-    if flow_steps < 1 or not 0 < flow_t_eps < 0.5:
-        raise ValueError("Expected positive flow_steps and 0 < flow_t_eps < 0.5")
-    return {
-        "gs_statistics_path": gs_statistics_path,
-        "flow_steps": flow_steps,
-        "flow_t_eps": flow_t_eps,
-        "eval_noise_seed": eval_noise_seed,
-        "normalization_variance_floor": normalization_variance_floor,
-    }
 
 
 @gin.configurable

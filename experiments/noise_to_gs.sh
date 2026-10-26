@@ -74,37 +74,38 @@ data_root=${DATASET_ROOT:-/project/ricky/splatformer-sr-data-scaled}
 # OUTPUT_ROOT=${OUTPUT_ROOT:-/project2/ricky/experiments/${run_date}/} \
 # bash scripts/overfit-noise-to-gs.sh
 
-DATASET_ROOT=${data_root} \
-SOURCE_GS_ROOT=${SOURCE_GS_ROOT:-/project/ricky/splatformer-sr-data-mcmc-4000} \
-TARGET_GS_ROOT=${TARGET_GS_ROOT:-/project/ricky/splatformer-sr-data-mcmc-4000} \
-GS_COUNT=4000 \
-GS_STATISTICS_PATH=${GS_STATISTICS_PATH:-/project/ricky/splatformer-sr-data-mcmc-4000/test-set/objaverse/128/gs_statistics.json} \
-SCENE_NAME=${SCENE_NAME:-3e288ee8aced4a0797e66d53536112b1} \
-PREDICTOR=${PREDICTOR:-dit} \
-GS_COORDINATE_MODE=morton_rank \
-INPUT_RESOLUTION=128 \
-TARGET_RESOLUTION=128 \
-GS_SH_DEGREE=0 \
-OUTPUT_ROOT=${OUTPUT_ROOT:-/project2/ricky/experiments/${run_date}/} \
-bash scripts/overfit-noise-to-gs.sh
+# DATASET_ROOT=${data_root} \
+# SOURCE_GS_ROOT=${SOURCE_GS_ROOT:-/project/ricky/splatformer-sr-data-mcmc-4000} \
+# TARGET_GS_ROOT=${TARGET_GS_ROOT:-/project/ricky/splatformer-sr-data-mcmc-4000} \
+# GS_COUNT=4000 \
+# GS_STATISTICS_PATH=${GS_STATISTICS_PATH:-/project/ricky/splatformer-sr-data-mcmc-4000/test-set/objaverse/128/gs_statistics.json} \
+# SCENE_NAME=${SCENE_NAME:-3e288ee8aced4a0797e66d53536112b1} \
+# PREDICTOR=${PREDICTOR:-dit} \
+# GS_COORDINATE_MODE=morton_rank \
+# INPUT_RESOLUTION=128 \
+# TARGET_RESOLUTION=128 \
+# GS_SH_DEGREE=0 \
+# OUTPUT_ROOT=${OUTPUT_ROOT:-/project2/ricky/experiments/${run_date}/} \
+# bash scripts/overfit-noise-to-gs.sh
 
-DATASET_ROOT=${data_root} \
-SOURCE_GS_ROOT=${SOURCE_GS_ROOT:-/project/ricky/splatformer-sr-data-mcmc-4000} \
-TARGET_GS_ROOT=${TARGET_GS_ROOT:-/project/ricky/splatformer-sr-data-mcmc-4000} \
-GS_COUNT=4000 \
-GS_STATISTICS_PATH=${GS_STATISTICS_PATH:-/project/ricky/splatformer-sr-data-mcmc-4000/test-set/objaverse/128/gs_statistics.json} \
-SCENE_NAME=${SCENE_NAME:-3e288ee8aced4a0797e66d53536112b1} \
-PREDICTOR=${PREDICTOR:-dit} \
-GS_COORDINATE_MODE=current \
-INPUT_RESOLUTION=128 \
-TARGET_RESOLUTION=128 \
-GS_SH_DEGREE=0 \
-OUTPUT_ROOT=${OUTPUT_ROOT:-/project2/ricky/experiments/${run_date}/} \
-bash scripts/overfit-noise-to-gs.sh
+# DATASET_ROOT=${data_root} \
+# SOURCE_GS_ROOT=${SOURCE_GS_ROOT:-/project/ricky/splatformer-sr-data-mcmc-4000} \
+# TARGET_GS_ROOT=${TARGET_GS_ROOT:-/project/ricky/splatformer-sr-data-mcmc-4000} \
+# GS_COUNT=4000 \
+# GS_STATISTICS_PATH=${GS_STATISTICS_PATH:-/project/ricky/splatformer-sr-data-mcmc-4000/test-set/objaverse/128/gs_statistics.json} \
+# SCENE_NAME=${SCENE_NAME:-3e288ee8aced4a0797e66d53536112b1} \
+# PREDICTOR=${PREDICTOR:-dit} \
+# GS_COORDINATE_MODE=current \
+# INPUT_RESOLUTION=128 \
+# TARGET_RESOLUTION=128 \
+# GS_SH_DEGREE=0 \
+# OUTPUT_ROOT=${OUTPUT_ROOT:-/project2/ricky/experiments/${run_date}/} \
+# bash scripts/overfit-noise-to-gs.sh
 
 DATASET_ROOT=${data_root} \
 SOURCE_GS_ROOT=${SOURCE_GS_ROOT:-/project/ricky/splatformer-sr-data-mcmc-8000} \
 TARGET_GS_ROOT=${TARGET_GS_ROOT:-/project/ricky/splatformer-sr-data-mcmc-8000} \
+GS_COUNT=8000 \
 GS_STATISTICS_PATH=${GS_STATISTICS_PATH:-/project/ricky/splatformer-sr-data-mcmc-8000/test-set/objaverse/512/gs_statistics.json} \
 SCENE_NAME=${SCENE_NAME:-3e288ee8aced4a0797e66d53536112b1} \
 PREDICTOR=${PREDICTOR:-dit} \

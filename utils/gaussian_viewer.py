@@ -44,13 +44,16 @@ def _camera_intrinsics(camera, height):
     return np.array([[focal, 0, width / 2], [0, focal, height / 2], [0, 0, 1]], dtype=np.float32), width
 
 
-def _render_gsplat_for_camera(camera, gaussians, render_cfg):
+def _render_gsplat_for_camera(camera, gaussians, render_cfg, colors_override=None):
     from gsplat.rendering import rasterization
     from utils.gs_utils import _prepare_render_inputs
 
     device = torch.device(render_cfg["device"])
     current = {key: value.to(device) for key, value in gaussians.items()}
     means, quats, scales, opacities, colors, sh_degree = _prepare_render_inputs(current)
+    if colors_override is not None:
+        colors = torch.as_tensor(colors_override, device=device, dtype=torch.float32) / 255.0
+        sh_degree = None
     intrinsics, width = _camera_intrinsics(camera, render_cfg["height"])
     viewmats = torch.from_numpy(_camera_to_viewmat(camera)).to(device).unsqueeze(0).contiguous()
     Ks = torch.from_numpy(intrinsics).to(device).unsqueeze(0).contiguous()
@@ -72,12 +75,18 @@ class GsplatBackgroundRenderer:
 
     def __init__(self, server, gaussians, state, render_cfg):
         self.server, self.gaussians, self.state, self.render_cfg = server, gaussians, state, render_cfg
+        self.colors_override = None
         self.lock = threading.Lock()
         self.last_render_time = {}
 
     def update_gaussians(self, gaussians):
         with self.lock:
             self.gaussians = gaussians
+
+    def update_scene(self, gaussians, colors):
+        with self.lock:
+            self.gaussians = gaussians
+            self.colors_override = colors
 
     def render_client(self, client, force=False):
         if self.state["view_mode"] != "gsplat":
@@ -91,7 +100,8 @@ class GsplatBackgroundRenderer:
         self.last_render_time[client_id] = now
         try:
             with self.lock:
-                image = _render_gsplat_for_camera(client.camera, self.gaussians, self.render_cfg)
+                image = _render_gsplat_for_camera(client.camera, self.gaussians, self.render_cfg,
+                                                  self.colors_override)
             client.set_background_image(image, format="jpeg", jpeg_quality=85)
         except Exception:
             print("GSplat background render failed:", flush=True)
