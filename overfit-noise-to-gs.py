@@ -24,7 +24,6 @@ from utils.gpu_utils import seed_everything
 from utils.gs_normalization import GaussianStandardizer
 from utils.log_utils import ProcessSafeLogger
 from utils.loss_utils import SUPPORTED_GS_KEYS
-from utils.metrics import MetricComputer, PooledFID
 from utils.optimizers import build_optimizer, build_scheduler
 from utils.spatial_coordinates import morton_order
 
@@ -92,7 +91,7 @@ def training_augmentation(random_rotate=False, rotation_mode="gravity_consistent
 
 
 @torch.no_grad()
-def evaluate_scene(model, scene, standardizer, flow_cfg, output_dir, ground_truth=False, fid=None, rotated_fid=None):
+def evaluate_scene(model, scene, standardizer, flow_cfg, output_dir, ground_truth=False, ply_only=False):
     device = next(model.parameters()).device
     if ground_truth:
         gaussians = gpu_utils.move_to_device(scene["gt_gs"], device)
@@ -110,6 +109,10 @@ def evaluate_scene(model, scene, standardizer, flow_cfg, output_dir, ground_trut
     ply_name = "gt.ply" if ground_truth else "output.ply"
     gs_utils.export_ply_forviewer(gaussians, os.path.join(output_dir, "point_cloud", ply_name),
                                   sh_degree_zero=sh_degree_zero)
+    if ply_only:
+        return
+    from utils.metrics import MetricComputer
+
     pred_dir = os.path.join(output_dir, "gt" if ground_truth else "pred")
     os.makedirs(pred_dir, exist_ok=True)
     metrics = MetricComputer()
@@ -127,17 +130,12 @@ def evaluate_scene(model, scene, standardizer, flow_cfg, output_dir, ground_trut
             gaussians, chunk_cameras, sh_degree_zero=sh_degree_zero
         )
         predicted = torch.stack(predicted)
-        if rotated_fid is not None and not ground_truth:
-            # Rotated FID compares renders on the same camera background, without a canonical target mask.
-            rotated_fid.update((predicted.clamp(0, 1) * 255).to(torch.uint8), real=False)
         target = torch.stack(gpu_utils.move_to_device(images[start:end], device))
         if target.shape[-1] == 4:
             predicted = predicted * target[..., 3:4]
         target_uint8 = (target[..., :3] * 255).to(torch.uint8)
         predicted_uint8 = (predicted * 255).to(torch.uint8)
         metrics.update(predicted_uint8, target_uint8, name=f"{scene['scene_idx']}_{start:06d}")
-        if fid is not None:
-            fid.update(target_uint8 if ground_truth else predicted_uint8, real=ground_truth)
         for name, image in zip(scene["target_image_names"][start:end], predicted_uint8):
             image = image.cpu().numpy()
             cv2.imwrite(os.path.join(pred_dir, name), image[:, :, ::-1])
@@ -156,11 +154,15 @@ def training(dataset, scene_indices, output_dir, logger, device, total_steps=400
         raise ValueError("Training and reporting intervals must be positive")
     flow_cfg = flow_matching()
     augmentation_cfg = training_augmentation()
+    ply_only = len(scene_indices) > 1 or augmentation_cfg["random_rotate"]
     rotation_sampler = (sample_uniform_z_rotation_quaternion
                         if augmentation_cfg["rotation_mode"] == "gravity_consistent"
                         else sample_uniform_rotation_quaternion)
-    if dataset.max_gs_num != 1000 or not dataset.load_tgt_gs or not dataset.load_tgt_images:
-        raise ValueError("Noise-to-GS requires native HR Gaussians and views capped at 1000")
+    if not dataset.load_tgt_gs or (not ply_only and not dataset.load_tgt_images):
+        raise ValueError("Noise-to-GS requires native HR Gaussians and views for paired evaluation")
+    if ply_only:
+        # PLY snapshots need target Gaussians but never load target images or cameras.
+        dataset.load_tgt_images = False
 
     model_class = PREDICTORS[FLAGS.predictor]
     model = model_class().to(device)
@@ -193,28 +195,32 @@ def training(dataset, scene_indices, output_dir, logger, device, total_steps=400
         if model.sh_degree == 0:
             # Retain the native DC coefficient while discarding higher-order SH.
             target_gs = {**target_gs, "features_rest": target_gs["features_rest"][:, :0, :]}
-        if not 1 <= len(target_gs["means"]) <= 1000 or not target["images"]:
-            raise ValueError(f"Scene {raw['scene_name']} needs 1 to 1000 HR Gaussians and target views")
-        view_count = min(FLAGS.eval_max_views, len(target["images"])) if FLAGS.eval_max_views > 0 else len(target["images"])
-        cameras = {key: value[:view_count] if key == "camera_to_worlds" else value
-                   for key, value in target["cameras"].items()}
+        if not ply_only and not target["images"]:
+            raise ValueError(f"Scene {raw['scene_name']} needs target views for paired evaluation")
         target_flow_gs = standardizer.encode(target_gs)
         if FLAGS.predictor == "dit" and model.coordinate_mode == "morton_rank":
             order = morton_order(target_gs["means"])
             # Keep every standardized target attribute aligned with its Morton slot.
             target_flow_gs = {key: value[order] for key, value in target_flow_gs.items()}
-        prepared.append({
+        scene = {
             "scene_idx": scene_idx,
             "scene_name": raw["scene_name"],
-            "gt_gs": target["gs_params"],
             "target_gs": target_gs,
             "target_flow_gs": target_flow_gs,
-            "target_images": target["images"][:view_count],
-            "target_cameras": cameras,
-            "target_image_names": target["images_name"][:view_count],
-            "eval_chunk_size": dataset.image_per_scene if dataset.image_per_scene and dataset.image_per_scene > 0
-                               else len(target["images"]),
-        })
+        }
+        if not ply_only:
+            view_count = min(FLAGS.eval_max_views, len(target["images"])) if FLAGS.eval_max_views > 0 else len(target["images"])
+            cameras = {key: value[:view_count] if key == "camera_to_worlds" else value
+                       for key, value in target["cameras"].items()}
+            scene.update({
+                "gt_gs": target["gs_params"],
+                "target_images": target["images"][:view_count],
+                "target_cameras": cameras,
+                "target_image_names": target["images_name"][:view_count],
+                "eval_chunk_size": dataset.image_per_scene if dataset.image_per_scene and dataset.image_per_scene > 0
+                                   else len(target["images"]),
+            })
+        prepared.append(scene)
         logger.info(f"Prepared native HR scene {raw['scene_name']} with {len(target_gs['means'])} Gaussians")
     if len(prepared) > 1:
         prepared = [gpu_utils.to_cpu(scene) for scene in prepared]
@@ -229,43 +235,18 @@ def training(dataset, scene_indices, output_dir, logger, device, total_steps=400
         json.dump(standardizer.report(), handle, indent=2)
         handle.write("\n")
 
-    # Render the native HR Gaussians once on the same views used for model evaluation.
     gt_scene_metrics = {}
-    fid = None
-    rotated_fid = None
-    with torch.random.fork_rng(devices=[device]):
-        if FLAGS.scene_mode == "many":
-            fid = PooledFID(device)
-            if augmentation_cfg["random_rotate"]:
-                rotated_fid = PooledFID(device)
-        for scene in prepared:
-            scene_dir = os.path.join(output_dir, "gt_gs", scene["scene_name"])
-            gt_scene_metrics[scene["scene_name"]] = evaluate_scene(
-                model, scene, standardizer, flow_cfg, scene_dir, ground_truth=True, fid=fid
-            )
-            logger.info(f"GT GS scene={scene['scene_name']} metrics={gt_scene_metrics[scene['scene_name']]}")
-            if rotated_fid is not None:
-                target_gs = gpu_utils.move_to_device(scene["target_gs"], device)
-                rotation_generator = torch.Generator(device=device).manual_seed(
-                    augmentation_cfg["eval_rotation_seed"] + int(scene["scene_idx"])
+    if not ply_only:
+        # Render native HR Gaussians once for the paired one-scene evaluation.
+        with torch.random.fork_rng(devices=[device]):
+            for scene in prepared:
+                scene_dir = os.path.join(output_dir, "gt_gs", scene["scene_name"])
+                gt_scene_metrics[scene["scene_name"]] = evaluate_scene(
+                    model, scene, standardizer, flow_cfg, scene_dir, ground_truth=True
                 )
-                rotation = rotation_sampler(target_gs["means"].dtype, device, rotation_generator,
-                                            max_degrees=augmentation_cfg["rotation_max_degrees"])
-                rotated_gs = rotate_gaussians(target_gs, rotation, augmentation_cfg["rotation_pivot"])
-                images = scene["target_images"]
-                chunk_size = min(scene["eval_chunk_size"], len(images))
-                with torch.no_grad():
-                    for start in range(0, len(images), chunk_size):
-                        end = min(start + chunk_size, len(images))
-                        cameras = {key: value[start:end] if key == "camera_to_worlds" else value
-                                   for key, value in scene["target_cameras"].items()}
-                        cameras = gpu_utils.move_to_device(cameras, device)
-                        rendered, _ = gs_utils.rasterize_gaussians_to_multiimgs(
-                            rotated_gs, cameras, sh_degree_zero=model.sh_degree == 0
-                        )
-                        rotated_fid.update((torch.stack(rendered).clamp(0, 1) * 255).to(torch.uint8), real=True)
-    gt_mean = {key: sum(metrics[key] for metrics in gt_scene_metrics.values()) / len(gt_scene_metrics)
-               for key in next(iter(gt_scene_metrics.values()))}
+                logger.info(f"GT GS scene={scene['scene_name']} metrics={gt_scene_metrics[scene['scene_name']]}")
+        gt_mean = {key: sum(metrics[key] for metrics in gt_scene_metrics.values()) / len(gt_scene_metrics)
+                   for key in next(iter(gt_scene_metrics.values()))}
 
     scaler = torch.cuda.amp.GradScaler(enabled=enable_amp)
     augmentation_generator = torch.Generator(device=device).manual_seed(torch.initial_seed())
@@ -344,30 +325,26 @@ def training(dataset, scene_indices, output_dir, logger, device, total_steps=400
         if step % eval_interval == 0 or (step + 1) % save_interval == 0 or final:
             eval_dir = os.path.join(output_dir, FLAGS.eval_subdir if final else f"eval/{step:08d}")
             scene_metrics = {}
-            # Rendering and metric setup must not change subsequent training noise.
+            # Snapshot sampling must not change subsequent training noise.
             with torch.random.fork_rng(devices=[device]):
                 for scene in prepared:
                     scene_dir = os.path.join(eval_dir, scene["scene_name"])
-                    scene_metrics[scene["scene_name"]] = evaluate_scene(
-                        model, scene, standardizer, flow_cfg, scene_dir, fid=fid, rotated_fid=rotated_fid
-                    )
-                    logger.info(f"Eval step={step} scene={scene['scene_name']} gt_conditioned={gt_conditioned} "
-                                f"metrics={scene_metrics[scene['scene_name']]} "
-                                f"gt_gs_metrics={gt_scene_metrics[scene['scene_name']]}")
-            mean = {key: sum(metrics[key] for metrics in scene_metrics.values()) / len(scene_metrics)
-                    for key in next(iter(scene_metrics.values()))}
-            report = {"mean": mean, "scenes": scene_metrics, "gt_conditioned": gt_conditioned,
-                      "gt_gs": {"mean": gt_mean, "scenes": gt_scene_metrics}}
-            if fid is not None:
-                report.update(fid.report())
-            if rotated_fid is not None:
-                rotated_report = rotated_fid.report()
-                report["rotated_fid"] = rotated_report["fid"]
-                report["rotated_fid_counts"] = rotated_report["fid_counts"]
-            os.makedirs(eval_dir, exist_ok=True)
-            with open(os.path.join(eval_dir, "metrics.json"), "w") as handle:
-                json.dump(report, handle, indent=2)
-                handle.write("\n")
+                    result = evaluate_scene(model, scene, standardizer, flow_cfg, scene_dir, ply_only=ply_only)
+                    if ply_only:
+                        logger.info(f"PLY step={step} sample_slot={scene['scene_name']}")
+                    else:
+                        scene_metrics[scene["scene_name"]] = result
+                        logger.info(f"Eval step={step} scene={scene['scene_name']} gt_conditioned={gt_conditioned} "
+                                    f"metrics={result} gt_gs_metrics={gt_scene_metrics[scene['scene_name']]}")
+            if not ply_only:
+                mean = {key: sum(metrics[key] for metrics in scene_metrics.values()) / len(scene_metrics)
+                        for key in next(iter(scene_metrics.values()))}
+                report = {"mean": mean, "scenes": scene_metrics, "gt_conditioned": gt_conditioned,
+                          "gt_gs": {"mean": gt_mean, "scenes": gt_scene_metrics}}
+                os.makedirs(eval_dir, exist_ok=True)
+                with open(os.path.join(eval_dir, "metrics.json"), "w") as handle:
+                    json.dump(report, handle, indent=2)
+                    handle.write("\n")
         if (step + 1) % save_interval == 0:
             torch.save(model.state_dict(), os.path.join(output_dir, "checkpoints", f"model_{step:08d}.pth"))
     torch.save(model.state_dict(), os.path.join(output_dir, "checkpoints", "model_last.pth"))

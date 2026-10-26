@@ -10,6 +10,7 @@ TEST_SCENE_LIST=${TEST_SCENE_LIST:-${DATASET_ROOT}/test_psnr_filtered_scenes.csv
 GS_STATISTICS_PATH=${GS_STATISTICS_PATH:-${DATASET_ROOT}/gs_statistics.json}
 SCENE_MODE=${SCENE_MODE:-one}
 SCENE_COUNT=${SCENE_COUNT:-1}
+GS_COUNT=${GS_COUNT:-1000}
 SCENE_NAME=${SCENE_NAME:-3e288ee8aced4a0797e66d53536112b1}
 PREDICTOR=${PREDICTOR:-dit}
 GS_COORDINATE_MODE=${GS_COORDINATE_MODE:-morton_rank}
@@ -73,6 +74,10 @@ case "${RANDOM_ROTATE}" in
     false|False) RANDOM_ROTATE=False ;;
     *) echo "RANDOM_ROTATE must be True or False" >&2; exit 2 ;;
 esac
+load_target_images=True
+if [[ "${RANDOM_ROTATE}" == "True" ]] || [[ "${SCENE_MODE}" == "many" && "${SCENE_COUNT}" -gt 1 ]]; then
+    load_target_images=False
+fi
 rotation_label=
 if [[ "${RANDOM_ROTATE}" == "True" ]]; then
     rotation_label=_rot_${ROTATION_MODE}
@@ -81,7 +86,7 @@ if [[ "${RANDOM_ROTATE}" == "True" ]]; then
     fi
 fi
 OUTPUT_ROOT=${OUTPUT_ROOT:-output_overfit_noise_to_gs}
-OUTPUT_DIR=${OUTPUT_DIR:-${OUTPUT_ROOT}/${scene_label}_${PREDICTOR}${coordinate_label}${rotation_label}_hr${TARGET_RESOLUTION}_n1000}
+OUTPUT_DIR=${OUTPUT_DIR:-${OUTPUT_ROOT}/${scene_label}_${PREDICTOR}${coordinate_label}${rotation_label}_hr${TARGET_RESOLUTION}_n${GS_COUNT}}
 
 # Forward architecture-specific Gin overrides without changing model defaults.
 network_gin_args=()
@@ -128,6 +133,8 @@ if [[ "${PREDICTOR}" == "ptv3" ]]; then
     network_gin_args+=("--gin_param=GSFlowPredictor.shift_negative_grid_coords=True")
 elif [[ "${PREDICTOR}" == "dipt" || "${PREDICTOR}" == "gdpt" ]]; then
     network_gin_args+=("--gin_param=DiffusionGaussianPredictor.shift_negative_grid_coords=True")
+elif [[ "${PREDICTOR}" == "dit" ]]; then
+    network_gin_args+=("--gin_param=GaussianDiTPredictor.max_gaussians=${GS_COUNT}")
 fi
 
 CUDA_VISIBLE_DEVICES="${GPU_ID}" python overfit-noise-to-gs.py \
@@ -148,11 +155,11 @@ CUDA_VISIBLE_DEVICES="${GPU_ID}" python overfit-noise-to-gs.py \
     --gin_param="test_scene_list='${TEST_SCENE_LIST}'" \
     --gin_param="SplatFactoSRDataset.src_resolution=${INPUT_RESOLUTION}" \
     --gin_param="SplatFactoSRDataset.tgt_resolution=${TARGET_RESOLUTION}" \
-    --gin_param="SplatFactoSRDataset.max_gs_num=1000" \
+    --gin_param="SplatFactoSRDataset.max_gs_num=${GS_COUNT}" \
     --gin_param="SplatFactoSRDataset.load_src_gs=False" \
     --gin_param="SplatFactoSRDataset.load_src_images=False" \
     --gin_param="SplatFactoSRDataset.load_tgt_gs=True" \
-    --gin_param="SplatFactoSRDataset.load_tgt_images=True" \
+    --gin_param="SplatFactoSRDataset.load_tgt_images=${load_target_images}" \
     --gin_param="flow_matching.gs_statistics_path='${GS_STATISTICS_PATH}'" \
     --gin_param="flow_matching.flow_steps=${FLOW_STEPS}" \
     --gin_param="flow_matching.flow_t_eps=${FLOW_T_EPS}" \
