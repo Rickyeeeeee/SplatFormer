@@ -5,6 +5,7 @@ import math
 import gin
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 try:
     import flash_attn
@@ -72,7 +73,8 @@ class GaussianDiT(nn.Module):
     """Predict packed Gaussian velocities with scene-wide DiT attention."""
 
     def __init__(self, in_channels, out_channels, max_gaussians=1000, depth=12, channels=384,
-                 num_heads=6, mlp_ratio=4, frequency_embedding_size=256, position_mode="coordinate"):
+                 num_heads=6, mlp_ratio=4, frequency_embedding_size=256, position_mode="coordinate",
+                 patch_size=1):
         super().__init__()
         if max_gaussians < 1 or depth < 1 or channels < 1 or num_heads < 1 or channels % num_heads:
             raise ValueError("Invalid Gaussian DiT dimensions or maximum Gaussian count")
@@ -82,10 +84,17 @@ class GaussianDiT(nn.Module):
             raise ValueError(f"Unsupported position_mode={position_mode!r}")
         if position_mode == "morton_rank" and channels < 2:
             raise ValueError("Morton-rank position encoding requires at least two channels")
+        if not isinstance(patch_size, int) or isinstance(patch_size, bool) or patch_size < 1:
+            raise ValueError("patch_size must be a positive integer")
+        if patch_size > 1 and position_mode != "morton_rank":
+            raise ValueError("patch_size > 1 requires morton_rank position mode")
         self.max_gaussians = max_gaussians
         self.output_dim = out_channels
         self.position_mode = position_mode
+        self.patch_size = patch_size
         self.feature_embedding = nn.Sequential(nn.Linear(in_channels, channels), nn.GELU(), nn.Linear(channels, channels))
+        if patch_size > 1:
+            self.patch_embedding = nn.Linear(patch_size * channels, channels)
         if position_mode == "coordinate":
             self.coordinate_embedding = nn.Sequential(nn.Linear(3, channels), nn.GELU(), nn.Linear(channels, channels))
         else:
@@ -98,7 +107,7 @@ class GaussianDiT(nn.Module):
             self.register_buffer("position_embedding", embedding, persistent=False)
         self.timestep_embedding = TimestepEmbedding(channels, frequency_embedding_size)
         self.blocks = nn.ModuleList([GaussianDiTBlock(channels, num_heads, mlp_ratio) for _ in range(depth)])
-        self.final_layer = GaussianDiTFinalLayer(channels, out_channels)
+        self.final_layer = GaussianDiTFinalLayer(channels, patch_size * out_channels)
 
         # AdaLN-Zero starts every transformer block as an identity map.
         for block in self.blocks:
@@ -124,8 +133,6 @@ class GaussianDiT(nn.Module):
             if coord.shape != (len(feat), 3):
                 raise ValueError("Expected one current coordinate per Gaussian")
 
-        batch = torch.repeat_interleave(torch.arange(len(offset), device=feat.device), counts)
-        cu_seqlens = torch.cat([offset.new_zeros(1), offset]).to(torch.int32).contiguous()
         features = self.feature_embedding(feat)
         if self.position_mode == "coordinate":
             features = features + self.coordinate_embedding(coord)
@@ -134,8 +141,27 @@ class GaussianDiT(nn.Module):
             starts = torch.cat([offset.new_zeros(1), offset[:-1]])
             indices = torch.arange(len(feat), device=feat.device) - torch.repeat_interleave(starts, counts)
             features = features + self.position_embedding[indices].to(features.dtype)
+        if self.patch_size > 1:
+            # Pad each scene independently so a patch never crosses a scene boundary.
+            scene_counts = counts.tolist()
+            patches = []
+            for scene_features in features.split(scene_counts):
+                padding = (-len(scene_features)) % self.patch_size
+                patches.append(F.pad(scene_features, (0, 0, 0, padding)).reshape(-1, self.patch_size * features.shape[-1]))
+            features = self.patch_embedding(torch.cat(patches))
+            token_counts = torch.div(counts + self.patch_size - 1, self.patch_size, rounding_mode="floor")
+        else:
+            token_counts = counts
+        batch = torch.repeat_interleave(torch.arange(len(offset), device=feat.device), token_counts)
+        cu_seqlens = torch.cat([offset.new_zeros(1), token_counts.cumsum(0)]).to(torch.int32).contiguous()
         time = self.timestep_embedding(timesteps)
-        max_seqlen = int(counts.max().item())
+        max_seqlen = int(token_counts.max().item())
         for block in self.blocks:
             features = block(features, time, batch, cu_seqlens, max_seqlen)
-        return self.final_layer(features, time, batch)
+        velocity = self.final_layer(features, time, batch)
+        if self.patch_size > 1:
+            # Discard padded Gaussian outputs while preserving each scene's input order.
+            velocity = velocity.reshape(-1, self.patch_size, self.output_dim)
+            velocity = torch.cat([scene.reshape(-1, self.output_dim)[:count]
+                                  for scene, count in zip(velocity.split(token_counts.tolist()), scene_counts)])
+        return velocity

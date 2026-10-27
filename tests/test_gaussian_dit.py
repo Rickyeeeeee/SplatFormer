@@ -128,6 +128,68 @@ class GaussianDiTTests(unittest.TestCase):
         torch.testing.assert_close(backbone.position_embedding[0, :4], torch.tensor([0., 1., 0., 1.]))
         torch.testing.assert_close(backbone.position_embedding[1, :2], torch.tensor([math.sin(1), math.cos(1)]))
 
+    def test_patch_size_one_keeps_checkpoint_layout(self):
+        kwargs = {"in_channels": 3, "out_channels": 3, "max_gaussians": 5, "channels": 32,
+                  "num_heads": 4, "depth": 1, "position_mode": "morton_rank"}
+        original = GaussianDiT(**kwargs)
+        explicit = GaussianDiT(**kwargs, patch_size=1)
+        self.assertEqual(set(original.state_dict()), set(explicit.state_dict()))
+        self.assertFalse(hasattr(explicit, "patch_embedding"))
+        explicit.load_state_dict(original.state_dict(), strict=True)
+
+    @unittest.skipUnless(torch.cuda.is_available() and flash_attn is not None, "CUDA FlashAttention is required")
+    def test_patch_size_one_matches_explicit_forward(self):
+        kwargs = {"in_channels": 3, "out_channels": 3, "max_gaussians": 5, "channels": 32,
+                  "num_heads": 4, "depth": 1, "position_mode": "morton_rank"}
+        original = GaussianDiT(**kwargs).cuda().eval()
+        explicit = GaussianDiT(**kwargs, patch_size=1).cuda().eval()
+        explicit.load_state_dict(original.state_dict(), strict=True)
+        data = {"feat": torch.randn(3, 3, device="cuda"), "offset": torch.tensor([3], device="cuda"),
+                "timesteps": torch.tensor([0.5], device="cuda")}
+        with torch.no_grad():
+            torch.testing.assert_close(original(data), explicit(data))
+
+    def test_patch_size_validation(self):
+        kwargs = {"in_channels": 3, "out_channels": 3, "position_mode": "morton_rank"}
+        for size in (0, -1, 1.5, "2", True):
+            with self.subTest(size=size), self.assertRaisesRegex(ValueError, "patch_size"):
+                GaussianDiT(**kwargs, patch_size=size)
+        with self.assertRaisesRegex(ValueError, "morton_rank"):
+            GaussianDiT(in_channels=3, out_channels=3, position_mode="coordinate", patch_size=4)
+
+    @unittest.skipUnless(torch.cuda.is_available() and flash_attn is not None, "CUDA FlashAttention is required")
+    def test_patched_morton_rank_shapes_scene_isolation_and_gradients(self):
+        gin.bind_parameter("GaussianDiT.patch_size", 4)
+        model = GaussianDiTPredictor(coordinate_mode="morton_rank").cuda().train()
+        with torch.no_grad():
+            torch.nn.init.normal_(model.backbone.final_layer.linear.weight, std=0.02)
+        scenes = [self.scene(count, "cuda") for count in (2, 5, 8)]
+        times = [0.2, 0.5, 0.8]
+        boundaries = []
+
+        def record_boundaries(_, inputs):
+            boundaries.append((inputs[3].tolist(), inputs[4]))
+
+        handle = model.backbone.blocks[0].register_forward_pre_hook(record_boundaries)
+        try:
+            batch = model(scenes, t=times)
+        finally:
+            handle.remove()
+        self.assertEqual(boundaries, [([0, 1, 3, 5], 2)])
+        for scene, output in zip(scenes, batch):
+            for key in SHAPES:
+                self.assertEqual(output[key].shape, scene[key].shape)
+        with torch.no_grad():
+            separate = [model([scene], t=time)[0] for scene, time in zip(scenes, times)]
+        for actual, expected in zip(batch, separate):
+            for key in SHAPES:
+                torch.testing.assert_close(actual[key], expected[key], rtol=2e-3, atol=2e-3)
+        sum(output["means"].square().mean() for output in batch).backward()
+        for parameter in (model.backbone.feature_embedding[0].weight, model.backbone.patch_embedding.weight,
+                          model.backbone.final_layer.linear.weight):
+            self.assertTrue(torch.isfinite(parameter.grad).all())
+            self.assertGreater(parameter.grad.abs().sum().item(), 0)
+
     @unittest.skipUnless(torch.cuda.is_available() and flash_attn is not None, "CUDA FlashAttention is required")
     def test_morton_rank_batch_matches_individual_scenes(self):
         model = GaussianDiTPredictor(coordinate_mode="morton_rank").cuda().eval()

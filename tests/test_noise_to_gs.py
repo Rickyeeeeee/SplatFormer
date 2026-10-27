@@ -241,9 +241,11 @@ class NoiseToGaussianTests(unittest.TestCase):
         self.assertIn("--gin_param=GaussianDiTPredictor.coordinate_mode='gt'", result.stdout)
 
         environment["GS_COORDINATE_MODE"] = "morton_rank"
+        environment["DIT_PATCH_SIZE"] = "4"
         result = subprocess.run(["bash", "-c", command, "test", str(ROOT / "scripts/overfit-noise-to-gs.sh")],
                                 env=environment, capture_output=True, text=True, check=True)
         self.assertIn("--gin_param=GaussianDiTPredictor.coordinate_mode='morton_rank'", result.stdout)
+        self.assertIn("--gin_param=GaussianDiT.patch_size=4", result.stdout)
 
 
 if __name__ == "__main__":

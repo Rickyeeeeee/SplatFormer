@@ -9,3 +9,4 @@ GaussianDiT.channels = 384
 GaussianDiT.num_heads = 6
 GaussianDiT.mlp_ratio = 4
 GaussianDiT.frequency_embedding_size = 256
+GaussianDiT.patch_size = 1

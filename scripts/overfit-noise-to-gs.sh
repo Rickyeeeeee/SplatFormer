@@ -106,7 +106,7 @@ for network in "${backbone_class}" "${predictor_class}"; do
             ;;
         GaussianDiT)
             prefix=DIT
-            parameters=(depth channels num_heads mlp_ratio frequency_embedding_size)
+            parameters=(depth channels num_heads patch_size mlp_ratio frequency_embedding_size)
             ;;
         GSFlowPredictor|DiffusionGaussianPredictor)
             prefix=GS
