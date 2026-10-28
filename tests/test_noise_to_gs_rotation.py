@@ -85,7 +85,7 @@ class RotationTrainingTests(unittest.TestCase):
         self.dataset = FakeDataset()
         self.original = {key: value.clone() for key, value in self.dataset.gaussians.items()}
         self.flow_cfg = {"gs_statistics_path": "unused", "normalization_variance_floor": 1e-8,
-                         "flow_t_eps": 1e-4, "flow_steps": 1, "eval_noise_seed": 0}
+                         "flow_t_eps": 1e-4, "flow_steps": 1, "eval_noise_seed": 0, "coupling": "random"}
         self.flags = SimpleNamespace(predictor="dit", scene_mode="one", eval_max_views=1,
                                      batch_size=2, grad_accum_steps=1, eval_subdir="eval_final")
 
@@ -100,9 +100,9 @@ class RotationTrainingTests(unittest.TestCase):
         models = []
         original_path = SCRIPT.noise_to_gs.construct_path
 
-        def capture_path(target, time):
+        def capture_path(target, time, coupling="random"):
             captured.append({key: value.clone() for key, value in target.items()})
-            return original_path(target, time)
+            return original_path(target, time, coupling=coupling)
 
         def build_model():
             model = FakeModel()
@@ -225,6 +225,16 @@ class RotationTrainingTests(unittest.TestCase):
         result = subprocess.run(["bash", "-c", command, "test", str(ROOT / "scripts/overfit-noise-to-gs.sh")],
                                 env=environment, capture_output=True, text=True, check=True)
         self.assertIn("--gin_param=SplatFactoSRDataset.load_tgt_images=True", result.stdout)
+
+    def test_launcher_exposes_morton_coupling_and_fourier(self):
+        command = 'python() { printf "%s\\n" "$@"; }; source "$1"'
+        environment = dict(os.environ, FLOW_COUPLING="morton", GS_COORDINATE_MODE="morton_rank",
+                           GS_FOURIER_INPUT_FEATURES="['means']", GS_FOURIER_NUM_FREQUENCIES="{'means': 3}")
+        result = subprocess.run(["bash", "-c", command, "test", str(ROOT / "scripts/overfit-noise-to-gs.sh")],
+                                env=environment, capture_output=True, text=True, check=True)
+        self.assertIn("--gin_param=flow_matching.coupling='morton'", result.stdout)
+        self.assertIn("--gin_param=GaussianDiTPredictor.fourier_input_features=['means']", result.stdout)
+        self.assertIn("--gin_param=GaussianDiTPredictor.fourier_num_frequencies={'means': 3}", result.stdout)
 
     def test_ply_snapshot_is_reproducible_for_a_fixed_noise_seed(self):
         model = FakeModel()

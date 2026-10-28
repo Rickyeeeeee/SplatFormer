@@ -126,7 +126,8 @@ def evaluate(model, standardizer, cameras, camera_indices, camera_names, flow_cf
             slot_dir.mkdir(parents=True, exist_ok=True)
             gaussians = noise_to_gs.sample_flow_model(
                 model, FLAGS.gs_count, 0, flow_cfg["flow_steps"], standardizer,
-                noise_seed=evaluation_seed(flow_cfg["eval_noise_seed"], slot), t_eps=flow_cfg["flow_t_eps"]
+                noise_seed=evaluation_seed(flow_cfg["eval_noise_seed"], slot), t_eps=flow_cfg["flow_t_eps"],
+                coupling=flow_cfg["coupling"]
             )
             sh_degree_zero = model.sh_degree == 0
             gs_utils.export_ply_forviewer(gaussians, slot_dir / "output.ply", sh_degree_zero=sh_degree_zero)
@@ -182,6 +183,7 @@ def training():
         test_dataset, FLAGS.eval_scene_name, FLAGS.test_splat_dir, device
     )
     model = GaussianDiTPredictor()
+    noise_to_gs.validate_coupling(model, flow_cfg["coupling"])
     if model.coordinate_mode not in ("morton_rank", "current") or model.max_gaussians != FLAGS.gs_count:
         raise ValueError("Trainer requires unconditional DiT with max_gaussians equal to gs_count")
     if augmentation_cfg["random_rotate"] and model.sh_degree > 1:
@@ -250,7 +252,8 @@ def training():
                                                                                   model_module.coordinate_mode)))
                 times = [torch.empty((), device=device).uniform_(flow_cfg["flow_t_eps"], 1 - flow_cfg["flow_t_eps"])
                          for _ in targets]
-                paths = [noise_to_gs.construct_path(target, time) for target, time in zip(targets, times)]
+                paths = [noise_to_gs.construct_path(target, time, coupling=flow_cfg["coupling"])
+                         for target, time in zip(targets, times)]
                 sync = model.no_sync() if distributed and microbatch_index < len(sizes) - 1 else nullcontext()
                 with sync, torch.cuda.amp.autocast(enabled=config["enable_amp"]):
                     predictions = model(batch_flow_gs=[query for query, _ in paths],

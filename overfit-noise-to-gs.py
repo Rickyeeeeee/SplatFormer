@@ -89,7 +89,7 @@ def evaluate_scene(model, scene, standardizer, flow_cfg, output_dir, ground_trut
         gaussians = noise_to_gs.sample_flow_model(
             model, count, scene["scene_idx"], flow_cfg["flow_steps"], standardizer,
             noise_seed=flow_cfg["eval_noise_seed"], t_eps=flow_cfg["flow_t_eps"],
-            reference_means=reference_means
+            reference_means=reference_means, coupling=flow_cfg["coupling"]
         )
     os.makedirs(output_dir, exist_ok=True)
     sh_degree_zero = gaussians["features_rest"].shape[1] == 0
@@ -153,6 +153,7 @@ def training(dataset, scene_indices, output_dir, logger, device, total_steps=400
 
     model_class = PREDICTORS[FLAGS.predictor]
     model = model_class().to(device)
+    noise_to_gs.validate_coupling(model, flow_cfg["coupling"])
     if augmentation_cfg["random_rotate"] and model.sh_degree > 1:
         raise ValueError("Random rotation supports Gaussian SH degree 0 or 1")
     if FLAGS.predictor in ("dipt", "gdpt") and model.backbone_type.lower() != FLAGS.predictor:
@@ -272,7 +273,8 @@ def training(dataset, scene_indices, output_dir, logger, device, total_steps=400
                 targets.append(target)
             times = [torch.empty((), device=device).uniform_(flow_cfg["flow_t_eps"], 1 - flow_cfg["flow_t_eps"])
                      for _ in microbatch]
-            paths = [noise_to_gs.construct_path(target, time) for target, time in zip(targets, times)]
+            paths = [noise_to_gs.construct_path(target, time, coupling=flow_cfg["coupling"])
+                     for target, time in zip(targets, times)]
             reference_means = [target["means"] for target in targets] if gt_conditioned else None
             with torch.cuda.amp.autocast(enabled=enable_amp):
                 predictions = noise_to_gs.predict_velocity(

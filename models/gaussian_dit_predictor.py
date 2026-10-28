@@ -3,6 +3,7 @@
 import gin
 import torch
 from torch import nn
+from utils.fourier_features import build_fourier_feature_encoders
 
 from .gaussian_dit import GaussianDiT
 
@@ -21,7 +22,9 @@ FEATURE_CHANNELS = {
 class GaussianDiTPredictor(nn.Module):
     """Return scene velocities; Morton-rank mode expects ordered training targets."""
 
-    def __init__(self, sh_degree=1, max_gaussians=1000, coordinate_mode="current"):
+    def __init__(self, sh_degree=1, max_gaussians=1000, coordinate_mode="current",
+                 fourier_input_features=(), fourier_num_frequencies=None, fourier_include_raw=True,
+                 fourier_log_sampling=True, fourier_max_frequency_log2=None):
         super().__init__()
         if sh_degree < 0:
             raise ValueError("GaussianDiTPredictor requires sh_degree >= 0")
@@ -38,9 +41,12 @@ class GaussianDiTPredictor(nn.Module):
             del self.feature_channels["features_rest"]
         self.input_features = list(self.feature_channels)
         self.output_features = list(self.feature_channels)
+        self.fourier_encoders, input_channels = build_fourier_feature_encoders(
+            self.feature_channels, self.input_features, fourier_input_features, fourier_num_frequencies,
+            fourier_include_raw, fourier_log_sampling, fourier_max_frequency_log2)
         width = sum(self.feature_channels.values())
         position_mode = "morton_rank" if coordinate_mode == "morton_rank" else "coordinate"
-        self.backbone = GaussianDiT(in_channels=width, out_channels=width, max_gaussians=max_gaussians,
+        self.backbone = GaussianDiT(in_channels=sum(input_channels.values()), out_channels=width, max_gaussians=max_gaussians,
                                     position_mode=position_mode)
 
     def apply_feature_update(self, feature, value, update, step_scale=1.0):
@@ -76,7 +82,10 @@ class GaussianDiTPredictor(nn.Module):
                 shape = (count, width // 3, 3) if key == "features_rest" else (count, width)
                 if value.shape != shape:
                     raise ValueError(f"Expected {key} shape {shape}, got {tuple(value.shape)}")
-                values.append(value.reshape(count, width))
+                value = value.reshape(count, width)
+                if key in self.fourier_encoders:
+                    value = self.fourier_encoders[key](value)
+                values.append(value)
             packed.append(torch.cat(values, dim=-1))
 
         device = packed[0].device

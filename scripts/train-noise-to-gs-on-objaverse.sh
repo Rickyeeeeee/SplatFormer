@@ -24,6 +24,7 @@ EVAL_INTERVAL=${EVAL_INTERVAL:-5000}
 SAVE_INTERVAL=${SAVE_INTERVAL:-5000}
 LOG_INTERVAL=${LOG_INTERVAL:-20}
 FLOW_STEPS=${FLOW_STEPS:-25}
+FLOW_COUPLING=${FLOW_COUPLING:-random}
 EVAL_NOISE_SEED=${EVAL_NOISE_SEED:-0}
 RANDOM_ROTATE=${RANDOM_ROTATE:-False}
 USE_WANDB=${USE_WANDB:-true}
@@ -72,6 +73,7 @@ torchrun --nnodes=1 --nproc_per_node="${NGPUS}" --rdzv-endpoint="localhost:${MAS
     --gin_param="GaussianDiT.patch_size=${DIT_PATCH_SIZE}" \
     --gin_param="flow_matching.gs_statistics_path='${GS_STATISTICS_PATH}'" \
     --gin_param="flow_matching.flow_steps=${FLOW_STEPS}" \
+    --gin_param="flow_matching.coupling='${FLOW_COUPLING}'" \
     --gin_param="flow_matching.eval_noise_seed=${EVAL_NOISE_SEED}" \
     --gin_param="training_augmentation.random_rotate=${RANDOM_ROTATE}" \
     --gin_param="training.total_steps=${TOTAL_STEPS}" \

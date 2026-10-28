@@ -8,6 +8,7 @@ training.grad_clip_norm = 2.0
 training.enable_amp = True
 
 flow_matching.flow_steps = 10
+flow_matching.coupling = 'random'
 flow_matching.flow_t_eps = 1e-4
 flow_matching.eval_noise_seed = 0
 flow_matching.normalization_variance_floor = 1e-8

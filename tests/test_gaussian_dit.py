@@ -69,6 +69,24 @@ class GaussianDiTTests(unittest.TestCase):
         loss.backward()
         self.assertTrue(torch.isfinite(model.backbone.linear.weight.grad).all())
 
+    def test_fourier_inputs_and_output_shapes(self):
+        for degree in (0, 1):
+            scene = self.scene(3)
+            if degree == 0:
+                scene["features_rest"] = scene["features_rest"][:, :0, :]
+            with mock.patch("models.gaussian_dit_predictor.GaussianDiT", CPUBackbone):
+                model = GaussianDiTPredictor(sh_degree=degree, fourier_input_features=["means", "quats"],
+                                             fourier_num_frequencies={"means": 2, "quats": 1},
+                                             fourier_include_raw=False)
+            result = model([scene], t=0.5)[0]
+            features = model.backbone.last_input["feat"]
+            torch.testing.assert_close(features[:, :12], model.fourier_encoders["means"](scene["means"]))
+            self.assertEqual(features.shape[1], sum(model.feature_channels.values()) - 7 + 12 + 8)
+            for key in scene:
+                self.assertEqual(result[key].shape, scene[key].shape)
+        with self.assertRaisesRegex(ValueError, "Missing fourier_num_frequencies"):
+            GaussianDiTPredictor(fourier_input_features=["means"])
+
     def test_coordinate_modes_keep_flow_features_and_select_coordinates(self):
         scenes = [self.scene(2), self.scene(3)]
         references = [torch.randn_like(scene["means"]) for scene in scenes]

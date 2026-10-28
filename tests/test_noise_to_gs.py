@@ -15,6 +15,7 @@ from models.diffusion_gaussian_predictor import DiffusionGaussianPredictor
 from models.feature_flow_predictor import GSFlowPredictor
 from sr import interpolants, noise_to_gs
 from utils.gs_normalization import STATISTIC_KEYS
+from utils.spatial_coordinates import morton_order
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -70,6 +71,29 @@ class NoiseToGaussianTests(unittest.TestCase):
         for key in STATISTIC_KEYS:
             torch.testing.assert_close(query[key], torch.full_like(target[key], -0.25))
             torch.testing.assert_close(velocity[key], torch.full_like(target[key], 3.))
+
+    def test_morton_coupling_aligns_all_noise_attributes(self):
+        target = {key: torch.randn((3,) + shape) for key, shape in SHAPES.items()}
+        noise = {key: torch.randn_like(value) for key, value in target.items()}
+        noise["means"] = torch.tensor([[2., 0., 0.], [0., 0., 0.], [1., 0., 0.]])
+        order = morton_order(noise["means"])
+        query, velocity = noise_to_gs.construct_path(target, 0.25, noise, coupling="morton")
+        for key in STATISTIC_KEYS:
+            torch.testing.assert_close(query[key], 0.75 * noise[key][order] + 0.25 * target[key])
+            torch.testing.assert_close(velocity[key], target[key] - noise[key][order])
+        with self.assertRaisesRegex(ValueError, "morton_rank"):
+            noise_to_gs.validate_coupling(RecordingPredictor(), "morton")
+
+    def test_morton_sampling_orders_once_and_is_seeded(self):
+        model = RecordingPredictor("DIT")
+        model.coordinate_mode = "morton_rank"
+        first = noise_to_gs.sample_flow_model(model, 7, 3, 3, self.standardizer, noise_seed=8, coupling="morton")
+        second = noise_to_gs.sample_flow_model(model, 7, 3, 3, self.standardizer, noise_seed=8, coupling="morton")
+        for key in STATISTIC_KEYS:
+            torch.testing.assert_close(first[key], second[key])
+            for states, _, _, _ in model.calls:
+                torch.testing.assert_close(states[0][key], first[key])
+        torch.testing.assert_close(morton_order(first["means"]), torch.arange(7))
 
     def test_sampling_is_count_only_seeded_and_restores_mode(self):
         model = RecordingPredictor().train()

@@ -3,6 +3,11 @@ GaussianDiTPredictor.sh_degree = 0
 GaussianDiTPredictor.max_gaussians = 1000
 # Use 'morton_rank' with targets sorted by Morton order for fixed index embeddings.
 GaussianDiTPredictor.coordinate_mode = 'current'
+GaussianDiTPredictor.fourier_input_features = []
+GaussianDiTPredictor.fourier_num_frequencies = {}
+GaussianDiTPredictor.fourier_include_raw = True
+GaussianDiTPredictor.fourier_log_sampling = True
+GaussianDiTPredictor.fourier_max_frequency_log2 = {}
 
 GaussianDiT.depth = 12
 GaussianDiT.channels = 384

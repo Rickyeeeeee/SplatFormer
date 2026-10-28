@@ -29,6 +29,7 @@ from dataset.GS_SR import SplatFactoSRDataset
 from sr import noise_to_gs
 from utils.gaussian_viewer import GsplatBackgroundRenderer, _rgb_from_gaussians, _validate_gsplat_available
 from utils.gs_normalization import GaussianStandardizer, STATISTIC_KEYS
+from utils.spatial_coordinates import morton_order
 
 
 def default_settings():
@@ -120,6 +121,7 @@ def parse_args(argv=None):
     parser.add_argument("--target_gs_root", type=Path, help="Dataset root containing target-resolution GS checkpoints.")
     parser.add_argument("--statistics_path", type=Path, default=Path("/project/ricky/splatformer-sr-data-scaled/gs_statistics.json"))
     parser.add_argument("--noise_seed", type=int, default=0, help="Evaluation seed; actual seed adds scene index.")
+    parser.add_argument("--coupling", choices=("random", "morton"), default="random")
     parser.add_argument("--preset", type=Path, help="Previously saved noise settings JSON.")
     parser.add_argument("--export_settings", type=Path, default=Path("noise_to_gs_preset.json"))
     parser.add_argument("--host", default="127.0.0.1")
@@ -175,11 +177,15 @@ def load_scene(args):
     if target["features_rest"].shape[1:] == (0, 3):
         for statistics in (standardizer.means, standardizer.variances, standardizer.stds):
             statistics["features_rest"] = torch.empty((0, 3), dtype=torch.float32)
+    if args.coupling == "morton":
+        order = morton_order(target["means"])
+        target = {key: value[order] for key, value in target.items()}
     target_flow = standardizer.encode(target)
     # Match evaluation's device-specific seeded draw, then keep viewer state on CPU.
     generator = torch.Generator(device=args.device).manual_seed(args.noise_seed + scene_idx)
     base_noise = {key: value.cpu() for key, value in
-                  noise_to_gs.sample_noise(count, standardizer, args.device, generator).items()}
+                  noise_to_gs.order_noise(noise_to_gs.sample_noise(count, standardizer, args.device, generator),
+                                          args.coupling).items()}
     return target, target_flow, base_noise, standardizer, scene_idx
 
 
