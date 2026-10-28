@@ -6,7 +6,7 @@ import sys
 import threading
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import torch
@@ -77,6 +77,22 @@ class CheckpointViewerTests(unittest.TestCase):
             torch.testing.assert_close(states[-1][key], expected[key])
         self.assertFalse(model.training)
 
+    def test_interpolated_noise_endpoints_and_middle(self):
+        model, standardizer = ConstantVelocity(), UnitStandardizer()
+        samples = viewer.record_interpolated_samples(model, 5, 2, standardizer, 3, 1e-4, 17, 23)
+        self.assertEqual(len(samples), 6)
+        self.assertTrue(all(len(trajectory) == 4 for trajectory in samples))
+        for index, seed in ((0, 17), (5, 23)):
+            direct = noise_to_gs.sample_flow_model(model, 5, 2, 3, standardizer, noise_seed=seed)
+            for key in STATISTIC_KEYS:
+                torch.testing.assert_close(samples[index][-1][key], direct[key])
+        generator_a = torch.Generator().manual_seed(19)
+        generator_b = torch.Generator().manual_seed(25)
+        noise_a = noise_to_gs.sample_noise(5, standardizer, "cpu", generator_a)
+        noise_b = noise_to_gs.sample_noise(5, standardizer, "cpu", generator_b)
+        for key in STATISTIC_KEYS:
+            torch.testing.assert_close(samples[2][0][key], 0.6 * noise_a[key] + 0.4 * noise_b[key])
+
     def test_sequence_colors_and_bar_follow_slot_indices(self):
         colors = viewer.sequence_index_colors(3)
         bar, labels = viewer.sequence_colorbar(colors)
@@ -108,6 +124,11 @@ class CheckpointViewerTests(unittest.TestCase):
         instance.count = 2
         instance.sequence_colors = viewer.sequence_index_colors(2)
         instance.step = types.SimpleNamespace(value=0)
+        instance.active_steps = 1
+        instance.active_mode = "Single"
+        instance.mode = types.SimpleNamespace(value="Single")
+        instance.seed_b = types.SimpleNamespace(visible=False)
+        instance.rate = types.SimpleNamespace(value=0.0, visible=False)
         instance.color_mode = types.SimpleNamespace(value="Sequence index")
         instance.colorbar = types.SimpleNamespace(visible=False)
         instance.colorbar_labels = types.SimpleNamespace(visible=False, content="Index **0** (left) → **1** (right)")
@@ -142,7 +163,7 @@ class CheckpointViewerTests(unittest.TestCase):
     def test_step_buttons_move_one_step_and_clamp(self):
         instance = object.__new__(viewer.CheckpointViewer)
         instance.step = types.SimpleNamespace(value=0)
-        instance.flow_cfg = {"flow_steps": 2}
+        instance.active_steps = 2
         instance.decrease_step(None)
         self.assertEqual(instance.step.value, 0)
         instance.increase_step(None)
@@ -158,6 +179,9 @@ class CheckpointViewerTests(unittest.TestCase):
         instance.lock = threading.RLock()
         instance.sampling = False
         instance.seed = types.SimpleNamespace(value=8)
+        instance.seed_b = types.SimpleNamespace(value=9)
+        instance.flow_steps = types.SimpleNamespace(value=1)
+        instance.mode = types.SimpleNamespace(value="Single", disabled=False)
         instance.resample_button = types.SimpleNamespace(disabled=False)
         instance.reload_button = types.SimpleNamespace(disabled=False)
         instance.active_checkpoint = Path("valid.pth")
@@ -167,18 +191,126 @@ class CheckpointViewerTests(unittest.TestCase):
         instance.reference_means = None
         instance.flow_cfg = {"flow_steps": 1, "flow_t_eps": 1e-4}
         instance.step = types.SimpleNamespace(value=1)
-        instance.states = [{"means": torch.tensor([[0., 0., 0.], [1., 1., 1.]])}]
+        instance.states = [{"means": torch.tensor([[0., 0., 0.], [1., 1., 1.]])}] * 2
+        instance.single_states = instance.states
+        instance.interpolated_states = None
+        instance.active_mode, instance.active_steps = "Single", 1
         instance.sequence_colors = viewer.sequence_index_colors(2)
         original_colors = instance.sequence_colors
         instance.refresh = lambda _: None
-        new_states = [{"means": torch.tensor([[1., 1., 1.], [0., 0., 0.]])}]
+        new_states = [{"means": torch.tensor([[1., 1., 1.], [0., 0., 0.]])}] * 2
         with patch.object(viewer.threading, "Thread",
                           side_effect=lambda target, daemon: types.SimpleNamespace(start=target)), \
                 patch.object(viewer, "record_sample", return_value=new_states):
             instance.start_sampling(reload_checkpoint=False)
         self.assertIs(instance.sequence_colors, original_colors)
         self.assertIs(instance.states, new_states)
-        self.assertEqual(instance.step.value, 0)
+        self.assertEqual(instance.step.value, 1)
+
+    def test_cached_rates_and_modes_only_change_displayed_states(self):
+        instance = object.__new__(viewer.CheckpointViewer)
+        single = [object()] * 3
+        interpolated = [[object()] * 3 for _ in viewer.INTERPOLATION_RATES]
+        instance.single_states = single
+        instance.interpolated_states = interpolated
+        instance.active_mode = "Single"
+        instance.mode = types.SimpleNamespace(value="Noise interpolation")
+        instance.rate = types.SimpleNamespace(value=0.4)
+        instance.step = types.SimpleNamespace(value=1)
+        instance.set_active_states = Mock()
+        with patch.object(viewer, "record_sample") as sample_single, \
+                patch.object(viewer, "record_interpolated_samples") as sample_blends:
+            instance.change_sample_mode(None)
+            instance.set_active_states.assert_called_with(interpolated[2], 2)
+            instance.rate.value = 0.8
+            instance.change_interpolation_rate(None)
+            instance.set_active_states.assert_called_with(interpolated[4], 1)
+            instance.mode.value = "Single"
+            instance.change_sample_mode(None)
+            instance.set_active_states.assert_called_with(single, 2)
+        sample_single.assert_not_called()
+        sample_blends.assert_not_called()
+
+    def test_flow_step_slider_resizes_for_new_trajectory(self):
+        instance = object.__new__(viewer.CheckpointViewer)
+        old = types.SimpleNamespace(order=2, remove=Mock())
+        instance.step = old
+        instance.active_steps = 4
+        instance.gui = types.SimpleNamespace(add_slider=Mock(return_value=types.SimpleNamespace(value=2, on_update=Mock())))
+        instance.refresh = Mock()
+        states = [object()] * 3
+        instance.set_active_states(states, 2)
+        instance.gui.add_slider.assert_called_once_with("Flow step", 0, 2, 1, 2, order=2)
+        old.remove.assert_called_once()
+        self.assertIs(instance.states, states)
+        self.assertEqual(instance.active_steps, 2)
+
+    def test_failed_interpolation_keeps_previous_sample(self):
+        instance = object.__new__(viewer.CheckpointViewer)
+        instance.lock = threading.RLock()
+        instance.sampling = False
+        instance.seed = types.SimpleNamespace(value=7)
+        instance.seed_b = types.SimpleNamespace(value=8)
+        instance.flow_steps = types.SimpleNamespace(value=2)
+        instance.mode = types.SimpleNamespace(value="Noise interpolation", disabled=False)
+        instance.active_mode = "Single"
+        instance.resample_button = types.SimpleNamespace(disabled=False)
+        instance.reload_button = types.SimpleNamespace(disabled=False)
+        instance.active_checkpoint = Path("valid.pth")
+        instance.model = ConstantVelocity()
+        instance.count, instance.scene_idx = 2, 0
+        instance.standardizer = UnitStandardizer()
+        instance.reference_means = None
+        instance.flow_cfg = {"flow_t_eps": 1e-4}
+        instance.states = [object()]
+        instance.single_states = instance.states
+        instance.interpolated_states = None
+        instance.refresh = lambda _: None
+        previous = instance.states
+        with patch.object(viewer.threading, "Thread",
+                          side_effect=lambda target, daemon: types.SimpleNamespace(start=target)), \
+                patch.object(viewer, "record_interpolated_samples", side_effect=RuntimeError("CUDA unavailable")):
+            instance.start_sampling(reload_checkpoint=False)
+        self.assertIs(instance.states, previous)
+        self.assertIsNone(instance.interpolated_states)
+        self.assertEqual(instance.mode.value, "Single")
+        self.assertTrue(instance.message.startswith("Sampling failed:"))
+
+    def test_checkpoint_reload_regenerates_interpolation_and_single_cache(self):
+        instance = object.__new__(viewer.CheckpointViewer)
+        instance.lock = threading.RLock()
+        instance.sampling = False
+        instance.seed = types.SimpleNamespace(value=11)
+        instance.seed_b = types.SimpleNamespace(value=12)
+        instance.flow_steps = types.SimpleNamespace(value=2)
+        instance.mode = types.SimpleNamespace(value="Noise interpolation", disabled=False)
+        instance.active_mode = "Noise interpolation"
+        instance.rate = types.SimpleNamespace(value=0.4)
+        instance.resample_button = types.SimpleNamespace(disabled=False)
+        instance.reload_button = types.SimpleNamespace(disabled=False)
+        instance.checkpoint_input = types.SimpleNamespace(value="new.pth")
+        instance.active_checkpoint = Path("old.pth")
+        instance.model = ConstantVelocity()
+        instance.args = types.SimpleNamespace(device="cpu")
+        instance.count, instance.scene_idx = 2, 0
+        instance.standardizer = UnitStandardizer()
+        instance.reference_means = None
+        instance.flow_cfg = {"flow_t_eps": 1e-4}
+        instance.single_states = [object()]
+        instance.interpolated_states = [[object()]] * 6
+        instance.set_active_states = Mock()
+        instance.refresh = lambda _: None
+        new_trajectories = [[object()] * 3 for _ in viewer.INTERPOLATION_RATES]
+        with patch.object(viewer.threading, "Thread",
+                          side_effect=lambda target, daemon: types.SimpleNamespace(start=target)), \
+                patch.object(viewer.torch, "load", return_value=instance.model.state_dict()), \
+                patch.object(viewer, "record_interpolated_samples", return_value=new_trajectories) as sample_blends:
+            instance.start_sampling(reload_checkpoint=True)
+        self.assertEqual(instance.active_checkpoint, Path("new.pth"))
+        self.assertIs(instance.interpolated_states, new_trajectories)
+        self.assertIs(instance.single_states, new_trajectories[0])
+        instance.set_active_states.assert_called_once_with(new_trajectories[2], 2)
+        self.assertEqual(sample_blends.call_args.args[4], 2)
 
     def test_gs_color_override_preserves_geometry_and_opacity(self):
         captured = {}
@@ -221,6 +353,10 @@ class CheckpointViewerTests(unittest.TestCase):
         instance.lock = threading.RLock()
         instance.sampling = False
         instance.seed = types.SimpleNamespace(value=7)
+        instance.seed_b = types.SimpleNamespace(value=8)
+        instance.flow_steps = types.SimpleNamespace(value=1)
+        instance.mode = types.SimpleNamespace(value="Single", disabled=False)
+        instance.active_mode = "Single"
         instance.checkpoint_input = types.SimpleNamespace(value="missing.pth")
         instance.resample_button = types.SimpleNamespace(disabled=False)
         instance.reload_button = types.SimpleNamespace(disabled=False)

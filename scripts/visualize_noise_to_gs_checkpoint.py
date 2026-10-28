@@ -9,6 +9,8 @@ Example:
 The checkpoint's run directory must contain config.gin unless --config is set.
 DiT defaults to its configured maximum Gaussian count; other predictors need
 --gs_count. GT-coordinate DiT checkpoints need --scene_name for reference means.
+In Viser, set the two seeds and Flow steps, then select Noise interpolation to
+generate six blends. The interpolation-rate slider switches cached samples.
 """
 
 import argparse
@@ -39,6 +41,7 @@ from utils.gs_normalization import GaussianStandardizer
 
 PREDICTORS = {"ptv3": GSFlowPredictor, "dipt": DiffusionGaussianPredictor,
               "gdpt": DiffusionGaussianPredictor, "dit": GaussianDiTPredictor}
+INTERPOLATION_RATES = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
 
 
 def parse_args(argv=None):
@@ -134,21 +137,42 @@ def load_experiment(args):
 
 
 @torch.no_grad()
-def record_sample(model, count, scene_idx, standardizer, steps, t_eps, seed, reference_means=None):
+def record_sample(model, count, scene_idx, standardizer, steps, t_eps, seed, reference_means=None,
+                  initial_noise=None):
     """Record physical Gaussian states using the same seeded Euler rollout as evaluation."""
     device = next(model.parameters()).device
-    generator = torch.Generator(device=device).manual_seed(int(seed) + int(scene_idx))
-    noise = noise_to_gs.sample_noise(count, standardizer, device, generator)
+    if initial_noise is None:
+        generator = torch.Generator(device=device).manual_seed(int(seed) + int(scene_idx))
+        initial_noise = noise_to_gs.sample_noise(count, standardizer, device, generator)
     states = []
     was_training = model.training
     model.eval()
     try:
-        noise_to_gs.rollout(model, noise, scene_idx, steps, standardizer, t_eps, reference_means,
+        noise_to_gs.rollout(model, initial_noise, scene_idx, steps, standardizer, t_eps, reference_means,
                             on_state=lambda _, state: states.append({key: value.detach().cpu()
                                                                      for key, value in standardizer.decode(state).items()}))
     finally:
         model.train(was_training)
     return states
+
+
+@torch.no_grad()
+def record_interpolated_samples(model, count, scene_idx, standardizer, steps, t_eps, seed_a, seed_b,
+                                reference_means=None, on_progress=None):
+    """Sample six linear blends of two fixed standardized noise tensors."""
+    device = next(model.parameters()).device
+    generator_a = torch.Generator(device=device).manual_seed(int(seed_a) + int(scene_idx))
+    generator_b = torch.Generator(device=device).manual_seed(int(seed_b) + int(scene_idx))
+    noise_a = noise_to_gs.sample_noise(count, standardizer, device, generator_a)
+    noise_b = noise_to_gs.sample_noise(count, standardizer, device, generator_b)
+    trajectories = []
+    for index, rate in enumerate(INTERPOLATION_RATES):
+        blended = {key: (1 - rate) * noise_a[key] + rate * noise_b[key] for key in noise_a}
+        trajectories.append(record_sample(model, count, scene_idx, standardizer, steps, t_eps, seed_a,
+                                          reference_means, initial_noise=blended))
+        if on_progress is not None:
+            on_progress(index + 1, len(INTERPOLATION_RATES))
+    return trajectories
 
 
 def sequence_index_colors(count):
@@ -173,6 +197,9 @@ class CheckpointViewer:
         self.count, self.scene_idx = count, scene_idx
         self.reference_means, self.flow_cfg = reference_means, flow_cfg
         self.active_seed, self.states = seed, states
+        self.single_states, self.interpolated_states = states, None
+        self.active_mode, self.active_steps = "Single", len(states) - 1
+        self.interpolation_seeds = None
         self.active_checkpoint = args.checkpoint
         self.sequence_colors = sequence_index_colors(count)
         self.lock = threading.RLock()
@@ -186,13 +213,17 @@ class CheckpointViewer:
                       "rasterize_mode": "classic", "background": np.zeros(3, dtype=np.float32)}
         self.renderer = GsplatBackgroundRenderer(self.server, states[0], self.state, render_cfg)
         self.point_handle = None
-        gui = self.server.gui
+        gui = self.gui = self.server.gui
         self.status = gui.add_markdown("")
-        self.step = gui.add_slider("Flow step", 0, flow_cfg["flow_steps"], 1, 0)
+        self.step = gui.add_slider("Flow step", 0, self.active_steps, 1, 0)
         gui.add_button("Decrease step").on_click(self.decrease_step)
         gui.add_button("Increase step").on_click(self.increase_step)
+        self.mode = gui.add_dropdown("Sampling mode", ("Single", "Noise interpolation"), initial_value="Single")
         self.seed = gui.add_number("Noise seed", initial_value=seed, step=1)
+        self.seed_b = gui.add_number("Second noise seed (interpolation)", initial_value=seed + 1, step=1)
+        self.flow_steps = gui.add_number("Flow steps", initial_value=self.active_steps, min=1, step=1)
         self.resample_button = gui.add_button("Resample")
+        self.rate = gui.add_slider("Interpolation rate", 0.0, 1.0, 0.2, 0.0, visible=False)
         self.checkpoint_input = gui.add_text("Checkpoint path", initial_value=str(args.checkpoint))
         self.reload_button = gui.add_button("Load checkpoint")
         self.view_mode = gui.add_dropdown("Rendering", ("Point cloud", "GS"),
@@ -204,6 +235,8 @@ class CheckpointViewer:
         self.colorbar_labels = gui.add_markdown(bar_labels)
         self.point_size = gui.add_number("Point size", initial_value=args.point_size, min=1e-6, step=0.001)
         self.step.on_update(self.refresh)
+        self.mode.on_update(self.change_sample_mode)
+        self.rate.on_update(self.change_interpolation_rate)
         self.view_mode.on_update(self.change_view_mode)
         self.color_mode.on_update(self.refresh)
         self.point_size.on_update(self.refresh)
@@ -217,6 +250,7 @@ class CheckpointViewer:
             current = self.states[int(self.step.value)]
             indices = np.arange(self.count)
             sequence = self.color_mode.value == "Sequence index"
+            self.rate.visible = self.active_mode == "Noise interpolation"
             self.colorbar.visible = self.colorbar_labels.visible = sequence
             colors = self.sequence_colors if sequence else _rgb_from_gaussians(current, indices)
             self.renderer.update_scene(current, self.sequence_colors if sequence else None)
@@ -227,12 +261,49 @@ class CheckpointViewer:
                 point_size=float(self.point_size.value), point_shape="circle",
                 visible=self.state["view_mode"] == "pointcloud",
             )
+            if self.active_mode == "Noise interpolation":
+                rate = INTERPOLATION_RATES[round(float(self.rate.value) * 5)]
+                sample_info = f"Seeds **{self.interpolation_seeds[0]} → {self.interpolation_seeds[1]}** · α=**{rate:.1f}**"
+            else:
+                sample_info = f"Seed **{self.active_seed}**"
             self.status.content = (f"**{self.args.scene_name or 'Noise only'}** · {self.count:,} Gaussians · "
                                    f"checkpoint `{self.active_checkpoint}` · config `{self.args.config}`  \n"
-                                   f"Seed **{self.active_seed}** · step **{self.step.value}/{self.flow_cfg['flow_steps']}** "
-                                   f"· {self.message}")
+                                   f"{sample_info} · step **{self.step.value}/{self.active_steps}** · {self.message}")
         if self.state["view_mode"] == "gsplat":
             self.renderer.render_all()
+
+    def set_active_states(self, states, step):
+        steps = len(states) - 1
+        previous_steps = self.active_steps
+        self.states, self.active_steps = states, steps
+        if steps != previous_steps:
+            # Legacy Viser sliders cannot change bounds, so replace the control in place.
+            old = self.step
+            self.step = self.gui.add_slider("Flow step", 0, steps, 1, step, order=old.order)
+            old.remove()
+            self.step.on_update(self.refresh)
+        else:
+            self.step.value = step
+        self.refresh(None)
+
+    def change_sample_mode(self, _event):
+        requested = self.mode.value
+        if requested == self.active_mode:
+            self.refresh(None)
+        elif requested == "Single":
+            self.active_mode = "Single"
+            self.set_active_states(self.single_states, len(self.single_states) - 1)
+        elif self.interpolated_states is not None:
+            self.active_mode = "Noise interpolation"
+            self.set_active_states(self.interpolated_states[round(float(self.rate.value) * 5)],
+                                   len(self.interpolated_states[0]) - 1)
+        else:
+            self.start_sampling(reload_checkpoint=False)
+
+    def change_interpolation_rate(self, _event):
+        if self.active_mode == "Noise interpolation":
+            index = round(float(self.rate.value) * 5)
+            self.set_active_states(self.interpolated_states[index], int(self.step.value))
 
     def change_view_mode(self, _event):
         requested = "gsplat" if self.view_mode.value == "GS" else "pointcloud"
@@ -252,7 +323,7 @@ class CheckpointViewer:
         self.step.value = max(0, int(self.step.value) - 1)
 
     def increase_step(self, _event):
-        self.step.value = min(self.flow_cfg["flow_steps"], int(self.step.value) + 1)
+        self.step.value = min(self.active_steps, int(self.step.value) + 1)
 
     def resample(self, _event):
         self.start_sampling(reload_checkpoint=False)
@@ -264,12 +335,19 @@ class CheckpointViewer:
         with self.lock:
             if self.sampling:
                 return
+            steps = int(self.flow_steps.value)
+            if steps < 1:
+                self.message = "Flow steps must be positive"
+                self.refresh(None)
+                return
             self.sampling = True
-            seed = int(self.seed.value)
+            seed_a, seed_b = int(self.seed.value), int(self.seed_b.value)
+            mode = self.mode.value
             path = Path(self.checkpoint_input.value) if reload_checkpoint else self.active_checkpoint
-            self.message = f"Loading {path}…" if reload_checkpoint else f"Sampling seed {seed}…"
+            self.message = f"Loading {path}…" if reload_checkpoint else f"Sampling {mode.lower()}…"
             self.resample_button.disabled = True
             self.reload_button.disabled = True
+            self.mode.disabled = True
             self.refresh(None)
 
         def worker():
@@ -280,25 +358,46 @@ class CheckpointViewer:
                     model = type(self.model)()
                     model.load_state_dict(torch.load(path, map_location="cpu", weights_only=True), strict=True)
                     model = model.to(self.args.device).eval()
-                states = record_sample(model, self.count, self.scene_idx, self.standardizer,
-                                       self.flow_cfg["flow_steps"], self.flow_cfg["flow_t_eps"], seed,
-                                       self.reference_means)
+                if mode == "Noise interpolation":
+                    def progress(done, total):
+                        with self.lock:
+                            self.status.content = f"Sampling interpolation **{done}/{total}**; previous result remains visible."
+
+                    trajectories = record_interpolated_samples(
+                        model, self.count, self.scene_idx, self.standardizer, steps, self.flow_cfg["flow_t_eps"],
+                        seed_a, seed_b, self.reference_means, on_progress=progress
+                    )
+                    states = trajectories[round(float(self.rate.value) * 5)]
+                else:
+                    states = record_sample(model, self.count, self.scene_idx, self.standardizer,
+                                           steps, self.flow_cfg["flow_t_eps"], seed_a, self.reference_means)
                 with self.lock:
                     self.model, self.active_checkpoint = model, path
-                    self.states, self.active_seed = states, seed
+                    self.active_seed = seed_a
+                    if mode == "Noise interpolation":
+                        self.interpolated_states, self.interpolation_seeds = trajectories, (seed_a, seed_b)
+                        if reload_checkpoint:
+                            self.single_states = trajectories[0]
+                    else:
+                        self.single_states = states
+                        if reload_checkpoint:
+                            self.interpolated_states = None
+                    self.active_mode = mode
                     self.message = "Ready"
-                    self.step.value = 0
-                    self.refresh(None)
+                    self.set_active_states(states, steps)
             except Exception as error:
                 with self.lock:
                     operation = "Checkpoint load" if reload_checkpoint else "Sampling"
                     self.message = f"{operation} failed: {error}"
+                    if self.mode.value != self.active_mode:
+                        self.mode.value = self.active_mode
                     self.refresh(None)
             finally:
                 with self.lock:
                     self.sampling = False
                     self.resample_button.disabled = False
                     self.reload_button.disabled = False
+                    self.mode.disabled = False
 
         threading.Thread(target=worker, daemon=True).start()
 
