@@ -321,10 +321,6 @@ def test_baseline_signature(dataset, indices, options, sources):
             roots.update(resolution_paths[key] for key in ("image_dir", "sparse_dir") if key in resolution_paths)
             if "gsplat_dir" in resolution_paths:
                 roots.add(os.path.join(resolution_paths["gsplat_dir"], "ckpts"))
-        if "target_fit_lr_to_hr" in sources:
-            roots.add(os.path.join(dataset.pretrained_path("fit_lr_to_hr", info["scene_name"], dataset.src_resolution), "ckpts"))
-        if options.get("alignment") == "fit_hr_to_lr":
-            roots.add(os.path.join(dataset.pretrained_path("fit_hr_to_lr", info["scene_name"], dataset.tgt_resolution), "ckpts"))
         for root in sorted(roots):
             path = Path(root)
             artifacts.append((str(path), path.exists()))

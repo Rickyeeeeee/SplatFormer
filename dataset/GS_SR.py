@@ -8,7 +8,6 @@ import torch
 
 from dataset import gs_io
 from dataset.gs_processing import GaussianProcessor
-from utils import gs_utils
 
 
 COORDINATE_FRAME = "input_resolution"
@@ -29,8 +28,6 @@ class SplatFactoSRDataset(torch.utils.data.IterableDataset):
         remove_outlier_ndevs: float,
         max_gs_num: int,
         split_across_gpus: bool,
-        fit_lr_to_hr_root: str,
-        fit_hr_to_lr_root: str,
         background_color: Sequence[int] = (0, 0, 0),
         dataset_name: str = "objaverse",
         src_resolution: int = 128,
@@ -39,14 +36,11 @@ class SplatFactoSRDataset(torch.utils.data.IterableDataset):
         load_tgt_gs: bool = True,
         load_src_images: bool = True,
         load_tgt_images: bool = True,
-        alignment: Optional[str] = None,
     ):
         if train_or_test not in ("train", "test"):
             raise ValueError("train_or_test must be either 'train' or 'test'")
         self.train_or_test = train_or_test
         self.dataset_root = os.fspath(dataset_root)
-        self.fit_lr_to_hr_root = os.fspath(fit_lr_to_hr_root)
-        self.fit_hr_to_lr_root = os.fspath(fit_hr_to_lr_root)
         self.scene_list = os.fspath(
             train_scene_list if train_or_test == "train" else test_scene_list
         )
@@ -62,11 +56,10 @@ class SplatFactoSRDataset(torch.utils.data.IterableDataset):
         self.load_tgt_gs = bool(load_tgt_gs)
         self.load_src_images = bool(load_src_images)
         self.load_tgt_images = bool(load_tgt_images)
-        self.alignment = alignment
         self.coordinate_frame = COORDINATE_FRAME
         self.coordinate_frame_version = COORDINATE_FRAME_VERSION
         if self.src_resolution == self.tgt_resolution and (
-            self.load_src_gs or self.load_src_images or self.alignment is not None
+            self.load_src_gs or self.load_src_images
         ):
             raise ValueError("Equal source and target resolution requires target-only loading")
 
@@ -179,48 +172,8 @@ class SplatFactoSRDataset(torch.utils.data.IterableDataset):
             "imgs_name": image_names,
         }
 
-    def pretrained_path(self, fit_alignment, scene_name, source_resolution):
-        if fit_alignment == "fit_lr_to_hr":
-            root = self.fit_lr_to_hr_root
-        elif fit_alignment == "fit_hr_to_lr":
-            root = self.fit_hr_to_lr_root
-        else:
-            raise ValueError(f"Unsupported pretrained alignment: {fit_alignment}")
-        return gs_io.fitted_paths(root, source_resolution, scene_name)["gsplat_dir"]
-
-    def load_pretrained_fit(
-        self,
-        fit_alignment,
-        scene_name,
-        source_resolution,
-        source_gs_raw,
-        source_gs_mask,
-        target_scaler,
-        coordinate_scaler,
-    ):
-        gsplat_dir = self.pretrained_path(fit_alignment, scene_name, source_resolution)
-        try:
-            target_gs_raw, _ = gs_io.load_gsplat(gsplat_dir)
-        except FileNotFoundError as exc:
-            raise FileNotFoundError(f"Missing preloaded {fit_alignment} GS: {gsplat_dir}") from exc
-        if set(target_gs_raw) != set(source_gs_raw):
-            raise ValueError(f"Preloaded {fit_alignment} attributes do not match source GS: {gsplat_dir}")
-        for key, source_value in source_gs_raw.items():
-            if target_gs_raw[key].shape != source_value.shape:
-                raise ValueError(f"Preloaded {fit_alignment} is not identity-paired for {key}: {gsplat_dir}")
-        target_gs_raw = {key: value[source_gs_mask] for key, value in target_gs_raw.items()}
-        if not self.processor.finite_mask(target_gs_raw).all():
-            raise ValueError(f"Preloaded {fit_alignment} GS contains non-finite values: {gsplat_dir}")
-        target_gs, _ = self.processor.normalize(target_gs_raw, scaler=target_scaler)
-        return gs_utils.convert_gaussian_frame(target_gs, target_scaler, coordinate_scaler)
-
-    def load_scene(self, scene_idx, sample_views=False, fit_alignment=None):
+    def load_scene(self, scene_idx, sample_views=False):
         scene_info = self.folders[scene_idx]
-        valid_fit_alignments = (None, "emd", "random", "fit_lr_to_hr", "fit_hr_to_lr")
-        if fit_alignment not in valid_fit_alignments:
-            raise ValueError(f"Unsupported fit_alignment: {fit_alignment}")
-        if self.src_resolution == self.tgt_resolution and fit_alignment is not None:
-            raise ValueError("Equal source and target resolution does not support GS alignment")
         # 1. Calculate coordinate scaler from source GS
         src_gs_paths = scene_info["resolution_paths"][self.src_resolution]
         src_gs_raw, _ = gs_io.load_gsplat(src_gs_paths["gsplat_dir"])
@@ -232,54 +185,18 @@ class SplatFactoSRDataset(torch.utils.data.IterableDataset):
 
         # 2. Load GS
         normalized_gs = {}
-        resolution_scalers = {self.src_resolution: coordinate_scaler}
-        fitted_gs_pair = None
-        needs_target_gs = self.load_tgt_gs or fit_alignment in (
-            "fit_lr_to_hr", "fit_hr_to_lr"
-        )
         if self.load_src_gs:
             normalized_gs[self.src_resolution] = normalized_src_gs
-        if needs_target_gs:
+        if self.load_tgt_gs:
             tgt_gs_paths = scene_info["resolution_paths"][self.tgt_resolution]
             tgt_gs_raw, _ = gs_io.load_gsplat(tgt_gs_paths["gsplat_dir"])
             tgt_gs_mask = self.processor.selection_mask(tgt_gs_raw)
             selected_tgt_gs = {
                 key: value[tgt_gs_mask] for key, value in tgt_gs_raw.items()
             }
-            _, resolution_scalers[self.tgt_resolution] = self.processor.normalize(
-                selected_tgt_gs
-            )
             normalized_gs[self.tgt_resolution], _ = self.processor.normalize(
                 selected_tgt_gs, scaler=coordinate_scaler
             )
-
-            if fit_alignment in ("fit_lr_to_hr", "fit_hr_to_lr"):
-                if fit_alignment == "fit_lr_to_hr":
-                    fit_source_resolution = self.src_resolution
-                    fit_target_resolution = self.tgt_resolution
-                    fit_source_gs_raw = src_gs_raw
-                    fit_source_gs_mask = src_gs_mask
-                else:
-                    fit_source_resolution = self.tgt_resolution
-                    fit_target_resolution = self.src_resolution
-                    fit_source_gs_raw = tgt_gs_raw
-                    fit_source_gs_mask = tgt_gs_mask
-                fitted_tgt_gs = self.load_pretrained_fit(
-                    fit_alignment,
-                    scene_info["scene_name"],
-                    fit_source_resolution,
-                    fit_source_gs_raw,
-                    fit_source_gs_mask,
-                    resolution_scalers[fit_target_resolution],
-                    coordinate_scaler,
-                )
-                fitted_gs_pair = {
-                    "src_resolution": fit_source_resolution,
-                    "tgt_resolution": fit_target_resolution,
-                    "tgt_gs": fitted_tgt_gs,
-                    "coordinate_frame": self.coordinate_frame,
-                    "coordinate_resolution": self.src_resolution,
-                }
 
         # 3. Build the final resolution payloads
         data = {}
@@ -328,8 +245,6 @@ class SplatFactoSRDataset(torch.utils.data.IterableDataset):
             "coordinate_resolution": self.src_resolution,
             "data": data,
         }
-        if fitted_gs_pair is not None:
-            sample[fit_alignment] = fitted_gs_pair
         return sample
 
     def build_background(self):
@@ -371,6 +286,4 @@ class SplatFactoSRDataset(torch.utils.data.IterableDataset):
             scene_idx = self.remaining_scenes.pop(0)
             if self.train_or_test == "train" and not self.remaining_scenes:
                 self.refresh_remaining_training()
-            yield self.load_scene(
-                scene_idx, sample_views=True, fit_alignment=self.alignment
-            )
+            yield self.load_scene(scene_idx, sample_views=True)

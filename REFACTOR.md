@@ -65,6 +65,14 @@ the retained SR and noise-to-GS paths and any moved shared functionality.
 
 ## Stage 3: Refactor shared dataset and configuration
 
+**Status: implementation complete; validation blocked.** Syntax checks,
+retained launcher Gin-file path checks, and the stale-reference search passed.
+Dataset, noise-to-GS, and augmentation diagnostic tests timed out without output
+in the `srsplatformer` environment; the `gsfm` environment also timed out while
+importing dependencies. Run the focused tests and Gin parsing in a working
+project environment before marking this stage done. The interactive fitted-pair
+augmentation viewer was removed; the separate augmentation diagnostic remains.
+
 Refactor `dataset/GS_SR.py` and `configs/dataset/objaverse-sr.gin` around the
 needs of both retained SR and noise-to-GS. Remove fitted-alignment options only
 after confirming that neither retained workflow uses them. Preserve a clear

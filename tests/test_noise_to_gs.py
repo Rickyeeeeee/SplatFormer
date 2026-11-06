@@ -232,8 +232,7 @@ class NoiseToGaussianTests(unittest.TestCase):
             dataset = SplatFactoSRDataset(
                 train_or_test="test", dataset_root="/tmp/fixture", train_scene_list="fixture.csv",
                 test_scene_list="fixture.csv", image_per_scene=1, remove_outlier_ndevs=-1,
-                max_gs_num=1000, split_across_gpus=False, fit_lr_to_hr_root="/tmp/fixture",
-                fit_hr_to_lr_root="/tmp/fixture", src_resolution=32, tgt_resolution=32,
+                max_gs_num=1000, split_across_gpus=False, src_resolution=32, tgt_resolution=32,
                 load_src_gs=False, load_src_images=False, load_tgt_gs=True, load_tgt_images=True,
             )
         gaussians = {key: torch.zeros((2,) + shape) for key, shape in SHAPES.items()}

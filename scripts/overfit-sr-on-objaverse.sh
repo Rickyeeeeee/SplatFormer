@@ -5,8 +5,6 @@ GPU_ID=${GPU_ID:-5}
 DATASET_ROOT=${DATASET_ROOT:-/project/ricky/splatformer-sr-data-scaled}
 TRAIN_SCENE_LIST=${TRAIN_SCENE_LIST:-${DATASET_ROOT}/psnr_filtered_scenes.csv}
 TEST_SCENE_LIST=${TEST_SCENE_LIST:-${DATASET_ROOT}/test_psnr_filtered_scenes.csv}
-FIT_LR_TO_HR_ROOT=${FIT_LR_TO_HR_ROOT:-${DATASET_ROOT}/test-set-4x-up/objaverse}
-FIT_HR_TO_LR_ROOT=${FIT_HR_TO_LR_ROOT:-${DATASET_ROOT}/test-set-4x-up/objaverse}
 echo "Using GPU: $GPU_ID"
 
 total_steps=${1:-1000}
@@ -41,8 +39,6 @@ CUDA_VISIBLE_DEVICES=$GPU_ID python overfit-sr.py \
     --gin_param="dataset_root='${DATASET_ROOT}'" \
     --gin_param="train_scene_list='${TRAIN_SCENE_LIST}'" \
     --gin_param="test_scene_list='${TEST_SCENE_LIST}'" \
-    --gin_param="test_fit_lr_to_hr_root='${FIT_LR_TO_HR_ROOT}'" \
-    --gin_param="test_fit_hr_to_lr_root='${FIT_HR_TO_LR_ROOT}'" \
     --gin_param="SplatFactoSRDataset.src_resolution=${input_resolution}" \
     --gin_param="SplatFactoSRDataset.tgt_resolution=${target_resolution}" \
     --gin_param="SplatFactoSRDataset.load_src_gs=True" \

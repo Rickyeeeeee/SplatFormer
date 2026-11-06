@@ -21,7 +21,7 @@ class SRSceneDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, scene_idx):
         try:
-            return self.dataset.load_scene(scene_idx, sample_views=True, fit_alignment=self.dataset.alignment)
+            return self.dataset.load_scene(scene_idx, sample_views=True)
         except Exception as error:
             raise RuntimeError(f"Failed to load scene {scene_idx}: {self.dataset.folders[scene_idx]}") from error
 

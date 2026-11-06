@@ -50,17 +50,6 @@ def resolution_paths(split_root, scene_name, resolution):
     }
 
 
-def fitted_paths(fitted_root, source_resolution, scene_name):
-    return {
-        "gsplat_dir": os.path.join(
-            fitted_root,
-            str(source_resolution),
-            "gsplat",
-            scene_name,
-        )
-    }
-
-
 def latest_gsplat_checkpoint(gsplat_dir):
     candidates = []
     pattern = os.path.join(gsplat_dir, "ckpts", "ckpt_*_rank0.pt")
@@ -99,7 +88,6 @@ def scene_problem(scene_info, resolutions):
                 return f"resolution={resolution}:missing_image_dir"
             colmap_model_paths(paths["sparse_dir"])
             latest_gsplat_checkpoint(paths["gsplat_dir"])
-        latest_gsplat_checkpoint(scene_info["fit_lr_to_hr_paths"]["gsplat_dir"])
     except (FileNotFoundError, ValueError) as exc:
         return str(exc)
     return None
