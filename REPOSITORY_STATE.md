@@ -1,5 +1,8 @@
 # SplatFormer: current repository state
 
+> Historical snapshot: this document describes an earlier repository state.
+> Some workflows and files have since been removed; see `REFACTOR.md` for the current plan.
+
 Inspection date: **2026-10-16**. Branch: **`sr-gsdiffusion-dpt`** at **`cf4ce99`** (`Enhance EDiPT and GDPT with global attention mode and sparse convolution support`). This is a source and worktree inventory. It does not claim that a dataset, CUDA training run, or reported model quality was reproduced. The pre-existing local edit to `experiments/edipt.sh` is described below and was not changed for this document.
 
 ## At a glance

@@ -520,8 +520,6 @@ by itself make the representation invariant to rotation or translation.
 | [`gs_normalization.py`](../utils/gs_normalization.py) | Fixed statistics and quaternion endpoint conventions. |
 | [`gs_utils.py`](../utils/gs_utils.py) | Renderer conversion of log scales and opacity logits. |
 | [`interpolants.py`](../sr/interpolants.py) | Paths, reference selection, attribute MSE, Euler integration. |
-| [`overfit-sr-interpolants.py`](../overfit-sr-interpolants.py) | Endpoint preparation, training objectives, model validation. |
-| [`overfit-sr-interpolants.sh`](../scripts/overfit-sr-interpolants.sh) | Predictor selection and environment-to-Gin overrides. |
 
 This explanation is based on source inspection; it does not claim measured
 throughput, trained accuracy, or a GPU execution check.

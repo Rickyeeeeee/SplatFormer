@@ -17,7 +17,6 @@ the 32-to-128 endpoints and compose an experiment configuration:
 
 ```bash
 BACKEND=edipt bash scripts/visualize_augmentations.sh \
-  --config configs/overfit/sr_interpolants_edipt.gin \
   --gin_param 'SplatFactoSRDataset.src_resolution=32' \
   --gin_param 'SplatFactoSRDataset.tgt_resolution=128' \
   --gin_param 'training_augmentation.random_rotate=True' \

@@ -1,9 +1,7 @@
 """CPU coverage of DiPT forward spatial inputs without CUDA backbone dependencies."""
 import ast
 from collections import OrderedDict
-import os
 from pathlib import Path
-import subprocess
 from types import SimpleNamespace
 from typing import List
 import unittest
@@ -96,27 +94,6 @@ class GridCoordinateTests(unittest.TestCase):
         defaults = dict(zip([arg.arg for arg in init.args.args][-len(init.args.defaults):], init.args.defaults))
         self.assertIs(ast.literal_eval(defaults['shift_negative_grid_coords']), False)
 
-    def test_launcher_forwarding_validation_and_unchanged_names(self):
-        command = 'python() { printf "%s\\n" "$@"; }; source "$1"'
-        base = dict(os.environ, PREDICTOR='dipt', PYTHON='python')
-        base.pop('GS_SHIFT_NEGATIVE_GRID_COORDS', None)
-        outputs = []
-        for value in (None, 'False', 'True'):
-            env = dict(base)
-            if value is not None:
-                env['GS_SHIFT_NEGATIVE_GRID_COORDS'] = value
-            result = subprocess.run(['bash', '-c', command, 'test', str(ROOT / 'scripts/overfit-sr-interpolants.sh')],
-                                    env=env, capture_output=True, text=True, check=True)
-            self.assertIn('DiffusionGaussianPredictor.shift_negative_grid_coords=' + (value or 'False'), result.stdout)
-            outputs.append(next(line for line in result.stdout.splitlines() if line.startswith('--output_dir=')))
-        self.assertEqual(len(set(outputs)), 1)
-        for predictor in ('dipt', 'ptv3'):
-            result = subprocess.run(['bash', '-c', command, 'test', str(ROOT / 'scripts/overfit-sr-interpolants.sh')],
-                                    env=dict(base, PREDICTOR=predictor, GS_SHIFT_NEGATIVE_GRID_COORDS='invalid'), capture_output=True, text=True)
-            self.assertEqual(result.returncode, 2 if predictor == 'dipt' else 0)
-            self.assertNotIn('--gin_param=GSFlowPredictor.shift_negative_grid_coords', result.stdout)
-            if predictor == 'ptv3':
-                self.assertNotIn('shift_negative_grid_coords', result.stdout)
 
 
 if __name__ == '__main__':

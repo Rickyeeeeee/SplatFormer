@@ -1,8 +1,6 @@
 """EDiPT geometry, real Pointcept ordering, packing, and gradient checks."""
 import copy
-import os
 from pathlib import Path
-import subprocess
 import unittest
 from unittest import mock
 
@@ -248,14 +246,6 @@ EquivariantGaussianDiPT.frequency_embedding_size = 8
                             for parameter in model.parameters()))
         optimizer.step()
 
-    def test_global_launcher_arguments(self):
-        command = 'python() { printf "%s\\n" "$@"; }; source "$1"'
-        environment = dict(os.environ, EDIPT_ATTENTION_MODE='global', EDIPT_GLOBAL_QUERY_CHUNK_SIZE='128')
-        path = Path(__file__).resolve().parents[1] / 'scripts/overfit-sr-interpolants-edipt.sh'
-        result = subprocess.run(['bash', '-c', command, 'test', str(path)], env=environment,
-                                capture_output=True, text=True, check=True)
-        self.assertIn("--gin_param=EquivariantGaussianDiPT.attention_mode='global'", result.stdout)
-        self.assertIn('--gin_param=EquivariantGaussianDiPT.global_query_chunk_size=128', result.stdout)
 
     @unittest.skipUnless(torch.cuda.is_available(), 'CUDA unavailable')
     def test_global_cuda_autocast_backward(self):

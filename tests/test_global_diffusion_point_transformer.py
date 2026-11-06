@@ -1,9 +1,7 @@
 """Synthetic correctness checks for scene-wide Gaussian attention."""
 
 import copy
-import os
 from pathlib import Path
-import subprocess
 import unittest
 
 import gin
@@ -138,19 +136,6 @@ class GlobalDiffusionPointTransformerTests(unittest.TestCase):
         finally:
             gin.clear_config()
 
-    def test_launcher_selects_gdpt_and_backend(self):
-        command = 'python() { printf "%s\\n" "$@"; }; source "$1"'
-        environment = dict(os.environ, PREDICTOR="gdpt", GDPT_ATTENTION_BACKEND="sdpa",
-                           GDPT_USE_SPARSE_CONV="True", GS_SHIFT_NEGATIVE_GRID_COORDS="True",
-                           quaternion_suffix="")
-        result = subprocess.run(["bash", "-c", command, "test", str(ROOT / "scripts/overfit-sr-interpolants.sh")],
-                                env=environment, capture_output=True, text=True, check=True)
-        self.assertIn("--predictor=gdpt", result.stdout)
-        self.assertIn("--gin_file=configs/model/gdpt_gaussian.gin", result.stdout)
-        self.assertIn("--gin_param=GlobalDiffusionPointTransformer.attention_backend='sdpa'", result.stdout)
-        self.assertIn("--gin_param=GlobalDiffusionPointTransformer.use_sparse_conv=True", result.stdout)
-        self.assertIn("--gin_param=DiffusionGaussianPredictor.shift_negative_grid_coords=True", result.stdout)
-        self.assertIn("_gdpt", next(line for line in result.stdout.splitlines() if line.startswith("--output_dir=")))
 
 
 if __name__ == "__main__":
