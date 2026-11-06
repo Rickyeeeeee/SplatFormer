@@ -13,7 +13,8 @@ from torch import nn
 from dataset.GS_SR import SplatFactoSRDataset
 from models.diffusion_gaussian_predictor import DiffusionGaussianPredictor
 from models.feature_flow_predictor import GSFlowPredictor
-from sr import interpolants, noise_to_gs
+from sr import noise_to_gs
+from utils import noise_to_gs_training
 from utils.gs_normalization import STATISTIC_KEYS
 from utils.spatial_coordinates import morton_order
 
@@ -68,8 +69,8 @@ class NoiseToGaussianTests(unittest.TestCase):
         target = {key: torch.zeros((2,) + shape) for key, shape in SHAPES.items()}
         target["features_rest"] = torch.empty(2, 0, 3)
         prediction = {key: torch.ones_like(value, requires_grad=True) for key, value in target.items()}
-        baseline, raw, unchanged = interpolants.attribute_mse(prediction, target)
-        weighted_total, weighted_raw, weighted = interpolants.attribute_mse(
+        baseline, raw, unchanged = noise_to_gs_training.attribute_mse(prediction, target)
+        weighted_total, weighted_raw, weighted = noise_to_gs_training.attribute_mse(
             prediction, target, {"means": 2.0, "opacities": 0.0})
         self.assertEqual(baseline.item(), 5.0)
         self.assertEqual(weighted_total.item(), 5.0)
@@ -192,7 +193,7 @@ class NoiseToGaussianTests(unittest.TestCase):
         query, velocity = noise_to_gs.construct_path(target, 0.4)
         model = RecordingPredictor("DIT")
         prediction = model([query], [0], None, torch.tensor([0.4]))[0]
-        loss, parts, _ = interpolants.attribute_mse(prediction, velocity)
+        loss, parts, _ = noise_to_gs_training.attribute_mse(prediction, velocity)
         self.assertTrue(torch.isfinite(loss))
         self.assertEqual(parts["features_rest"].item(), 0)
         loss.backward()
@@ -221,7 +222,7 @@ class NoiseToGaussianTests(unittest.TestCase):
                 self.assertNotIn("features_rest", model.input_features)
                 self.assertNotIn("features_rest", model.features_outputhead)
                 self.assertEqual(tuple(result["features_rest"].shape), (2, 0, 3))
-                loss, _, _ = interpolants.attribute_mse(result, scene)
+                loss, _, _ = noise_to_gs_training.attribute_mse(result, scene)
                 self.assertTrue(torch.isfinite(loss))
                 loss.backward()
                 self.assertTrue(torch.isfinite(model.features_outputhead["means"][-1].weight.grad).all())

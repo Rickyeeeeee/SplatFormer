@@ -158,8 +158,8 @@ class RotationTrainingTests(unittest.TestCase):
 
     def test_training_passes_feature_weights_to_loss(self):
         self.flow_cfg["feature_loss_weights"] = {"means": 2.0, "opacities": 0.0}
-        original = SCRIPT.interpolants.attribute_mse
-        with mock.patch.object(SCRIPT.interpolants, "attribute_mse", wraps=original) as loss_mock:
+        original = SCRIPT.noise_to_gs_training.attribute_mse
+        with mock.patch.object(SCRIPT.noise_to_gs_training, "attribute_mse", wraps=original) as loss_mock:
             self.run_training(12, rotate=False)
         self.assertEqual(loss_mock.call_count, self.flags.batch_size)
         for call in loss_mock.call_args_list:

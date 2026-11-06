@@ -43,6 +43,14 @@ paths, plus applicable tests available in the environment.
 
 ## Stage 2: Clean up orphaned internals
 
+**Status: implementation complete; validation blocked.** Syntax checks,
+retained launcher Gin-file path checks, the stale-reference search, and an AST
+comparison confirming the moved loss is unchanged passed. Noise-to-GS,
+visualization, and augmentation tests timed out without output in the existing
+`srsplatformer` environment; importing PyTorch and Gin there also timed out.
+Rerun the focused tests and validate Gin parsing in a working environment before
+marking this stage done.
+
 Recheck references after Stage 1, then remove code used only by the removed
 workflows, potentially including parts of `sr/flow.py`, `sr/alignment.py`,
 `sr/matching.py`, `sr/densification.py`, `sr/edipt_interpolants.py`, the old

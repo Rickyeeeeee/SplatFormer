@@ -436,7 +436,10 @@ The forward method itself returns velocities without adding them to the input.
 The `resume_ckpt` value is stored by this class but not loaded here; the examined
 overfit entry point rejects a non-`None` value.
 
-## 10. Training paths and inference integration
+## 10. Interpolant paths and historical training integration
+
+The LR-to-HR interpolant training entry points described in this section have
+been removed. The augmentation viewer still uses the analytic paths below.
 
 [`sr/interpolants.py`](../sr/interpolants.py) constructs the state and exact
 pathwise target velocity outside the model. Let `X_0` and `X_1` be prepared
@@ -460,7 +463,7 @@ zero at the midpoint. Nonzero-noise square-root paths have singular endpoint
 derivatives, so their training times exclude those endpoints. `one_sided`
 uses standard noise directly; its formula does not multiply noise by `σ`.
 
-The current velocity objective sums six per-attribute mean-squared errors:
+The former velocity objective summed six per-attribute mean-squared errors:
 
 $$
 \mathcal L_{\mathrm{velocity}}=
@@ -469,7 +472,7 @@ $$
 
 Each attribute's mean averages over its own points and components. This is a
 sum of attribute means, not one mean over the concatenated 23-channel vector.
-Alternatively, the entry point can supervise the endpoint of a differentiable
+Alternatively, the former entry point could supervise the endpoint of a differentiable
 rollout and optionally combine it with rendered-image losses. Loss choice does
 not change the network architecture.
 
@@ -519,7 +522,8 @@ by itself make the representation invariant to rotation or translation.
 | [`fourier_features.py`](../utils/fourier_features.py) | Attribute Fourier encoders and encoded widths. |
 | [`gs_normalization.py`](../utils/gs_normalization.py) | Fixed statistics and quaternion endpoint conventions. |
 | [`gs_utils.py`](../utils/gs_utils.py) | Renderer conversion of log scales and opacity logits. |
-| [`interpolants.py`](../sr/interpolants.py) | Paths, reference selection, attribute MSE, Euler integration. |
+| [`interpolants.py`](../sr/interpolants.py) | Paths, reference selection, and Euler integration. |
+| [`noise_to_gs_training.py`](../utils/noise_to_gs_training.py) | Attribute MSE and training utilities. |
 
 This explanation is based on source inspection; it does not claim measured
 throughput, trained accuracy, or a GPU execution check.

@@ -16,9 +16,9 @@ from models.diffusion_gaussian_predictor import DiffusionGaussianPredictor
 from models.feature_flow_predictor import GSFlowPredictor
 from models.feature_predictor import FeaturePredictor  # Registers legacy Gin keys.
 from models.gaussian_dit_predictor import GaussianDiTPredictor
-from sr import interpolants, noise_to_gs
+from sr import noise_to_gs
 from sr.noise_to_gs import flow_matching
-from utils import gpu_utils, gs_utils
+from utils import gpu_utils, gs_utils, noise_to_gs_training
 from utils.data_augmentation import (rotate_gaussians, sample_uniform_rotation_quaternion,
                                      sample_uniform_z_rotation_quaternion, validate_rotation_max_degrees)
 from utils.gpu_utils import seed_everything
@@ -283,7 +283,7 @@ def training(dataset, scene_indices, output_dir, logger, device, total_steps=400
                     model, [query for query, _ in paths], [scene["scene_idx"] for scene in microbatch],
                     torch.stack(times), standardizer, reference_means=reference_means
                 )
-                losses = [interpolants.attribute_mse(prediction, velocity, flow_cfg["feature_loss_weights"])
+                losses = [noise_to_gs_training.attribute_mse(prediction, velocity, flow_cfg["feature_loss_weights"])
                           for prediction, (_, velocity) in zip(predictions, paths)]
                 loss = sum(parts[0] for parts in losses) / FLAGS.batch_size
             if enable_amp:

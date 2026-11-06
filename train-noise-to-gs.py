@@ -23,9 +23,9 @@ from dataset import gs_io
 from dataset.GS_SR import SplatFactoSRDataset
 from dataset.scene_loader import build_train_loader, training_microbatches
 from models.gaussian_dit_predictor import GaussianDiTPredictor
-from sr import interpolants, noise_to_gs
+from sr import noise_to_gs
 from sr.noise_to_gs import flow_matching
-from utils import gpu_utils, gs_utils
+from utils import gpu_utils, gs_utils, noise_to_gs_training
 from utils.data_augmentation import (rotate_gaussians, sample_uniform_rotation_quaternion,
                                      sample_uniform_z_rotation_quaternion, validate_rotation_max_degrees)
 from utils.gpu_utils import seed_everything
@@ -263,7 +263,7 @@ def training():
                     predictions = model(batch_flow_gs=[query for query, _ in paths],
                                         batch_scene_idx=[0] * len(paths), batch_reference_means=None,
                                         t=torch.stack(times))
-                    loss_parts = [interpolants.attribute_mse(prediction, velocity, flow_cfg["feature_loss_weights"])
+                    loss_parts = [noise_to_gs_training.attribute_mse(prediction, velocity, flow_cfg["feature_loss_weights"])
                                   for prediction, (_, velocity) in zip(predictions, paths)]
                     summed = sum(parts[0] for parts in loss_parts)
                     loss = summed / FLAGS.batch_size

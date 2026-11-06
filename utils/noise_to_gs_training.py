@@ -12,6 +12,16 @@ from utils.gs_normalization import STATISTIC_KEYS
 PAD_OPACITY_LOGIT = -15.0
 
 
+def attribute_mse(prediction, target, feature_loss_weights=None):
+    losses = {}
+    for key in STATISTIC_KEYS:
+        delta = prediction[key].float() - target[key].float()
+        losses[key] = delta.square().mean() if delta.numel() else delta.sum()
+    weights = feature_loss_weights or {}
+    weighted_losses = {key: value * weights.get(key, 1.0) for key, value in losses.items()}
+    return sum(weighted_losses.values()), losses, weighted_losses
+
+
 def mean_feature_losses(feature_loss_sum, scene_count, weights):
     """Summarize feature sums after microbatch and distributed reduction."""
     raw = dict(zip(STATISTIC_KEYS, (feature_loss_sum / scene_count).tolist()))
