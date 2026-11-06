@@ -87,6 +87,14 @@ and noise-to-GS, and run focused dataset and training tests.
 
 ## Stage 4: Review optional backbones and diagnostics
 
+**Status: implementation complete; validation blocked.** Syntax, retained
+launcher paths, DiT overrides, and unsupported-predictor rejection checks passed.
+Noise-to-GS, checkpoint viewer, DiT model, and SR dataset tests timed out without
+output in the `srsplatformer` environment. Run these tests and validate Gin
+parsing in a working project environment before marking this stage done. The
+overfit and checkpoint interfaces now accept DiT only; other model files,
+configs, standalone tests, and remaining diagnostics are retained.
+
 Review optional noise-to-GS backbones and shared diagnostics separately from
 the removal of obsolete SR workflows. The main noise-to-GS trainer uses Gaussian
 DiT, while overfitting and checkpoint visualization also support PTV3, DiPT,

@@ -289,30 +289,23 @@ class NoiseToGaussianTests(unittest.TestCase):
         torch.testing.assert_close(gdpt.backbone.last["coord"], means)
         self.assertTrue((gdpt.backbone.last["grid_coord"] >= 0).all())
 
-    def test_launcher_selects_all_common_flow_models(self):
+    def test_launcher_accepts_dit_and_rejects_other_predictors(self):
         command = 'python() { printf "%s\\n" "$@"; }; source "$1"'
-        for predictor in ("ptv3", "dipt", "gdpt", "dit"):
-            environment = dict(os.environ, PREDICTOR=predictor, DATASET_ROOT="/tmp/noise-to-gs-test",
-                               SOURCE_GS_ROOT="/tmp/mcmc-500", TARGET_GS_ROOT="/tmp/mcmc-1000", GS_SH_DEGREE="0")
-            result = subprocess.run(
-                ["bash", "-c", command, "test", str(ROOT / "scripts/overfit-noise-to-gs.sh")],
-                env=environment, capture_output=True, text=True, check=True,
-            )
-            self.assertIn(f"--predictor={predictor}", result.stdout)
-            self.assertIn(f"--gin_file=configs/model/{'ptv3_flow' if predictor == 'ptv3' else predictor + '_gaussian'}.gin",
-                          result.stdout)
-            self.assertIn("--gin_param=SplatFactoSRDataset.max_gs_num=1000", result.stdout)
-            self.assertIn("--gin_param=SplatFactoSRDataset.load_src_gs=False", result.stdout)
-            self.assertIn("--source_gs_root=/tmp/mcmc-500", result.stdout)
-            self.assertIn("--target_gs_root=/tmp/mcmc-1000", result.stdout)
-            predictor_class = "GaussianDiTPredictor" if predictor == "dit" else (
-                "GSFlowPredictor" if predictor == "ptv3" else "DiffusionGaussianPredictor"
-            )
-            self.assertIn(f"--gin_param={predictor_class}.sh_degree=0", result.stdout)
-            if predictor == "ptv3":
-                self.assertIn("--gin_param=GSFlowPredictor.shift_negative_grid_coords=True", result.stdout)
-            elif predictor in ("dipt", "gdpt"):
-                self.assertIn("--gin_param=DiffusionGaussianPredictor.shift_negative_grid_coords=True", result.stdout)
+        environment = dict(os.environ, PREDICTOR="dit", DATASET_ROOT="/tmp/noise-to-gs-test",
+                           SOURCE_GS_ROOT="/tmp/mcmc-500", TARGET_GS_ROOT="/tmp/mcmc-1000", GS_SH_DEGREE="0")
+        result = subprocess.run(["bash", "-c", command, "test", str(ROOT / "scripts/overfit-noise-to-gs.sh")],
+                                env=environment, capture_output=True, text=True, check=True)
+        for argument in ("--predictor=dit", "--gin_file=configs/model/dit_gaussian.gin",
+                         "--gin_param=SplatFactoSRDataset.max_gs_num=1000",
+                         "--gin_param=SplatFactoSRDataset.load_src_gs=False",
+                         "--source_gs_root=/tmp/mcmc-500", "--target_gs_root=/tmp/mcmc-1000",
+                         "--gin_param=GaussianDiTPredictor.sh_degree=0"):
+            self.assertIn(argument, result.stdout)
+        for predictor in ("ptv3", "dipt", "gdpt"):
+            result = subprocess.run(["bash", "-c", command, "test", str(ROOT / "scripts/overfit-noise-to-gs.sh")],
+                                    env=dict(environment, PREDICTOR=predictor), capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("expected dit", result.stderr)
 
         environment = dict(os.environ, PREDICTOR="dit", DATASET_ROOT="/tmp/noise-to-gs-test",
                            GS_COORDINATE_MODE="gt")

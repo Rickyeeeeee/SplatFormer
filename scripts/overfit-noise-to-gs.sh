@@ -35,41 +35,19 @@ EVAL_ROTATION_SEED=${EVAL_ROTATION_SEED:-0}
 LR_WARMUP_STEPS=${LR_WARMUP_STEPS:-0}
 LR_WARMUP_START_FACTOR=${LR_WARMUP_START_FACTOR:-0.03333333333333333}
 
-case "${PREDICTOR}" in
-    ptv3)
-        predictor_class=GSFlowPredictor
-        backbone_class=PointTransformerV3FlowModel
-        model_gin_file=configs/model/ptv3_flow.gin
-        ;;
-    dipt)
-        predictor_class=DiffusionGaussianPredictor
-        backbone_class=DiffusionGaussianTransformer
-        model_gin_file=configs/model/dipt_gaussian.gin
-        ;;
-    gdpt)
-        predictor_class=DiffusionGaussianPredictor
-        backbone_class=GlobalDiffusionPointTransformer
-        model_gin_file=configs/model/gdpt_gaussian.gin
-        ;;
-    dit)
-        predictor_class=GaussianDiTPredictor
-        backbone_class=GaussianDiT
-        model_gin_file=configs/model/dit_gaussian.gin
-        ;;
-    *)
-        echo "Unsupported PREDICTOR: ${PREDICTOR}; expected ptv3, dipt, gdpt, or dit" >&2
-        exit 2
-        ;;
-esac
+if [[ "${PREDICTOR}" != "dit" ]]; then
+    echo "Unsupported PREDICTOR: ${PREDICTOR}; expected dit" >&2
+    exit 2
+fi
+predictor_class=GaussianDiTPredictor
+backbone_class=GaussianDiT
+model_gin_file=configs/model/dit_gaussian.gin
 
 scene_label=${SCENE_NAME}
 if [[ "${SCENE_MODE}" == "many" ]]; then
     scene_label=many_${SCENE_COUNT}
 fi
-coordinate_label=
-if [[ "${PREDICTOR}" == "dit" ]]; then
-    coordinate_label=_${GS_COORDINATE_MODE}
-fi
+coordinate_label=_${GS_COORDINATE_MODE}
 case "${RANDOM_ROTATE}" in
     true|True) RANDOM_ROTATE=True ;;
     false|False) RANDOM_ROTATE=False ;;
@@ -96,25 +74,9 @@ if [[ -n "${GS_FEATURE_LOSS_WEIGHTS:-}" ]]; then
 fi
 for network in "${backbone_class}" "${predictor_class}"; do
     case "${network}" in
-        PointTransformerV3FlowModel)
-            prefix=PTV3
-            parameters=(enc_dim output_dim enc_channels dec_channels enc_depths dec_depths enc_num_head dec_num_head stride enable_flash drop_path)
-            ;;
-        DiffusionGaussianTransformer)
-            prefix=DIPT
-            parameters=(depth channels num_head patch_size order mlp_ratio frequency_embedding_size enable_flash partition_mode)
-            ;;
-        GlobalDiffusionPointTransformer)
-            prefix=GDPT
-            parameters=(depth channels num_head mlp_ratio frequency_embedding_size attention_backend use_sparse_conv)
-            ;;
         GaussianDiT)
             prefix=DIT
             parameters=(depth channels num_heads patch_size mlp_ratio frequency_embedding_size)
-            ;;
-        GSFlowPredictor|DiffusionGaussianPredictor)
-            prefix=GS
-            parameters=(sh_degree output_head_nlayer output_head_width input_feat_to_mlp zeroinit fourier_input_features fourier_num_frequencies)
             ;;
         GaussianDiTPredictor)
             prefix=GS
@@ -126,20 +88,14 @@ for network in "${backbone_class}" "${predictor_class}"; do
         value=${!env_name:-}
         if [[ -n "${value}" ]]; then
             case "${parameter}" in
-                attention_backend|partition_mode|coordinate_mode) value="'${value}'" ;;
+                coordinate_mode) value="'${value}'" ;;
             esac
             network_gin_args+=("--gin_param=${network}.${parameter}=${value}")
         fi
     done
 done
 
-if [[ "${PREDICTOR}" == "ptv3" ]]; then
-    network_gin_args+=("--gin_param=GSFlowPredictor.shift_negative_grid_coords=True")
-elif [[ "${PREDICTOR}" == "dipt" || "${PREDICTOR}" == "gdpt" ]]; then
-    network_gin_args+=("--gin_param=DiffusionGaussianPredictor.shift_negative_grid_coords=True")
-elif [[ "${PREDICTOR}" == "dit" ]]; then
-    network_gin_args+=("--gin_param=GaussianDiTPredictor.max_gaussians=${GS_COUNT}")
-fi
+network_gin_args+=("--gin_param=GaussianDiTPredictor.max_gaussians=${GS_COUNT}")
 
 CUDA_VISIBLE_DEVICES="${GPU_ID}" python overfit-noise-to-gs.py \
     --output_dir="${OUTPUT_DIR}" \

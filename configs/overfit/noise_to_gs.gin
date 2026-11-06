@@ -14,17 +14,6 @@ flow_matching.flow_t_eps = 1e-4
 flow_matching.eval_noise_seed = 0
 flow_matching.normalization_variance_floor = 1e-8
 
-GSFlowPredictor.quat_residual_mode = 'add'
-GSFlowPredictor.res_feature_activation = {
-    'means': @Identity(), 'features_dc': @Identity(), 'features_rest': @Identity(),
-    'scales': @Identity(), 'opacities': @Identity(), 'quats': @Identity(),
-}
-DiffusionGaussianPredictor.quat_residual_mode = 'add'
-DiffusionGaussianPredictor.res_feature_activation = {
-    'means': @Identity(), 'features_dc': @Identity(), 'features_rest': @Identity(),
-    'scales': @Identity(), 'opacities': @Identity(), 'quats': @Identity(),
-}
-
 train2D/build_optimizer.lr_dict = {
     'base': 3e-4, 'embedding': 3e-4, 'backbone': 3e-4,
     'features_dc': 3e-4, 'features_rest': 1.5e-6,

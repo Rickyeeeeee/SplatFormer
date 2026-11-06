@@ -48,6 +48,13 @@ class ConstantVelocity(torch.nn.Module):
 
 
 class CheckpointViewerTests(unittest.TestCase):
+    def test_predictor_argument_accepts_only_dit(self):
+        args = viewer.parse_args(["--checkpoint", "run/checkpoints/model.pth", "--predictor", "dit"])
+        self.assertEqual(args.predictor, "dit")
+        for predictor in ("ptv3", "dipt", "gdpt"):
+            with self.subTest(predictor=predictor), self.assertRaises(SystemExit):
+                viewer.parse_args(["--checkpoint", "run/checkpoints/model.pth", "--predictor", predictor])
+
     def test_noise_only_uses_model_count_without_loading_dataset(self):
         args = viewer.parse_args(["--checkpoint", "run/checkpoints/model.pth"])
         model = types.SimpleNamespace(backbone_type="DIT", coordinate_mode="current",
@@ -58,7 +65,7 @@ class CheckpointViewerTests(unittest.TestCase):
         flow_cfg = {"gs_statistics_path": "stats.json", "flow_steps": 3,
                     "flow_t_eps": 1e-4, "eval_noise_seed": 9,
                     "normalization_variance_floor": 1e-8, "coupling": "random"}
-        with patch.dict(viewer.PREDICTORS, {"dit": lambda: model}), \
+        with patch.object(viewer, "GaussianDiTPredictor", return_value=model), \
                 patch.object(viewer.gin, "parse_config_files_and_bindings"), \
                 patch.object(viewer, "flow_matching", return_value=flow_cfg), \
                 patch.object(viewer, "GaussianStandardizer"), \

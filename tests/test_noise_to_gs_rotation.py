@@ -118,7 +118,7 @@ class RotationTrainingTests(unittest.TestCase):
                         "rotation_max_degrees": None, "rotation_pivot": (0.5, 0.5, 0.5)}
         with tempfile.TemporaryDirectory() as output_dir, \
              mock.patch.object(SCRIPT, "FLAGS", self.flags), \
-             mock.patch.dict(SCRIPT.PREDICTORS, {"dit": build_model}), \
+             mock.patch.object(SCRIPT, "GaussianDiTPredictor", side_effect=build_model), \
              mock.patch.object(SCRIPT, "GaussianStandardizer", FakeStandardizer), \
              mock.patch.object(SCRIPT, "flow_matching", return_value=self.flow_cfg), \
              mock.patch.object(SCRIPT, "training_augmentation", return_value=augmentation), \

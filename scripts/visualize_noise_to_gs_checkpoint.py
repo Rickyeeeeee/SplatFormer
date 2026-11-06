@@ -7,8 +7,8 @@ Example:
     --predictor dit
 
 The checkpoint's run directory must contain config.gin unless --config is set.
-DiT defaults to its configured maximum Gaussian count; other predictors need
---gs_count. GT-coordinate DiT checkpoints need --scene_name for reference means.
+DiT defaults to its configured maximum Gaussian count. GT-coordinate DiT
+checkpoints need --scene_name for reference means.
 In Viser, set the two seeds and Flow steps, then select Noise interpolation to
 generate six blends. The interpolation-rate slider switches cached samples.
 """
@@ -29,9 +29,6 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from dataset.GS_SR import SplatFactoSRDataset
-from models.diffusion_gaussian_predictor import DiffusionGaussianPredictor
-from models.feature_flow_predictor import GSFlowPredictor
-from models.feature_predictor import FeaturePredictor  # Registers legacy Gin keys.
 from models.gaussian_dit_predictor import GaussianDiTPredictor
 from sr import noise_to_gs
 from sr.noise_to_gs import flow_matching
@@ -39,8 +36,6 @@ from utils.gaussian_viewer import GsplatBackgroundRenderer, _rgb_from_gaussians,
 from utils.gs_normalization import GaussianStandardizer
 
 
-PREDICTORS = {"ptv3": GSFlowPredictor, "dipt": DiffusionGaussianPredictor,
-              "gdpt": DiffusionGaussianPredictor, "dit": GaussianDiTPredictor}
 INTERPOLATION_RATES = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
 
 
@@ -48,7 +43,7 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--config", type=Path, help="Saved config.gin; defaults to the checkpoint's run directory.")
-    parser.add_argument("--predictor", choices=tuple(PREDICTORS), default="dit")
+    parser.add_argument("--predictor", choices=("dit",), default="dit")
     parser.add_argument("--scene_name", help="Reference scene for GT-coordinate DiT or paired evaluation sampling.")
     parser.add_argument("--gs_count", type=int, help="Number of Gaussians to generate; defaults to DiT max_gaussians.")
     parser.add_argument("--split", choices=("train", "test"), default="test")
@@ -94,10 +89,8 @@ def load_experiment(args):
     gin.parse_config_files_and_bindings([str(args.config)], bindings, skip_unknown=True)
     flow_cfg = flow_matching()
     statistics_path = args.statistics_path or Path(flow_cfg["gs_statistics_path"])
-    model = PREDICTORS[args.predictor]().to(args.device)
+    model = GaussianDiTPredictor().to(args.device)
     noise_to_gs.validate_coupling(model, flow_cfg["coupling"])
-    if args.predictor in ("dipt", "gdpt") and model.backbone_type.lower() != args.predictor:
-        raise ValueError(f"Predictor {args.predictor} requires its matching backbone Gin config")
     if model.backbone_type == "DIT" and model.coordinate_mode == "gt" and not args.scene_name:
         raise ValueError("GT-coordinate DiT needs --scene_name to supply reference means")
     state_dict = torch.load(args.checkpoint, map_location="cpu", weights_only=True)

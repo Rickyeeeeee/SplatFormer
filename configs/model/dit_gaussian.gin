@@ -1,4 +1,4 @@
-# Standalone classic DiT Gaussian velocity predictor; no trainer wiring.
+# Classic DiT Gaussian velocity predictor for noise-to-GS training.
 GaussianDiTPredictor.sh_degree = 0
 GaussianDiTPredictor.max_gaussians = 1000
 # Use 'morton_rank' with targets sorted by Morton order for fixed index embeddings.

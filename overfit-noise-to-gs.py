@@ -12,9 +12,6 @@ from absl import app, flags
 from tqdm import tqdm
 
 from dataset.GS_SR import SplatFactoSRDataset
-from models.diffusion_gaussian_predictor import DiffusionGaussianPredictor
-from models.feature_flow_predictor import GSFlowPredictor
-from models.feature_predictor import FeaturePredictor  # Registers legacy Gin keys.
 from models.gaussian_dit_predictor import GaussianDiTPredictor
 from sr import noise_to_gs
 from sr.noise_to_gs import flow_matching
@@ -35,7 +32,7 @@ flags.DEFINE_string("eval_subdir", "eval_final", "Final evaluation subdirectory"
 flags.DEFINE_string("scene_name", "", "Scene name for one-scene overfitting")
 flags.DEFINE_string("source_gs_root", "", "Optional root for source GS checkpoints")
 flags.DEFINE_string("target_gs_root", "", "Optional root for target GS checkpoints")
-flags.DEFINE_enum("predictor", "dit", ["ptv3", "dipt", "gdpt", "dit"], "Gaussian velocity predictor")
+flags.DEFINE_enum("predictor", "dit", ["dit"], "Gaussian velocity predictor")
 flags.DEFINE_enum("scene_mode", "one", ["one", "many"], "Overfit one or several scenes")
 flags.DEFINE_integer("scene_count", 1, "Number of scenes in many mode")
 flags.DEFINE_integer("batch_size", 1, "Scene samples per optimizer update")
@@ -50,12 +47,6 @@ flags.register_multi_flags_validator(
 )
 
 FLAGS = flags.FLAGS
-PREDICTORS = {
-    "ptv3": GSFlowPredictor,
-    "dipt": DiffusionGaussianPredictor,
-    "gdpt": DiffusionGaussianPredictor,
-    "dit": GaussianDiTPredictor,
-}
 
 
 @gin.configurable
@@ -152,23 +143,15 @@ def training(dataset, scene_indices, output_dir, logger, device, total_steps=400
         # PLY snapshots need target Gaussians but never load target images or cameras.
         dataset.load_tgt_images = False
 
-    model_class = PREDICTORS[FLAGS.predictor]
-    model = model_class().to(device)
+    model = GaussianDiTPredictor().to(device)
     noise_to_gs.validate_coupling(model, flow_cfg["coupling"])
     if augmentation_cfg["random_rotate"] and model.sh_degree > 1:
         raise ValueError("Random rotation supports Gaussian SH degree 0 or 1")
-    if FLAGS.predictor in ("dipt", "gdpt") and model.backbone_type.lower() != FLAGS.predictor:
-        raise ValueError(f"Predictor {FLAGS.predictor} requires its matching backbone Gin config")
     required_outputs = set(SUPPORTED_GS_KEYS) - ({"features_rest"} if model.sh_degree == 0 else set())
     if required_outputs - set(model.output_features):
         raise ValueError("Noise-to-GS requires velocities for all active Gaussian attributes")
-    if FLAGS.predictor != "dit":
-        if model.quat_residual_mode != "add" or any(
-            not isinstance(model.res_feature_activation[key], torch.nn.Identity) for key in required_outputs
-        ):
-            raise ValueError("Noise-to-GS requires additive quaternion velocity and identity output activations")
-    gt_conditioned = FLAGS.predictor == "dit" and model.coordinate_mode == "gt"
-    logger.info(f"Predictor={FLAGS.predictor} class={model_class.__name__} sh_degree={model.sh_degree} "
+    gt_conditioned = model.coordinate_mode == "gt"
+    logger.info(f"Predictor=dit class={type(model).__name__} sh_degree={model.sh_degree} "
                 f"gt_conditioned={gt_conditioned} random_rotate={augmentation_cfg['random_rotate']} "
                 f"rotation_mode={augmentation_cfg['rotation_mode']}")
     standardizer = GaussianStandardizer(
@@ -187,7 +170,7 @@ def training(dataset, scene_indices, output_dir, logger, device, total_steps=400
         if not ply_only and not target["images"]:
             raise ValueError(f"Scene {raw['scene_name']} needs target views for paired evaluation")
         target_flow_gs = standardizer.encode(target_gs)
-        if FLAGS.predictor == "dit" and model.coordinate_mode == "morton_rank":
+        if model.coordinate_mode == "morton_rank":
             order = morton_order(target_gs["means"])
             # Keep every standardized target attribute aligned with its Morton slot.
             target_flow_gs = {key: value[order] for key, value in target_flow_gs.items()}
@@ -267,7 +250,7 @@ def training(dataset, scene_indices, output_dir, logger, device, total_steps=400
                                                 max_degrees=augmentation_cfg["rotation_max_degrees"])
                     rotated_gs = rotate_gaussians(target_gs, rotation, augmentation_cfg["rotation_pivot"])
                     target = standardizer.encode(rotated_gs)
-                    if FLAGS.predictor == "dit" and model.coordinate_mode == "morton_rank":
+                    if model.coordinate_mode == "morton_rank":
                         order = morton_order(rotated_gs["means"])
                         target = {key: value[order] for key, value in target.items()}
                 else:
