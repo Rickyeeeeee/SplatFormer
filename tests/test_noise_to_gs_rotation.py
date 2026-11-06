@@ -85,7 +85,8 @@ class RotationTrainingTests(unittest.TestCase):
         self.dataset = FakeDataset()
         self.original = {key: value.clone() for key, value in self.dataset.gaussians.items()}
         self.flow_cfg = {"gs_statistics_path": "unused", "normalization_variance_floor": 1e-8,
-                         "flow_t_eps": 1e-4, "flow_steps": 1, "eval_noise_seed": 0, "coupling": "random"}
+                         "flow_t_eps": 1e-4, "flow_steps": 1, "eval_noise_seed": 0, "coupling": "random",
+                         "feature_loss_weights": {}}
         self.flags = SimpleNamespace(predictor="dit", scene_mode="one", eval_max_views=1,
                                      batch_size=2, grad_accum_steps=1, eval_subdir="eval_final")
 
@@ -154,6 +155,15 @@ class RotationTrainingTests(unittest.TestCase):
         for first, second in zip(targets, repeated):
             torch.testing.assert_close(first["means"], second["means"])
         self.assertFalse(torch.equal(targets[0]["means"], different[0]["means"]))
+
+    def test_training_passes_feature_weights_to_loss(self):
+        self.flow_cfg["feature_loss_weights"] = {"means": 2.0, "opacities": 0.0}
+        original = SCRIPT.interpolants.attribute_mse
+        with mock.patch.object(SCRIPT.interpolants, "attribute_mse", wraps=original) as loss_mock:
+            self.run_training(12, rotate=False)
+        self.assertEqual(loss_mock.call_count, self.flags.batch_size)
+        for call in loss_mock.call_args_list:
+            self.assertEqual(call.args[2], self.flow_cfg["feature_loss_weights"])
 
     def test_gt_mode_uses_rotated_reference_and_disabled_mode_keeps_format(self):
         targets, _, model, report, _, _, loaded_images = self.run_training(4, coordinate_mode="gt")

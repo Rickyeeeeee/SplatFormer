@@ -10,11 +10,22 @@ import torch
 
 from models.gaussian_dit_predictor import GaussianDiTPredictor
 from utils.noise_to_gs_training import (PAD_OPACITY_LOGIT, evenly_spaced_camera_indices,
-                                        evaluation_seed, prepare_fixed_count_target, select_available_scenes)
+                                        evaluation_seed, mean_feature_losses, prepare_fixed_count_target,
+                                        select_available_scenes)
 from utils.spatial_coordinates import morton_order
+from utils.gs_normalization import STATISTIC_KEYS
 
 
 class NoiseToGSTrainingTests(unittest.TestCase):
+    def test_feature_loss_sums_preserve_microbatch_and_rank_averages(self):
+        # Two ranks each process two unequal microbatches, three scenes per rank.
+        scenes = torch.arange(1., 37.).reshape(6, len(STATISTIC_KEYS))
+        rank_sums = [scenes[:1].sum(0) + scenes[1:3].sum(0), scenes[3:5].sum(0) + scenes[5:].sum(0)]
+        raw, weighted = mean_feature_losses(sum(rank_sums), 6, {"means": 2.0, "opacities": 0.0})
+        for key, expected in zip(STATISTIC_KEYS, scenes.mean(0)):
+            self.assertAlmostEqual(raw[key], expected.item())
+            self.assertAlmostEqual(weighted[key], expected.item() * {"means": 2.0, "opacities": 0.0}.get(key, 1.0))
+
     def test_morton_dit_forward_needs_no_scene_or_target_coordinates(self):
         class RecordingBackbone(torch.nn.Module):
             def forward(self, data):
@@ -43,6 +54,28 @@ class NoiseToGSTrainingTests(unittest.TestCase):
             self.assertEqual(skipped, ["missing"])
             self.assertEqual(len(dataset.folders), 1)
             self.assertEqual(dataset.folders[0]["resolution_paths"][32]["gsplat_dir"], str(root / "available"))
+
+    def test_scene_limit_selects_first_listed_scenes_and_requires_exact_count(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in ("first", "second", "third"):
+                path = root / name / "ckpts"
+                path.mkdir(parents=True)
+                (path / "ckpt_9_rank0.pt").touch()
+            entries = [{"scene_name": name, "resolution_paths": {32: {}}} for name in ("first", "second", "third")]
+            selected = SimpleNamespace(folders=list(entries), tgt_resolution=32)
+            self.assertEqual(select_available_scenes(selected, root, 2), [])
+            self.assertEqual([entry["scene_name"] for entry in selected.folders], ["first", "second"])
+            selected = SimpleNamespace(folders=list(entries), tgt_resolution=32)
+            select_available_scenes(selected, root, -1)
+            self.assertEqual(len(selected.folders), 3)
+            for count in (0, -2, 4):
+                with self.subTest(count=count), self.assertRaisesRegex(ValueError, "scene_count"):
+                    select_available_scenes(SimpleNamespace(folders=list(entries), tgt_resolution=32), root, count)
+            for names in (["first", "missing", "third"], ["first", "first", "third"]):
+                with self.subTest(names=names), self.assertRaisesRegex(ValueError, "First 2 listed scenes"):
+                    folders = [{"scene_name": name, "resolution_paths": {32: {}}} for name in names]
+                    select_available_scenes(SimpleNamespace(folders=folders, tgt_resolution=32), root, 2)
 
     def test_padding_is_finite_invisible_and_morton_ordered(self):
         gaussians = {

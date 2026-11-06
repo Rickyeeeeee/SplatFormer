@@ -1,5 +1,8 @@
 """Gaussian flow matching with optional GT-coordinate conditioning."""
 
+import math
+import numbers
+
 import gin
 import torch
 
@@ -9,14 +12,21 @@ from utils.spatial_coordinates import morton_order
 
 @gin.configurable
 def flow_matching(gs_statistics_path, flow_steps=10, flow_t_eps=1e-4, eval_noise_seed=0,
-                  normalization_variance_floor=1e-8, coupling="random"):
+                  normalization_variance_floor=1e-8, coupling="random", feature_loss_weights=None):
     if flow_steps < 1 or not 0 < flow_t_eps < 0.5:
         raise ValueError("Expected positive flow_steps and 0 < flow_t_eps < 0.5")
     if coupling not in ("random", "morton"):
         raise ValueError("coupling must be 'random' or 'morton'")
+    weights = {} if feature_loss_weights is None else dict(feature_loss_weights)
+    if set(weights) - set(STATISTIC_KEYS):
+        raise ValueError(f"Unknown feature loss weights: {sorted(set(weights) - set(STATISTIC_KEYS))}")
+    if any(isinstance(value, bool) or not isinstance(value, numbers.Real) or not math.isfinite(value) or value < 0
+           for value in weights.values()):
+        raise ValueError("Feature loss weights must be finite nonnegative numbers")
     return {"gs_statistics_path": gs_statistics_path, "flow_steps": flow_steps,
             "flow_t_eps": flow_t_eps, "eval_noise_seed": eval_noise_seed,
-            "normalization_variance_floor": normalization_variance_floor, "coupling": coupling}
+            "normalization_variance_floor": normalization_variance_floor, "coupling": coupling,
+            "feature_loss_weights": weights}
 
 
 def validate_coupling(model, coupling):

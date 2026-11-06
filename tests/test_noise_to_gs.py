@@ -64,6 +64,62 @@ class NoiseToGaussianTests(unittest.TestCase):
     def setUp(self):
         self.standardizer = UnitStandardizer()
 
+    def test_feature_loss_weights_and_empty_sh(self):
+        target = {key: torch.zeros((2,) + shape) for key, shape in SHAPES.items()}
+        target["features_rest"] = torch.empty(2, 0, 3)
+        prediction = {key: torch.ones_like(value, requires_grad=True) for key, value in target.items()}
+        baseline, raw, unchanged = interpolants.attribute_mse(prediction, target)
+        weighted_total, weighted_raw, weighted = interpolants.attribute_mse(
+            prediction, target, {"means": 2.0, "opacities": 0.0})
+        self.assertEqual(baseline.item(), 5.0)
+        self.assertEqual(weighted_total.item(), 5.0)
+        self.assertEqual(raw["features_rest"].item(), 0.0)
+        self.assertEqual(weighted["means"].item(), 2.0)
+        self.assertEqual(weighted["opacities"].item(), 0.0)
+        for key in STATISTIC_KEYS:
+            torch.testing.assert_close(raw[key], unchanged[key])
+            torch.testing.assert_close(raw[key], weighted_raw[key])
+        weighted_total.backward()
+        self.assertTrue((prediction["means"].grad != 0).all())
+        self.assertTrue((prediction["opacities"].grad == 0).all())
+
+    def test_feature_loss_weight_configuration_validation(self):
+        config = noise_to_gs.flow_matching("unused", feature_loss_weights={"means": 2, "scales": 0})
+        self.assertEqual(config["feature_loss_weights"], {"means": 2, "scales": 0})
+        self.assertEqual(noise_to_gs.flow_matching("unused")["feature_loss_weights"], {})
+        for invalid in ({"bad": 1}, {"means": -1}, {"means": float("nan")},
+                        {"means": float("inf")}, {"means": True}, {"means": "1"}):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                noise_to_gs.flow_matching("unused", feature_loss_weights=invalid)
+
+    def test_multiscene_launcher_forwards_experiment_settings(self):
+        command = 'torchrun() { printf "%s\\n" "$@"; }; source "$1"'
+        environment = dict(os.environ, EVAL_SCENE_NAME="scene", TRAIN_SCENE_COUNT="100", LR_WARMUP_STEPS="2000",
+                           LR_WARMUP_START_FACTOR="0.1", GS_FOURIER_INPUT_FEATURES="['means', 'scales']",
+                           GS_FOURIER_NUM_FREQUENCIES="{'means': 6, 'scales': 4}",
+                           GS_FOURIER_INCLUDE_RAW="False", GS_FOURIER_LOG_SAMPLING="False",
+                           GS_FOURIER_MAX_FREQUENCY_LOG2="{'means': 5}",
+                           GS_FEATURE_LOSS_WEIGHTS="{'means': 2, 'opacities': 0.5}")
+        result = subprocess.run(["bash", "-c", command, "test", str(ROOT / "scripts/train-noise-to-gs-on-objaverse.sh")],
+                                env=environment, capture_output=True, text=True, check=True)
+        self.assertIn("--train_scene_count=100\n", result.stdout)
+        for binding in ("train2D/build_scheduler.warmup_step=2000", "train2D/build_scheduler.warmup_start_factor=0.1",
+                        "GaussianDiTPredictor.fourier_input_features=['means', 'scales']",
+                        "GaussianDiTPredictor.fourier_num_frequencies={'means': 6, 'scales': 4}",
+                        "GaussianDiTPredictor.fourier_include_raw=False", "GaussianDiTPredictor.fourier_log_sampling=False",
+                        "GaussianDiTPredictor.fourier_max_frequency_log2={'means': 5}",
+                        "flow_matching.feature_loss_weights={'means': 2, 'opacities': 0.5}"):
+            self.assertIn(f"--gin_param={binding}\n", result.stdout)
+        for key in list(environment):
+            if key.startswith("GS_FOURIER_") or key in ("GS_FEATURE_LOSS_WEIGHTS", "LR_WARMUP_STEPS", "LR_WARMUP_START_FACTOR", "TRAIN_SCENE_COUNT"):
+                environment.pop(key)
+        result = subprocess.run(["bash", "-c", command, "test", str(ROOT / "scripts/train-noise-to-gs-on-objaverse.sh")],
+                                env=environment, capture_output=True, text=True, check=True)
+        self.assertIn("train2D/build_scheduler.warmup_step=0", result.stdout)
+        self.assertIn("--train_scene_count=-1\n", result.stdout)
+        self.assertNotIn("GaussianDiTPredictor.fourier_", result.stdout)
+        self.assertNotIn("flow_matching.feature_loss_weights", result.stdout)
+
     def test_linear_path_uses_noise_and_target_only(self):
         target = {key: torch.full((3,) + shape, 2.) for key, shape in SHAPES.items()}
         noise = {key: torch.full_like(value, -1.) for key, value in target.items()}

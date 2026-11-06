@@ -71,12 +71,14 @@ def construct_path(source, target, t, mode, source_means, target_means, noise_sc
             "reference_means": reference_means(mode, time, source_means, target_means)}
 
 
-def attribute_mse(prediction, target):
+def attribute_mse(prediction, target, feature_loss_weights=None):
     losses = {}
     for key in STATISTIC_KEYS:
         delta = prediction[key].float() - target[key].float()
         losses[key] = delta.square().mean() if delta.numel() else delta.sum()
-    return sum(losses.values()), losses, dict(losses)
+    weights = feature_loss_weights or {}
+    weighted_losses = {key: value * weights.get(key, 1.0) for key, value in losses.items()}
+    return sum(weighted_losses.values()), losses, weighted_losses
 
 
 def seeded_noise_like(reference, seed):

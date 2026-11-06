@@ -6,16 +6,27 @@ import torch
 
 from dataset.gs_io import latest_gsplat_checkpoint
 from utils.spatial_coordinates import morton_order
+from utils.gs_normalization import STATISTIC_KEYS
 
 
 PAD_OPACITY_LOGIT = -15.0
 
 
-def select_available_scenes(dataset, splat_dir):
+def mean_feature_losses(feature_loss_sum, scene_count, weights):
+    """Summarize feature sums after microbatch and distributed reduction."""
+    raw = dict(zip(STATISTIC_KEYS, (feature_loss_sum / scene_count).tolist()))
+    weighted = {key: value * weights.get(key, 1.0) for key, value in raw.items()}
+    return raw, weighted
+
+
+def select_available_scenes(dataset, splat_dir, scene_count=-1):
     """Keep listed scenes with a checkpoint in the supplied splat directory."""
+    if scene_count != -1 and (scene_count < 1 or scene_count > len(dataset.folders)):
+        raise ValueError(f"scene_count must be -1 or between 1 and {len(dataset.folders)}")
     splat_dir = Path(splat_dir)
     available, skipped, seen = [], [], set()
-    for entry in dataset.folders:
+    entries = dataset.folders if scene_count == -1 else dataset.folders[:scene_count]
+    for entry in entries:
         name = entry["scene_name"]
         if name in seen:
             continue
@@ -28,6 +39,9 @@ def select_available_scenes(dataset, splat_dir):
             continue
         entry["resolution_paths"][dataset.tgt_resolution]["gsplat_dir"] = str(path)
         available.append(entry)
+    if scene_count != -1 and len(available) != scene_count:
+        raise ValueError(f"First {scene_count} listed scenes must be distinct and have GS checkpoints; "
+                         f"found {len(available)} available, missing={skipped}")
     if not available:
         raise ValueError(f"No listed scenes have GS checkpoints under {splat_dir}")
     dataset.folders = available

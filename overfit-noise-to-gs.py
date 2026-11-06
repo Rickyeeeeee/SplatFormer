@@ -22,9 +22,10 @@ from utils import gpu_utils, gs_utils
 from utils.data_augmentation import (rotate_gaussians, sample_uniform_rotation_quaternion,
                                      sample_uniform_z_rotation_quaternion, validate_rotation_max_degrees)
 from utils.gpu_utils import seed_everything
-from utils.gs_normalization import GaussianStandardizer
+from utils.gs_normalization import GaussianStandardizer, STATISTIC_KEYS
 from utils.log_utils import ProcessSafeLogger
 from utils.loss_utils import SUPPORTED_GS_KEYS
+from utils.noise_to_gs_training import mean_feature_losses
 from utils.optimizers import build_optimizer, build_scheduler
 from utils.spatial_coordinates import morton_order
 
@@ -253,6 +254,7 @@ def training(dataset, scene_indices, output_dir, logger, device, total_steps=400
 
         optimizer.zero_grad(set_to_none=True)
         weighted_loss = 0.0
+        feature_loss_sum = torch.zeros(len(STATISTIC_KEYS), device=device)
         left = 0
         for size in sizes:
             microbatch = selected[left:left + size]
@@ -281,14 +283,17 @@ def training(dataset, scene_indices, output_dir, logger, device, total_steps=400
                     model, [query for query, _ in paths], [scene["scene_idx"] for scene in microbatch],
                     torch.stack(times), standardizer, reference_means=reference_means
                 )
-                losses = [interpolants.attribute_mse(prediction, velocity)[0]
+                losses = [interpolants.attribute_mse(prediction, velocity, flow_cfg["feature_loss_weights"])
                           for prediction, (_, velocity) in zip(predictions, paths)]
-                loss = sum(losses) / FLAGS.batch_size
+                loss = sum(parts[0] for parts in losses) / FLAGS.batch_size
             if enable_amp:
                 scaler.scale(loss).backward()
             else:
                 loss.backward()
             weighted_loss += loss.detach().item()
+            if step % log_interval == 0:
+                feature_loss_sum += sum(torch.stack([parts[1][key].detach() for key in STATISTIC_KEYS])
+                                        for parts in losses)
 
         if enable_amp:
             previous_scale = scaler.get_scale()
@@ -306,8 +311,10 @@ def training(dataset, scene_indices, output_dir, logger, device, total_steps=400
         if optimizer_stepped:
             scheduler.step()
         if step % log_interval == 0:
+            raw, weighted = mean_feature_losses(feature_loss_sum, FLAGS.batch_size, flow_cfg["feature_loss_weights"])
             logger.info(f"step={step} loss={weighted_loss:.6f} lr={optimizer.param_groups[0]['lr']:.8f} "
-                        f"scenes={[scene['scene_name'] for scene in selected]}")
+                        f"scenes={[scene['scene_name'] for scene in selected]} "
+                        f"feature_loss={raw} weighted_feature_loss={weighted}")
 
         final = step == total_steps - 1
         # Save a Gaussian snapshot for every evaluation and checkpoint step.

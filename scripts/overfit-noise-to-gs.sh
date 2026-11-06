@@ -91,6 +91,9 @@ OUTPUT_DIR=${OUTPUT_DIR:-${OUTPUT_ROOT}/${scene_label}_${PREDICTOR}${coordinate_
 
 # Forward architecture-specific Gin overrides without changing model defaults.
 network_gin_args=()
+if [[ -n "${GS_FEATURE_LOSS_WEIGHTS:-}" ]]; then
+    network_gin_args+=("--gin_param=flow_matching.feature_loss_weights=${GS_FEATURE_LOSS_WEIGHTS}")
+fi
 for network in "${backbone_class}" "${predictor_class}"; do
     case "${network}" in
         PointTransformerV3FlowModel)

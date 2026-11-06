@@ -17,6 +17,7 @@ case "${COORDINATE_MODE}" in
 esac
 GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS:-1}
 GS_COUNT=${GS_COUNT:-1000}
+TRAIN_SCENE_COUNT=${TRAIN_SCENE_COUNT:--1}
 RESOLUTION=${RESOLUTION:-32}
 DIT_PATCH_SIZE=${DIT_PATCH_SIZE:-1}
 TOTAL_STEPS=${TOTAL_STEPS:-100000}
@@ -25,6 +26,8 @@ SAVE_INTERVAL=${SAVE_INTERVAL:-5000}
 LOG_INTERVAL=${LOG_INTERVAL:-20}
 FLOW_STEPS=${FLOW_STEPS:-25}
 FLOW_COUPLING=${FLOW_COUPLING:-random}
+LR_WARMUP_STEPS=${LR_WARMUP_STEPS:-0}
+LR_WARMUP_START_FACTOR=${LR_WARMUP_START_FACTOR:-0.03333333333333333}
 EVAL_NOISE_SEED=${EVAL_NOISE_SEED:-0}
 RANDOM_ROTATE=${RANDOM_ROTATE:-False}
 USE_WANDB=${USE_WANDB:-true}
@@ -42,6 +45,17 @@ init_args=()
 if [[ -n "${INIT_CHECKPOINT:-}" ]]; then
     init_args=("--init_checkpoint=${INIT_CHECKPOINT}")
 fi
+experiment_gin_args=()
+for parameter in fourier_input_features fourier_num_frequencies fourier_include_raw fourier_log_sampling fourier_max_frequency_log2; do
+    env_name=GS_${parameter^^}
+    value=${!env_name:-}
+    if [[ -n "${value}" ]]; then
+        experiment_gin_args+=("--gin_param=GaussianDiTPredictor.${parameter}=${value}")
+    fi
+done
+if [[ -n "${GS_FEATURE_LOSS_WEIGHTS:-}" ]]; then
+    experiment_gin_args+=("--gin_param=flow_matching.feature_loss_weights=${GS_FEATURE_LOSS_WEIGHTS}")
+fi
 
 export CUDA_VISIBLE_DEVICES="${GPU_IDS}"
 torchrun --nnodes=1 --nproc_per_node="${NGPUS}" --rdzv-endpoint="localhost:${MASTER_PORT}" \
@@ -51,6 +65,7 @@ torchrun --nnodes=1 --nproc_per_node="${NGPUS}" --rdzv-endpoint="localhost:${MAS
     --test_splat_dir="${TEST_SPLAT_DIR}" \
     --eval_scene_name="${EVAL_SCENE_NAME}" \
     --gs_count="${GS_COUNT}" \
+    --train_scene_count="${TRAIN_SCENE_COUNT}" \
     --batch_size="${BATCH_SIZE}" \
     --grad_accum_steps="${GRAD_ACCUM_STEPS}" \
     --num_workers="${NUM_WORKERS}" \
@@ -80,4 +95,7 @@ torchrun --nnodes=1 --nproc_per_node="${NGPUS}" --rdzv-endpoint="localhost:${MAS
     --gin_param="training.eval_interval=${EVAL_INTERVAL}" \
     --gin_param="training.save_interval=${SAVE_INTERVAL}" \
     --gin_param="training.log_interval=${LOG_INTERVAL}" \
-    --gin_param="train2D/build_scheduler.total_step=${TOTAL_STEPS}"
+    --gin_param="train2D/build_scheduler.total_step=${TOTAL_STEPS}" \
+    --gin_param="train2D/build_scheduler.warmup_step=${LR_WARMUP_STEPS}" \
+    --gin_param="train2D/build_scheduler.warmup_start_factor=${LR_WARMUP_START_FACTOR}" \
+    "${experiment_gin_args[@]}"

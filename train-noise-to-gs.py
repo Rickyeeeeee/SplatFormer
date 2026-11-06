@@ -29,10 +29,10 @@ from utils import gpu_utils, gs_utils
 from utils.data_augmentation import (rotate_gaussians, sample_uniform_rotation_quaternion,
                                      sample_uniform_z_rotation_quaternion, validate_rotation_max_degrees)
 from utils.gpu_utils import seed_everything
-from utils.gs_normalization import GaussianStandardizer
+from utils.gs_normalization import GaussianStandardizer, STATISTIC_KEYS
 from utils.log_utils import ProcessSafeLogger
 from utils.noise_to_gs_training import (evenly_spaced_camera_indices, evaluation_seed,
-                                        prepare_fixed_count_target, select_available_scenes)
+                                        mean_feature_losses, prepare_fixed_count_target, select_available_scenes)
 from utils.optimizers import build_optimizer, build_scheduler
 
 
@@ -41,6 +41,7 @@ flags.DEFINE_string("train_splat_dir", None, "Direct training gsplat scene direc
 flags.DEFINE_string("test_splat_dir", None, "Direct test gsplat scene directory")
 flags.DEFINE_string("eval_scene_name", None, "Test scene supplying eight evaluation cameras")
 flags.DEFINE_string("init_checkpoint", None, "Optional model weights for a warm start")
+flags.DEFINE_integer("train_scene_count", -1, "Train on the first N listed scenes; -1 uses all available scenes")
 flags.DEFINE_integer("gs_count", 1000, "Gaussians in every training target and generated scene")
 flags.DEFINE_integer("batch_size", 4, "Scenes per GPU per optimizer update")
 flags.DEFINE_integer("grad_accum_steps", 4, "Microbatches per GPU optimizer update")
@@ -152,6 +153,8 @@ def training():
         raise ValueError("--train_splat_dir, --test_splat_dir, and --eval_scene_name are required")
     if FLAGS.gs_count < 1 or FLAGS.num_workers < 0 or FLAGS.prefetch_factor < 1:
         raise ValueError("gs_count and prefetch_factor must be positive; num_workers must be nonnegative")
+    if FLAGS.train_scene_count != -1 and FLAGS.train_scene_count < 1:
+        raise ValueError("train_scene_count must be -1 or a positive integer")
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
@@ -178,7 +181,7 @@ def training():
     )
     if train_dataset.src_resolution != train_dataset.tgt_resolution or test_dataset.src_resolution != test_dataset.tgt_resolution:
         raise ValueError("Unconditional noise-to-GS requires equal source and target resolution")
-    skipped = select_available_scenes(train_dataset, FLAGS.train_splat_dir)
+    skipped = select_available_scenes(train_dataset, FLAGS.train_splat_dir, FLAGS.train_scene_count)
     cameras, camera_indices, camera_names = load_evaluation_cameras(
         test_dataset, FLAGS.eval_scene_name, FLAGS.test_splat_dir, device
     )
@@ -236,6 +239,7 @@ def training():
             model.train()
             optimizer.zero_grad(set_to_none=True)
             loss_sum = torch.zeros((), device=device)
+            feature_loss_sum = torch.zeros(len(STATISTIC_KEYS), device=device)
             for microbatch_index in range(len(sizes)):
                 scenes = next(train_iter)
                 targets = []
@@ -259,14 +263,18 @@ def training():
                     predictions = model(batch_flow_gs=[query for query, _ in paths],
                                         batch_scene_idx=[0] * len(paths), batch_reference_means=None,
                                         t=torch.stack(times))
-                    summed = sum(interpolants.attribute_mse(prediction, velocity)[0]
-                                 for prediction, (_, velocity) in zip(predictions, paths))
+                    loss_parts = [interpolants.attribute_mse(prediction, velocity, flow_cfg["feature_loss_weights"])
+                                  for prediction, (_, velocity) in zip(predictions, paths)]
+                    summed = sum(parts[0] for parts in loss_parts)
                     loss = summed / FLAGS.batch_size
                 if config["enable_amp"]:
                     scaler.scale(loss).backward()
                 else:
                     loss.backward()
                 loss_sum += summed.detach()
+                if step % config["log_interval"] == 0:
+                    feature_loss_sum += sum(torch.stack([parts[1][key].detach() for key in STATISTIC_KEYS])
+                                            for parts in loss_parts)
                 del scenes, targets, paths, predictions, loss
             if config["enable_amp"]:
                 previous_scale = scaler.get_scale()
@@ -286,12 +294,19 @@ def training():
             if step % config["log_interval"] == 0:
                 if distributed:
                     dist.all_reduce(loss_sum)
+                    dist.all_reduce(feature_loss_sum)
                 average_loss = (loss_sum / (FLAGS.batch_size * world_size)).item()
                 if rank == 0:
                     lr = optimizer.param_groups[0]["lr"]
-                    logger.info("step=%d loss=%.6f lr=%.8f", step, average_loss, lr)
+                    raw, weighted = mean_feature_losses(feature_loss_sum, FLAGS.batch_size * world_size,
+                                                        flow_cfg["feature_loss_weights"])
+                    logger.info("step=%d loss=%.6f lr=%.8f feature_loss=%s weighted_feature_loss=%s",
+                                step, average_loss, lr, raw, weighted)
                     if wandb is not None and wandb.run is not None:
-                        wandb.log({"train/loss": average_loss, "train/lr": lr}, step=step)
+                        metrics = {"train/loss": average_loss, "train/lr": lr}
+                        metrics.update({f"train/feature_loss/{key}": value for key, value in raw.items()})
+                        metrics.update({f"train/weighted_feature_loss/{key}": value for key, value in weighted.items()})
+                        wandb.log(metrics, step=step)
             if step % config["eval_interval"] == 0 or step == config["total_steps"]:
                 evaluate(model_module, standardizer, cameras, camera_indices, camera_names,
                          flow_cfg, step, rank, world_size)
