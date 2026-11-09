@@ -1,0 +1,29 @@
+# Current unsplit ShapeNet renders and default-strategy gsplat checkpoints.
+dataset_root = '/project/ricky/shapenet-sr-data'
+shapenet_gs_root = '/project/ricky/shapenet-sr-data-default-4096'
+train_scene_list = '/project/ricky/shapenet-sr-data-default-4096/shapenet/128/train_scenes.csv'
+test_scene_list = '/project/ricky/shapenet-sr-data-default-4096/shapenet/128/test_scenes.csv'
+
+SplatFactoSRDataset.dataset_root = %dataset_root
+SplatFactoSRDataset.dataset_layout = 'shapenet'
+SplatFactoSRDataset.dataset_name = 'shapenet'
+SplatFactoSRDataset.gs_dataset_root = %shapenet_gs_root
+SplatFactoSRDataset.train_scene_list = %train_scene_list
+SplatFactoSRDataset.test_scene_list = %test_scene_list
+SplatFactoSRDataset.remove_outlier_ndevs = 3
+SplatFactoSRDataset.image_per_scene = 8
+SplatFactoSRDataset.max_gs_num = 4096
+SplatFactoSRDataset.src_resolution = 128
+SplatFactoSRDataset.tgt_resolution = 128
+SplatFactoSRDataset.background_color = [0, 0, 0]
+SplatFactoSRDataset.load_src_gs = False
+SplatFactoSRDataset.load_tgt_gs = True
+SplatFactoSRDataset.load_src_images = False
+SplatFactoSRDataset.load_tgt_images = True
+
+train_dataset/SplatFactoSRDataset.train_or_test = 'train'
+train_dataset/SplatFactoSRDataset.split_across_gpus = True
+test_dataset/SplatFactoSRDataset.train_or_test = 'test'
+test_dataset/SplatFactoSRDataset.split_across_gpus = False
+
+flow_matching.gs_statistics_path = '/project/ricky/shapenet-sr-data-default-4096/shapenet/128/gs_statistics.json'

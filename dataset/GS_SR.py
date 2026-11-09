@@ -36,11 +36,19 @@ class SplatFactoSRDataset(torch.utils.data.IterableDataset):
         load_tgt_gs: bool = True,
         load_src_images: bool = True,
         load_tgt_images: bool = True,
+        dataset_layout: str = "split",
+        image_dataset_root: Optional[str] = None,
+        gs_dataset_root: Optional[str] = None,
     ):
         if train_or_test not in ("train", "test"):
             raise ValueError("train_or_test must be either 'train' or 'test'")
+        if dataset_layout not in ("split", "shapenet"):
+            raise ValueError("dataset_layout must be either 'split' or 'shapenet'")
         self.train_or_test = train_or_test
         self.dataset_root = os.fspath(dataset_root)
+        self.dataset_layout = dataset_layout
+        self.image_dataset_root = os.fspath(image_dataset_root) if image_dataset_root is not None else self.dataset_root
+        self.gs_dataset_root = os.fspath(gs_dataset_root) if gs_dataset_root is not None else self.dataset_root
         self.scene_list = os.fspath(
             train_scene_list if train_or_test == "train" else test_scene_list
         )
@@ -92,15 +100,24 @@ class SplatFactoSRDataset(torch.utils.data.IterableDataset):
             f"Scene {scene_name!r} is absent or was filtered from the dataset"
         )
 
+    def resolution_paths(self, scene_name, resolution, gs_root=None):
+        if self.dataset_layout == "split":
+            image_root = self.split_root
+            checkpoint_root = os.path.join(gs_root, f"{self.train_or_test}-set", self.dataset_name) if gs_root else image_root
+        else:
+            image_root = os.path.join(self.image_dataset_root, "shapenet")
+            checkpoint_root = os.path.join(gs_root or self.gs_dataset_root, "shapenet")
+        paths = gs_io.resolution_paths(image_root, scene_name, resolution)
+        paths["gsplat_dir"] = gs_io.resolution_paths(checkpoint_root, scene_name, resolution)["gsplat_dir"]
+        return paths
+
     def load_scene_manifest(self):
         folders = []
         for scene_name in gs_io.read_scene_names(self.scene_list):
             scene_info = {
                 "scene_name": scene_name,
                 "resolution_paths": {
-                    resolution: gs_io.resolution_paths(
-                        self.split_root, scene_name, resolution
-                    )
+                    resolution: self.resolution_paths(scene_name, resolution)
                     for resolution in (self.src_resolution, self.tgt_resolution)
                 },
             }

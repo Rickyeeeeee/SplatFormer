@@ -47,13 +47,16 @@ class NoiseToGSTrainingTests(unittest.TestCase):
             root = Path(temporary)
             (root / "available" / "ckpts").mkdir(parents=True)
             (root / "available" / "ckpts" / "ckpt_9_rank0.pt").touch()
+            (root / "03001627" / "model" / "ckpts").mkdir(parents=True)
+            (root / "03001627" / "model" / "ckpts" / "ckpt_9_rank0.pt").touch()
             folders = [{"scene_name": name, "resolution_paths": {32: {"gsplat_dir": "old"}}}
-                       for name in ("missing", "available", "available")]
+                       for name in ("missing", "available", "available", "03001627/model")]
             dataset = SimpleNamespace(folders=folders, tgt_resolution=32)
             skipped = select_available_scenes(dataset, root)
             self.assertEqual(skipped, ["missing"])
-            self.assertEqual(len(dataset.folders), 1)
+            self.assertEqual(len(dataset.folders), 2)
             self.assertEqual(dataset.folders[0]["resolution_paths"][32]["gsplat_dir"], str(root / "available"))
+            self.assertEqual(dataset.folders[1]["resolution_paths"][32]["gsplat_dir"], str(root / "03001627/model"))
 
     def test_scene_limit_selects_first_listed_scenes_and_requires_exact_count(self):
         with tempfile.TemporaryDirectory() as temporary:

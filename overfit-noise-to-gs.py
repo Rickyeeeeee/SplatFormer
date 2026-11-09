@@ -344,10 +344,9 @@ def main(argv):
                              (dataset.tgt_resolution, FLAGS.target_gs_root)):
         if root:
             for entry in dataset.folders:
-                entry["resolution_paths"][resolution]["gsplat_dir"] = os.path.join(
-                    root, f"{dataset.train_or_test}-set", dataset.dataset_name,
-                    str(resolution), "gsplat", entry["scene_name"]
-                )
+                entry["resolution_paths"][resolution]["gsplat_dir"] = dataset.resolution_paths(
+                    entry["scene_name"], resolution, gs_root=root
+                )["gsplat_dir"]
     if FLAGS.scene_mode == "one":
         scene_indices = [dataset.scene_index(FLAGS.scene_name)]
     else:
