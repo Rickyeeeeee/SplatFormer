@@ -83,10 +83,12 @@ class SRSceneLoadingTests(unittest.TestCase):
             self.assertEqual(val_dataset.folders[0]["scene_name"], "03001627/val")
             paths = val_dataset.folders[0]["resolution_paths"][128]
             self.assertEqual(paths["gsplat_dir"], str(root / "shapenet/128/gsplat/03001627/val"))
-            with mock.patch("dataset.GS_SR.gs_io.load_gsplat", return_value=(self.target, "ckpt")):
+            with mock.patch("dataset.GS_SR.gs_io.load_gsplat", return_value=(self.target, "ckpt")) as load:
                 scene = val_dataset.load_scene(0)
+            load.assert_called_once_with(paths["gsplat_dir"])
             self.assertEqual(list(scene["data"]), [128])
             self.assertIn("gs_params", scene["data"][128])
+            torch.testing.assert_close(scene["data"][128]["gs_params"]["means"], (self.target["means"] - 1) / 2)
 
     def test_invalid_dataset_layout(self):
         with self.assertRaisesRegex(ValueError, "dataset_layout"):

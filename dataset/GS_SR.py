@@ -204,7 +204,9 @@ class SplatFactoSRDataset(torch.utils.data.IterableDataset):
         normalized_gs = {}
         if self.load_src_gs:
             normalized_gs[self.src_resolution] = normalized_src_gs
-        if self.load_tgt_gs:
+        if self.load_tgt_gs and self.src_resolution == self.tgt_resolution:
+            normalized_gs[self.tgt_resolution] = normalized_src_gs
+        elif self.load_tgt_gs:
             tgt_gs_paths = scene_info["resolution_paths"][self.tgt_resolution]
             tgt_gs_raw, _ = gs_io.load_gsplat(tgt_gs_paths["gsplat_dir"])
             tgt_gs_mask = self.processor.selection_mask(tgt_gs_raw)

@@ -1,5 +1,6 @@
 """Noise-only Gaussian path, current-coordinate, and launcher checks."""
 
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -282,17 +283,20 @@ class NoiseToGaussianTests(unittest.TestCase):
                 load_src_gs=False, load_src_images=False, load_tgt_gs=True, load_tgt_images=True,
             )
         gaussians = {key: torch.zeros((2,) + shape) for key, shape in SHAPES.items()}
-        gaussians["means"][1] = 1
+        gaussians["means"][1] = 2
         gaussians["quats"][:, 0] = 1
         gaussians["features_rest"] = gaussians["features_rest"][:, :0, :]
         camera = torch.eye(4).unsqueeze(0)
         camera_meta = {"meta": {"camera_to_worlds": camera}}
         views = ([torch.zeros((2, 2, 3))], ["view.png"], {"camera_to_worlds": camera})
-        with mock.patch("dataset.GS_SR.gs_io.load_gsplat", return_value=(gaussians, "ckpt")), \
+        with mock.patch("dataset.GS_SR.gs_io.load_gsplat", return_value=(gaussians, "ckpt")) as load, \
              mock.patch.object(dataset, "load_camera_meta", return_value=camera_meta), \
              mock.patch.object(dataset, "load_resolution_views", return_value=views):
             scene = dataset.load_scene(0)
+        load.assert_called_once_with(dataset.folders[0]["resolution_paths"][32]["gsplat_dir"])
         self.assertEqual(list(scene["data"]), [32])
+        torch.testing.assert_close(scene["data"][32]["gs_params"]["means"], gaussians["means"] / 2)
+        torch.testing.assert_close(scene["data"][32]["gs_params"]["scales"], torch.full((2, 3), -math.log(2)))
         self.assertEqual(tuple(scene["data"][32]["gs_params"]["features_rest"].shape), (2, 0, 3))
         self.assertEqual(len(scene["data"][32]["images"]), 1)
 

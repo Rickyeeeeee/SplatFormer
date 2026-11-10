@@ -90,6 +90,16 @@ GS_FEATURE_LOSS_WEIGHTS='{}' EVAL_SCENE_NAME=${EVAL_SCENE_NAME:-3e288ee8aced4a07
 OUTPUT_DIR=${OUTPUT_ROOT:-/project2/ricky/outputs/$(date +%m%d)}/noise_to_gs_morton_x_xloss \
 bash scripts/train-noise-to-gs-on-objaverse.sh
 
+# Predict clean Gaussians and train with velocity loss.
+GPU_IDS=6 NGPUS=1 BATCH_SIZE=64 GRAD_ACCUM_STEPS=1 MASTER_PORT=29524 \
+DIT_SIZE=B \
+COORDINATE_MODE=morton_rank FLOW_COUPLING=morton RANDOM_ROTATE=False \
+MODEL_OUTPUT_TYPE=x PREDICTION_TYPE=x \
+LR_WARMUP_STEPS=2000 LR_WARMUP_START_FACTOR=0.03333333333333333 \
+GS_FEATURE_LOSS_WEIGHTS='{}' EVAL_SCENE_NAME=${EVAL_SCENE_NAME:-3e288ee8aced4a0797e66d53536112b1} \
+OUTPUT_DIR=${OUTPUT_ROOT:-/project2/ricky/outputs/$(date +%m%d)}/noise_to_gs_morton_x_xloss \
+bash scripts/train-noise-to-gs-on-objaverse.sh
+
 GPU_IDS=6 NGPUS=1 BATCH_SIZE=64 GRAD_ACCUM_STEPS=1 MASTER_PORT=29524 \
 COORDINATE_MODE=morton_rank FLOW_COUPLING=morton RANDOM_ROTATE=False \
 MODEL_OUTPUT_TYPE=x PREDICTION_TYPE=v \

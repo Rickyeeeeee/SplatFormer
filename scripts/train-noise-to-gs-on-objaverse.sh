@@ -20,6 +20,11 @@ GS_COUNT=${GS_COUNT:-1000}
 TRAIN_SCENE_COUNT=${TRAIN_SCENE_COUNT:--1}
 RESOLUTION=${RESOLUTION:-32}
 DIT_PATCH_SIZE=${DIT_PATCH_SIZE:-1}
+DIT_SIZE=${DIT_SIZE:-S}
+case "${DIT_SIZE}" in
+    S|B|L) ;;
+    *) echo "DIT_SIZE must be S, B, or L" >&2; exit 2 ;;
+esac
 TOTAL_STEPS=${TOTAL_STEPS:-100000}
 EVAL_INTERVAL=${EVAL_INTERVAL:-5000}
 SAVE_INTERVAL=${SAVE_INTERVAL:-5000}
@@ -77,6 +82,7 @@ torchrun --nnodes=1 --nproc_per_node="${NGPUS}" --rdzv-endpoint="localhost:${MAS
     --wandb_project="${WANDB_PROJECT}" \
     "${init_args[@]}" \
     --gin_file=configs/model/dit_gaussian.gin \
+    --gin_file="configs/model/dit_${DIT_SIZE}.gin" \
     --gin_file=configs/dataset/objaverse-sr.gin \
     --gin_file=configs/train/noise_to_gs.gin \
     --gin_param="dataset_root='${DATASET_ROOT}'" \

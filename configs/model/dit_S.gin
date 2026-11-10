@@ -1,0 +1,3 @@
+GaussianDiT.depth = 12
+GaussianDiT.channels = 384
+GaussianDiT.num_heads = 6
