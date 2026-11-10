@@ -132,7 +132,7 @@ def load_experiment(args):
 
 @torch.no_grad()
 def record_sample(model, count, scene_idx, standardizer, steps, t_eps, seed, reference_means=None,
-                  initial_noise=None, coupling="random", model_output_type="velocity"):
+                  initial_noise=None, coupling="random", model_output_type="v"):
     """Record physical Gaussian states using the same seeded Euler rollout as evaluation."""
     device = next(model.parameters()).device
     noise_to_gs.validate_coupling(model, coupling)
@@ -154,7 +154,7 @@ def record_sample(model, count, scene_idx, standardizer, steps, t_eps, seed, ref
 
 @torch.no_grad()
 def record_interpolated_samples(model, count, scene_idx, standardizer, steps, t_eps, seed_a, seed_b,
-                                reference_means=None, on_progress=None, coupling="random", model_output_type="velocity"):
+                                reference_means=None, on_progress=None, coupling="random", model_output_type="v"):
     """Sample six linear blends of two fixed standardized noise tensors."""
     device = next(model.parameters()).device
     generator_a = torch.Generator(device=device).manual_seed(int(seed_a) + int(scene_idx))

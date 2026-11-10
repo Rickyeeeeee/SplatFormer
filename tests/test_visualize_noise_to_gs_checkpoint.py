@@ -288,7 +288,7 @@ class CheckpointViewerTests(unittest.TestCase):
         instance.count, instance.scene_idx = 2, 0
         instance.standardizer = UnitStandardizer()
         instance.reference_means = None
-        instance.flow_cfg = {"flow_t_eps": 1e-4, "coupling": "random", "model_output_type": "velocity"}
+        instance.flow_cfg = {"flow_t_eps": 1e-4, "coupling": "random", "model_output_type": "v"}
         instance.states = [object()]
         instance.single_states = instance.states
         instance.interpolated_states = None
@@ -322,7 +322,7 @@ class CheckpointViewerTests(unittest.TestCase):
         instance.count, instance.scene_idx = 2, 0
         instance.standardizer = UnitStandardizer()
         instance.reference_means = None
-        instance.flow_cfg = {"flow_t_eps": 1e-4, "coupling": "random", "model_output_type": "velocity"}
+        instance.flow_cfg = {"flow_t_eps": 1e-4, "coupling": "random", "model_output_type": "v"}
         instance.single_states = [object()]
         instance.interpolated_states = [[object()]] * 6
         instance.set_active_states = Mock()

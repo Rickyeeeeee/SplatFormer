@@ -4,7 +4,7 @@
 # GS_FOURIER_INPUT_FEATURES="['means', 'scales']" GS_FOURIER_NUM_FREQUENCIES="{'means': 6, 'scales': 4}" \
 # bash scripts/overfit-noise-to-gs.sh
 set -euo pipefail
-export GPU_ID=3
+export GPU_ID=6
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "${REPO_ROOT}"
@@ -223,7 +223,6 @@ data_root=${DATASET_ROOT:-/project/ricky/splatformer-sr-data-scaled}
 # OUTPUT_DIR=${OUTPUT_ROOT:-/project2/ricky/experiments/${run_date}}/${SCENE_NAME:-3e288ee8aced4a0797e66d53536112b1}_dit_morton_rank_hr128_n4000_patch16 \
 # bash scripts/overfit-noise-to-gs.sh
 
-export GPU_ID=3
 export DATASET_ROOT=${data_root}
 export SOURCE_GS_ROOT=${SOURCE_GS_ROOT:-/project/ricky/splatformer-sr-data-mcmc-1000}
 export TARGET_GS_ROOT=${TARGET_GS_ROOT:-/project/ricky/splatformer-sr-data-mcmc-1000}
@@ -271,28 +270,48 @@ export OUTPUT_ROOT=${OUTPUT_ROOT:-/project2/ricky/experiments/${run_date}/}
 # bash scripts/overfit-noise-to-gs.sh
 
 # Compare x prediction with velocity loss across scenes and coupling modes.
-SCENE_MODE=one FLOW_COUPLING=random MODEL_OUTPUT_TYPE=x PREDICTION_TYPE=velocity \
-OUTPUT_DIR=${OUTPUT_ROOT}/dit_hr32_n1000_random_coupling_x_vloss \
+# SCENE_MODE=one FLOW_COUPLING=random MODEL_OUTPUT_TYPE=x PREDICTION_TYPE=v \
+# OUTPUT_DIR=${OUTPUT_ROOT}/dit_hr32_n1000_random_coupling_x_vloss \
+# bash scripts/overfit-noise-to-gs.sh
+
+# SCENE_MODE=one FLOW_COUPLING=morton MODEL_OUTPUT_TYPE=x PREDICTION_TYPE=v \
+# OUTPUT_DIR=${OUTPUT_ROOT}/dit_hr32_n1000_morton_coupling_x_vloss \
+# bash scripts/overfit-noise-to-gs.sh
+
+# SCENE_MODE=one FLOW_COUPLING=morton MODEL_OUTPUT_TYPE=v PREDICTION_TYPE=v \
+# OUTPUT_DIR=${OUTPUT_ROOT}/dit_hr32_n1000_morton_coupling_v_vloss \
+# bash scripts/overfit-noise-to-gs.sh
+
+# SCENE_MODE=one FLOW_COUPLING=morton MODEL_OUTPUT_TYPE=x PREDICTION_TYPE=x \
+# OUTPUT_DIR=${OUTPUT_ROOT}/dit_hr32_n1000_morton_coupling_x_xloss \
+# bash scripts/overfit-noise-to-gs.sh
+
+# SCENE_MODE=one FLOW_COUPLING=morton MODEL_OUTPUT_TYPE=x PREDICTION_TYPE=v \
+# OUTPUT_DIR=${OUTPUT_ROOT}/dit_hr32_n1000_morton_coupling_x_vloss \
+# bash scripts/overfit-noise-to-gs.sh
+
+# SCENE_MODE=one FLOW_COUPLING=morton MODEL_OUTPUT_TYPE=x PREDICTION_TYPE=v \
+# GS_FOURIER_INPUT_FEATURES="['means', 'scales', 'quats']" GS_FOURIER_NUM_FREQUENCIES="{'means': 6, 'scales': 6, 'quats': 6}" \
+# OUTPUT_DIR=${OUTPUT_ROOT}/dit_hr32_n1000_morton_coupling_fourier_x_vloss \
+# bash scripts/overfit-noise-to-gs.sh
+
+# SCENE_MODE=many FLOW_COUPLING=random MODEL_OUTPUT_TYPE=x PREDICTION_TYPE=v \
+# OUTPUT_DIR=${OUTPUT_ROOT}/many_dit_hr32_n1000_random_coupling_x_vloss \
+# bash scripts/overfit-noise-to-gs.sh
+
+SCENE_MODE=many FLOW_COUPLING=morton MODEL_OUTPUT_TYPE=x PREDICTION_TYPE=x \
+OUTPUT_DIR=${OUTPUT_ROOT}/many_dit_hr32_n1000_morton_coupling_x_xloss \
 bash scripts/overfit-noise-to-gs.sh
 
-SCENE_MODE=one FLOW_COUPLING=morton MODEL_OUTPUT_TYPE=x PREDICTION_TYPE=velocity \
-OUTPUT_DIR=${OUTPUT_ROOT}/dit_hr32_n1000_morton_coupling_x_vloss \
-bash scripts/overfit-noise-to-gs.sh
-
-SCENE_MODE=one FLOW_COUPLING=morton MODEL_OUTPUT_TYPE=x PREDICTION_TYPE=velocity \
-GS_FOURIER_INPUT_FEATURES="['means', 'scales', 'quats']" GS_FOURIER_NUM_FREQUENCIES="{'means': 6, 'scales': 6, 'quats': 6}" \
-OUTPUT_DIR=${OUTPUT_ROOT}/dit_hr32_n1000_morton_coupling_fourier_x_vloss \
-bash scripts/overfit-noise-to-gs.sh
-
-SCENE_MODE=many FLOW_COUPLING=random MODEL_OUTPUT_TYPE=x PREDICTION_TYPE=velocity \
-OUTPUT_DIR=${OUTPUT_ROOT}/many_dit_hr32_n1000_random_coupling_x_vloss \
-bash scripts/overfit-noise-to-gs.sh
-
-SCENE_MODE=many FLOW_COUPLING=morton MODEL_OUTPUT_TYPE=x PREDICTION_TYPE=velocity \
+SCENE_MODE=many FLOW_COUPLING=morton MODEL_OUTPUT_TYPE=x PREDICTION_TYPE=v \
 OUTPUT_DIR=${OUTPUT_ROOT}/many_dit_hr32_n1000_morton_coupling_x_vloss \
 bash scripts/overfit-noise-to-gs.sh
 
-SCENE_MODE=many FLOW_COUPLING=morton MODEL_OUTPUT_TYPE=x PREDICTION_TYPE=velocity \
-GS_FOURIER_INPUT_FEATURES="['means', 'scales', 'quats']" GS_FOURIER_NUM_FREQUENCIES="{'means': 6, 'scales': 6, 'quats': 6}" \
-OUTPUT_DIR=${OUTPUT_ROOT}/many_dit_hr32_n1000_morton_coupling_fourier_x_vloss \
-bash scripts/overfit-noise-to-gs.sh
+# SCENE_MODE=many FLOW_COUPLING=morton MODEL_OUTPUT_TYPE=v PREDICTION_TYPE=v \
+# OUTPUT_DIR=${OUTPUT_ROOT}/many_dit_hr32_n1000_morton_coupling_v_vloss \
+# bash scripts/overfit-noise-to-gs.sh
+
+# SCENE_MODE=many FLOW_COUPLING=morton MODEL_OUTPUT_TYPE=x PREDICTION_TYPE=v \
+# GS_FOURIER_INPUT_FEATURES="['means', 'scales', 'quats']" GS_FOURIER_NUM_FREQUENCIES="{'means': 6, 'scales': 6, 'quats': 6}" \
+# OUTPUT_DIR=${OUTPUT_ROOT}/many_dit_hr32_n1000_morton_coupling_fourier_x_vloss \
+# bash scripts/overfit-noise-to-gs.sh

@@ -264,9 +264,12 @@ def training():
                                     batch_scene_idx=[0] * len(paths), batch_reference_means=None,
                                     t=torch.stack(times))
                     predictions = [noise_to_gs.convert_prediction(output, query, time, flow_cfg["model_output_type"],
-                                                                   flow_cfg["prediction_type"])
+                                                                   flow_cfg["prediction_type"], min_denominator=0.05)
                                    for output, (query, _), time in zip(outputs, paths, times)]
                     loss_targets = targets if flow_cfg["prediction_type"] == "x" else [velocity for _, velocity in paths]
+                    if flow_cfg["model_output_type"] == "x" and flow_cfg["prediction_type"] == "v":
+                        loss_targets = [noise_to_gs.convert_prediction(target, query, time, "x", "v", min_denominator=0.05)
+                                        for target, (query, _), time in zip(targets, paths, times)]
                     loss_parts = [noise_to_gs_training.attribute_mse(prediction, target, flow_cfg["feature_loss_weights"])
                                   for prediction, target in zip(predictions, loss_targets)]
                     summed = sum(parts[0] for parts in loss_parts)

@@ -101,7 +101,7 @@ class NoiseToGaussianTests(unittest.TestCase):
                            GS_FOURIER_INCLUDE_RAW="False", GS_FOURIER_LOG_SAMPLING="False",
                            GS_FOURIER_MAX_FREQUENCY_LOG2="{'means': 5}",
                            GS_FEATURE_LOSS_WEIGHTS="{'means': 2, 'opacities': 0.5}",
-                           MODEL_OUTPUT_TYPE="x", PREDICTION_TYPE="velocity")
+                           MODEL_OUTPUT_TYPE="x", PREDICTION_TYPE="v")
         result = subprocess.run(["bash", "-c", command, "test", str(ROOT / "scripts/train-noise-to-gs-on-objaverse.sh")],
                                 env=environment, capture_output=True, text=True, check=True)
         self.assertIn("--train_scene_count=100\n", result.stdout)
@@ -111,7 +111,7 @@ class NoiseToGaussianTests(unittest.TestCase):
                         "GaussianDiTPredictor.fourier_include_raw=False", "GaussianDiTPredictor.fourier_log_sampling=False",
                         "GaussianDiTPredictor.fourier_max_frequency_log2={'means': 5}",
                         "flow_matching.feature_loss_weights={'means': 2, 'opacities': 0.5}",
-                        "flow_matching.model_output_type='x'", "flow_matching.prediction_type='velocity'"):
+                        "flow_matching.model_output_type='x'", "flow_matching.prediction_type='v'"):
             self.assertIn(f"--gin_param={binding}\n", result.stdout)
         for key in list(environment):
             if key.startswith("GS_FOURIER_") or key in ("GS_FEATURE_LOSS_WEIGHTS", "LR_WARMUP_STEPS", "LR_WARMUP_START_FACTOR", "TRAIN_SCENE_COUNT"):
@@ -133,7 +133,7 @@ class NoiseToGaussianTests(unittest.TestCase):
 
     def test_prediction_types_and_weighted_loss(self):
         config = noise_to_gs.flow_matching("unused")
-        self.assertEqual((config["model_output_type"], config["prediction_type"]), ("velocity", "velocity"))
+        self.assertEqual((config["model_output_type"], config["prediction_type"]), ("v", "v"))
         for field in ("model_output_type", "prediction_type"):
             with self.assertRaises(ValueError):
                 noise_to_gs.flow_matching("unused", **{field: "invalid"})
@@ -142,8 +142,8 @@ class NoiseToGaussianTests(unittest.TestCase):
         noise = {key: torch.full_like(value, -1.) for key, value in target.items()}
         for time in (0.2, 0.9999):
             state, velocity = noise_to_gs.construct_path(target, time, noise)
-            for output_type in ("velocity", "x"):
-                for prediction_type in ("velocity", "x"):
+            for output_type in ("v", "x"):
+                for prediction_type in ("v", "x"):
                     with self.subTest(time=time, output_type=output_type, prediction_type=prediction_type):
                         source = target if output_type == "x" else velocity
                         output = {key: value.clone().requires_grad_() for key, value in source.items()}
@@ -157,6 +157,15 @@ class NoiseToGaussianTests(unittest.TestCase):
                         self.assertEqual(weighted["opacities"].item(), 0.)
                         loss.backward()
                         self.assertTrue(torch.isfinite(output["means"].grad).all())
+
+    def test_x_to_v_training_clips_prediction_and_target(self):
+        target = {key: torch.full((2,) + shape, 2.) for key, shape in SHAPES.items()}
+        noise = {key: torch.full_like(value, -1.) for key, value in target.items()}
+        for time in (0.5, 0.99):
+            state, velocity = noise_to_gs.construct_path(target, time, noise)
+            converted = noise_to_gs.convert_prediction(target, state, time, "x", "v", min_denominator=0.05)
+            for key in STATISTIC_KEYS:
+                torch.testing.assert_close(converted[key], velocity[key] * ((1 - time) / max(1 - time, 0.05)))
 
     def test_x_output_sampling_reaches_clean_target(self):
         model = RecordingPredictor("DIT")
@@ -330,7 +339,7 @@ class NoiseToGaussianTests(unittest.TestCase):
         command = 'python() { printf "%s\\n" "$@"; }; source "$1"'
         environment = dict(os.environ, PREDICTOR="dit", DATASET_ROOT="/tmp/noise-to-gs-test",
                            SOURCE_GS_ROOT="/tmp/mcmc-500", TARGET_GS_ROOT="/tmp/mcmc-1000", GS_SH_DEGREE="0",
-                           MODEL_OUTPUT_TYPE="velocity", PREDICTION_TYPE="x")
+                           MODEL_OUTPUT_TYPE="v", PREDICTION_TYPE="x")
         result = subprocess.run(["bash", "-c", command, "test", str(ROOT / "scripts/overfit-noise-to-gs.sh")],
                                 env=environment, capture_output=True, text=True, check=True)
         for argument in ("--predictor=dit", "--gin_file=configs/model/dit_gaussian.gin",
@@ -338,7 +347,7 @@ class NoiseToGaussianTests(unittest.TestCase):
                          "--gin_param=SplatFactoSRDataset.load_src_gs=False",
                          "--source_gs_root=/tmp/mcmc-500", "--target_gs_root=/tmp/mcmc-1000",
                          "--gin_param=GaussianDiTPredictor.sh_degree=0",
-                         "--gin_param=flow_matching.model_output_type='velocity'",
+                         "--gin_param=flow_matching.model_output_type='v'",
                          "--gin_param=flow_matching.prediction_type='x'"):
             self.assertIn(argument, result.stdout)
         for predictor in ("ptv3", "dipt", "gdpt"):
