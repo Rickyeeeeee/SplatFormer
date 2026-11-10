@@ -70,11 +70,22 @@ cd "${repo_root}"
 # OUTPUT_DIR=${OUTPUT_ROOT:-/project2/ricky/outputs/$(date +%m%d)}/noise_to_gs_morton_fourier_means6 \
 # bash scripts/train-noise-to-gs-on-objaverse.sh
 
+# GPU_IDS=1 NGPUS=1 BATCH_SIZE=64 GRAD_ACCUM_STEPS=1 MASTER_PORT=29524 \
+# COORDINATE_MODE=morton_rank FLOW_COUPLING=morton RANDOM_ROTATE=True \
+# LR_WARMUP_STEPS=2000 LR_WARMUP_START_FACTOR=0.03333333333333333 \
+# GS_FOURIER_INPUT_FEATURES="['means']" GS_FOURIER_NUM_FREQUENCIES="{'means': 6}" \
+# GS_FOURIER_INCLUDE_RAW=True GS_FOURIER_LOG_SAMPLING=True GS_FOURIER_MAX_FREQUENCY_LOG2='{}' \
+# GS_FEATURE_LOSS_WEIGHTS='{}' EVAL_SCENE_NAME=${EVAL_SCENE_NAME:-3e288ee8aced4a0797e66d53536112b1} \
+# OUTPUT_DIR=${OUTPUT_ROOT:-/project2/ricky/outputs/$(date +%m%d)}/noise_to_gs_morton_fourier_means6_rotate \
+# bash scripts/train-noise-to-gs-on-objaverse.sh
+
+# Predict clean Gaussians and train with velocity loss.
 GPU_IDS=1 NGPUS=1 BATCH_SIZE=64 GRAD_ACCUM_STEPS=1 MASTER_PORT=29524 \
 COORDINATE_MODE=morton_rank FLOW_COUPLING=morton RANDOM_ROTATE=True \
+MODEL_OUTPUT_TYPE=x PREDICTION_TYPE=velocity \
 LR_WARMUP_STEPS=2000 LR_WARMUP_START_FACTOR=0.03333333333333333 \
 GS_FOURIER_INPUT_FEATURES="['means']" GS_FOURIER_NUM_FREQUENCIES="{'means': 6}" \
 GS_FOURIER_INCLUDE_RAW=True GS_FOURIER_LOG_SAMPLING=True GS_FOURIER_MAX_FREQUENCY_LOG2='{}' \
 GS_FEATURE_LOSS_WEIGHTS='{}' EVAL_SCENE_NAME=${EVAL_SCENE_NAME:-3e288ee8aced4a0797e66d53536112b1} \
-OUTPUT_DIR=${OUTPUT_ROOT:-/project2/ricky/outputs/$(date +%m%d)}/noise_to_gs_morton_fourier_means6_rotate \
+OUTPUT_DIR=${OUTPUT_ROOT:-/project2/ricky/outputs/$(date +%m%d)}/noise_to_gs_morton_fourier_means6_rotate_x_vloss \
 bash scripts/train-noise-to-gs-on-objaverse.sh
