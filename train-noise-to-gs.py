@@ -128,7 +128,7 @@ def evaluate(model, standardizer, cameras, camera_indices, camera_names, flow_cf
             gaussians = noise_to_gs.sample_flow_model(
                 model, FLAGS.gs_count, 0, flow_cfg["flow_steps"], standardizer,
                 noise_seed=evaluation_seed(flow_cfg["eval_noise_seed"], slot), t_eps=flow_cfg["flow_t_eps"],
-                coupling=flow_cfg["coupling"]
+                coupling=flow_cfg["coupling"], model_output_type=flow_cfg["model_output_type"]
             )
             sh_degree_zero = model.sh_degree == 0
             gs_utils.export_ply_forviewer(gaussians, slot_dir / "output.ply", sh_degree_zero=sh_degree_zero)
@@ -260,11 +260,15 @@ def training():
                          for target, time in zip(targets, times)]
                 sync = model.no_sync() if distributed and microbatch_index < len(sizes) - 1 else nullcontext()
                 with sync, torch.cuda.amp.autocast(enabled=config["enable_amp"]):
-                    predictions = model(batch_flow_gs=[query for query, _ in paths],
-                                        batch_scene_idx=[0] * len(paths), batch_reference_means=None,
-                                        t=torch.stack(times))
-                    loss_parts = [noise_to_gs_training.attribute_mse(prediction, velocity, flow_cfg["feature_loss_weights"])
-                                  for prediction, (_, velocity) in zip(predictions, paths)]
+                    outputs = model(batch_flow_gs=[query for query, _ in paths],
+                                    batch_scene_idx=[0] * len(paths), batch_reference_means=None,
+                                    t=torch.stack(times))
+                    predictions = [noise_to_gs.convert_prediction(output, query, time, flow_cfg["model_output_type"],
+                                                                   flow_cfg["prediction_type"])
+                                   for output, (query, _), time in zip(outputs, paths, times)]
+                    loss_targets = targets if flow_cfg["prediction_type"] == "x" else [velocity for _, velocity in paths]
+                    loss_parts = [noise_to_gs_training.attribute_mse(prediction, target, flow_cfg["feature_loss_weights"])
+                                  for prediction, target in zip(predictions, loss_targets)]
                     summed = sum(parts[0] for parts in loss_parts)
                     loss = summed / FLAGS.batch_size
                 if config["enable_amp"]:
@@ -275,7 +279,7 @@ def training():
                 if step % config["log_interval"] == 0:
                     feature_loss_sum += sum(torch.stack([parts[1][key].detach() for key in STATISTIC_KEYS])
                                             for parts in loss_parts)
-                del scenes, targets, paths, predictions, loss
+                del scenes, targets, paths, outputs, predictions, loss_targets, loss
             if config["enable_amp"]:
                 previous_scale = scaler.get_scale()
                 scaler.unscale_(optimizer)

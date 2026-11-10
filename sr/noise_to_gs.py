@@ -12,11 +12,14 @@ from utils.spatial_coordinates import morton_order
 
 @gin.configurable
 def flow_matching(gs_statistics_path, flow_steps=10, flow_t_eps=1e-4, eval_noise_seed=0,
-                  normalization_variance_floor=1e-8, coupling="random", feature_loss_weights=None):
+                  normalization_variance_floor=1e-8, coupling="random", feature_loss_weights=None,
+                  model_output_type="velocity", prediction_type="velocity"):
     if flow_steps < 1 or not 0 < flow_t_eps < 0.5:
         raise ValueError("Expected positive flow_steps and 0 < flow_t_eps < 0.5")
     if coupling not in ("random", "morton"):
         raise ValueError("coupling must be 'random' or 'morton'")
+    if model_output_type not in ("velocity", "x") or prediction_type not in ("velocity", "x"):
+        raise ValueError("model_output_type and prediction_type must be 'velocity' or 'x'")
     weights = {} if feature_loss_weights is None else dict(feature_loss_weights)
     if set(weights) - set(STATISTIC_KEYS):
         raise ValueError(f"Unknown feature loss weights: {sorted(set(weights) - set(STATISTIC_KEYS))}")
@@ -26,7 +29,8 @@ def flow_matching(gs_statistics_path, flow_steps=10, flow_t_eps=1e-4, eval_noise
     return {"gs_statistics_path": gs_statistics_path, "flow_steps": flow_steps,
             "flow_t_eps": flow_t_eps, "eval_noise_seed": eval_noise_seed,
             "normalization_variance_floor": normalization_variance_floor, "coupling": coupling,
-            "feature_loss_weights": weights}
+            "feature_loss_weights": weights, "model_output_type": model_output_type,
+            "prediction_type": prediction_type}
 
 
 def validate_coupling(model, coupling):
@@ -65,7 +69,7 @@ def construct_path(target, time, noise=None, coupling="random"):
     return state, velocity
 
 
-def predict_velocity(model, states, scene_indices, time, standardizer, reference_means=None):
+def predict_model_output(model, states, scene_indices, time, standardizer, reference_means=None):
     """Supply physical state coordinates to point backbones or fixed DiT references."""
     references = reference_means
     if model.backbone_type != "DIT":
@@ -76,7 +80,20 @@ def predict_velocity(model, states, scene_indices, time, standardizer, reference
                  batch_reference_means=references, t=time)
 
 
-def rollout(model, noise, scene_idx, steps, standardizer, t_eps=1e-4, reference_means=None, on_state=None):
+def convert_prediction(output, state, time, model_output_type, prediction_type):
+    """Convert standardized model outputs between endpoint and velocity."""
+    if model_output_type not in ("velocity", "x") or prediction_type not in ("velocity", "x"):
+        raise ValueError("model_output_type and prediction_type must be 'velocity' or 'x'")
+    if model_output_type == prediction_type:
+        return output
+    if model_output_type == "velocity" and prediction_type == "x":
+        return {key: state[key] + (1 - time) * output[key] for key in STATISTIC_KEYS}
+    if model_output_type == "x" and prediction_type == "velocity":
+        return {key: (output[key] - state[key]) / (1 - time) for key in STATISTIC_KEYS}
+
+
+def rollout(model, noise, scene_idx, steps, standardizer, t_eps=1e-4, reference_means=None, on_state=None,
+            model_output_type="velocity"):
     if steps < 1 or not 0 < t_eps < 0.5:
         raise ValueError("Expected positive flow steps and 0 < t_eps < 0.5")
     state = noise
@@ -85,7 +102,8 @@ def rollout(model, noise, scene_idx, steps, standardizer, t_eps=1e-4, reference_
         on_state(0, state)
     for step in range(steps):
         time = state["means"].new_tensor([min(max(step / steps, t_eps), 1 - t_eps)])
-        velocity = predict_velocity(model, [state], [scene_idx], time, standardizer, references)[0]
+        output = predict_model_output(model, [state], [scene_idx], time, standardizer, references)[0]
+        velocity = convert_prediction(output, state, time, model_output_type, "velocity")
         state = {key: state[key] + velocity[key] / steps for key in STATISTIC_KEYS}
         if on_state is not None:
             on_state(step + 1, state)
@@ -94,7 +112,7 @@ def rollout(model, noise, scene_idx, steps, standardizer, t_eps=1e-4, reference_
 
 @torch.no_grad()
 def sample_flow_model(model, count, scene_idx, steps, standardizer, noise_seed=0, t_eps=1e-4,
-                      reference_means=None, coupling="random"):
+                      reference_means=None, coupling="random", model_output_type="velocity"):
     """Generate a scene from noise, optionally conditioned on fixed GT coordinates."""
     device = next(model.parameters()).device
     generator = torch.Generator(device=device).manual_seed(int(noise_seed) + int(scene_idx))
@@ -103,7 +121,8 @@ def sample_flow_model(model, count, scene_idx, steps, standardizer, noise_seed=0
     was_training = model.training
     model.eval()
     try:
-        endpoint = rollout(model, noise, scene_idx, steps, standardizer, t_eps, reference_means)
+        endpoint = rollout(model, noise, scene_idx, steps, standardizer, t_eps, reference_means,
+                           model_output_type=model_output_type)
     finally:
         model.train(was_training)
     return standardizer.decode(endpoint)

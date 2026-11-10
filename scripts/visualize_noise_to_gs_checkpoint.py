@@ -132,7 +132,7 @@ def load_experiment(args):
 
 @torch.no_grad()
 def record_sample(model, count, scene_idx, standardizer, steps, t_eps, seed, reference_means=None,
-                  initial_noise=None, coupling="random"):
+                  initial_noise=None, coupling="random", model_output_type="velocity"):
     """Record physical Gaussian states using the same seeded Euler rollout as evaluation."""
     device = next(model.parameters()).device
     noise_to_gs.validate_coupling(model, coupling)
@@ -145,7 +145,8 @@ def record_sample(model, count, scene_idx, standardizer, steps, t_eps, seed, ref
     try:
         noise_to_gs.rollout(model, initial_noise, scene_idx, steps, standardizer, t_eps, reference_means,
                             on_state=lambda _, state: states.append({key: value.detach().cpu()
-                                                                     for key, value in standardizer.decode(state).items()}))
+                                                                     for key, value in standardizer.decode(state).items()}),
+                            model_output_type=model_output_type)
     finally:
         model.train(was_training)
     return states
@@ -153,7 +154,7 @@ def record_sample(model, count, scene_idx, standardizer, steps, t_eps, seed, ref
 
 @torch.no_grad()
 def record_interpolated_samples(model, count, scene_idx, standardizer, steps, t_eps, seed_a, seed_b,
-                                reference_means=None, on_progress=None, coupling="random"):
+                                reference_means=None, on_progress=None, coupling="random", model_output_type="velocity"):
     """Sample six linear blends of two fixed standardized noise tensors."""
     device = next(model.parameters()).device
     generator_a = torch.Generator(device=device).manual_seed(int(seed_a) + int(scene_idx))
@@ -165,7 +166,8 @@ def record_interpolated_samples(model, count, scene_idx, standardizer, steps, t_
     for index, rate in enumerate(INTERPOLATION_RATES):
         blended = {key: (1 - rate) * noise_a[key] + rate * noise_b[key] for key in noise_a}
         trajectories.append(record_sample(model, count, scene_idx, standardizer, steps, t_eps, seed_a,
-                                          reference_means, initial_noise=blended, coupling=coupling))
+                                          reference_means, initial_noise=blended, coupling=coupling,
+                                          model_output_type=model_output_type))
         if on_progress is not None:
             on_progress(index + 1, len(INTERPOLATION_RATES))
     return trajectories
@@ -361,13 +363,15 @@ class CheckpointViewer:
 
                     trajectories = record_interpolated_samples(
                         model, self.count, self.scene_idx, self.standardizer, steps, self.flow_cfg["flow_t_eps"],
-                        seed_a, seed_b, self.reference_means, on_progress=progress, coupling=self.flow_cfg["coupling"]
+                        seed_a, seed_b, self.reference_means, on_progress=progress, coupling=self.flow_cfg["coupling"],
+                        model_output_type=self.flow_cfg["model_output_type"]
                     )
                     states = trajectories[round(float(self.rate.value) * 5)]
                 else:
                     states = record_sample(model, self.count, self.scene_idx, self.standardizer,
                                            steps, self.flow_cfg["flow_t_eps"], seed_a, self.reference_means,
-                                           coupling=self.flow_cfg["coupling"])
+                                           coupling=self.flow_cfg["coupling"],
+                                           model_output_type=self.flow_cfg["model_output_type"])
                 with self.lock:
                     self.model, self.active_checkpoint = model, path
                     self.active_seed = seed_a
@@ -412,7 +416,8 @@ def main(argv=None):
         _validate_gsplat_available(args.device)
     model, standardizer, count, scene_idx, reference_means, flow_cfg, seed = load_experiment(args)
     states = record_sample(model, count, scene_idx, standardizer, flow_cfg["flow_steps"],
-                           flow_cfg["flow_t_eps"], seed, reference_means, coupling=flow_cfg["coupling"])
+                           flow_cfg["flow_t_eps"], seed, reference_means, coupling=flow_cfg["coupling"],
+                           model_output_type=flow_cfg["model_output_type"])
     print(f"Loaded {args.checkpoint}; sampled {len(states)} states ({count:,} Gaussians)", flush=True)
     if args.dry_run:
         return

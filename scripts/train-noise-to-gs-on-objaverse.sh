@@ -26,6 +26,8 @@ SAVE_INTERVAL=${SAVE_INTERVAL:-5000}
 LOG_INTERVAL=${LOG_INTERVAL:-20}
 FLOW_STEPS=${FLOW_STEPS:-25}
 FLOW_COUPLING=${FLOW_COUPLING:-random}
+MODEL_OUTPUT_TYPE=${MODEL_OUTPUT_TYPE:-velocity}
+PREDICTION_TYPE=${PREDICTION_TYPE:-velocity}
 LR_WARMUP_STEPS=${LR_WARMUP_STEPS:-0}
 LR_WARMUP_START_FACTOR=${LR_WARMUP_START_FACTOR:-0.03333333333333333}
 EVAL_NOISE_SEED=${EVAL_NOISE_SEED:-0}
@@ -89,6 +91,8 @@ torchrun --nnodes=1 --nproc_per_node="${NGPUS}" --rdzv-endpoint="localhost:${MAS
     --gin_param="flow_matching.gs_statistics_path='${GS_STATISTICS_PATH}'" \
     --gin_param="flow_matching.flow_steps=${FLOW_STEPS}" \
     --gin_param="flow_matching.coupling='${FLOW_COUPLING}'" \
+    --gin_param="flow_matching.model_output_type='${MODEL_OUTPUT_TYPE}'" \
+    --gin_param="flow_matching.prediction_type='${PREDICTION_TYPE}'" \
     --gin_param="flow_matching.eval_noise_seed=${EVAL_NOISE_SEED}" \
     --gin_param="training_augmentation.random_rotate=${RANDOM_ROTATE}" \
     --gin_param="training.total_steps=${TOTAL_STEPS}" \

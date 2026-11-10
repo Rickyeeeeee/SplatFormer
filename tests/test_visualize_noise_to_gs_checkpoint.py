@@ -92,6 +92,18 @@ class CheckpointViewerTests(unittest.TestCase):
         for key in STATISTIC_KEYS:
             torch.testing.assert_close(states[-1][key], expected[key])
 
+    def test_x_output_recording_and_interpolation(self):
+        model, standardizer = ConstantVelocity(), UnitStandardizer()
+        states = viewer.record_sample(model, 5, 2, standardizer, 4, 1e-4, 17, model_output_type="x")
+        samples = viewer.record_interpolated_samples(model, 5, 2, standardizer, 4, 1e-4, 17, 23,
+                                                      model_output_type="x")
+        expected = noise_to_gs.sample_flow_model(model, 5, 2, 4, standardizer, noise_seed=17,
+                                                  model_output_type="x")
+        for key in STATISTIC_KEYS:
+            torch.testing.assert_close(states[-1][key], expected[key])
+            torch.testing.assert_close(samples[0][-1][key], expected[key])
+            torch.testing.assert_close(expected[key], torch.full_like(expected[key], 0.25))
+
     def test_interpolated_noise_endpoints_and_middle(self):
         model, standardizer = ConstantVelocity(), UnitStandardizer()
         samples = viewer.record_interpolated_samples(model, 5, 2, standardizer, 3, 1e-4, 17, 23)
@@ -204,7 +216,7 @@ class CheckpointViewerTests(unittest.TestCase):
         instance.standardizer = UnitStandardizer()
         instance.count, instance.scene_idx = 2, 0
         instance.reference_means = None
-        instance.flow_cfg = {"flow_steps": 1, "flow_t_eps": 1e-4}
+        instance.flow_cfg = {"flow_steps": 1, "flow_t_eps": 1e-4, "coupling": "random", "model_output_type": "x"}
         instance.step = types.SimpleNamespace(value=1)
         instance.states = [{"means": torch.tensor([[0., 0., 0.], [1., 1., 1.]])}] * 2
         instance.single_states = instance.states
@@ -276,7 +288,7 @@ class CheckpointViewerTests(unittest.TestCase):
         instance.count, instance.scene_idx = 2, 0
         instance.standardizer = UnitStandardizer()
         instance.reference_means = None
-        instance.flow_cfg = {"flow_t_eps": 1e-4, "coupling": "random"}
+        instance.flow_cfg = {"flow_t_eps": 1e-4, "coupling": "random", "model_output_type": "velocity"}
         instance.states = [object()]
         instance.single_states = instance.states
         instance.interpolated_states = None
@@ -310,7 +322,7 @@ class CheckpointViewerTests(unittest.TestCase):
         instance.count, instance.scene_idx = 2, 0
         instance.standardizer = UnitStandardizer()
         instance.reference_means = None
-        instance.flow_cfg = {"flow_t_eps": 1e-4, "coupling": "random"}
+        instance.flow_cfg = {"flow_t_eps": 1e-4, "coupling": "random", "model_output_type": "velocity"}
         instance.single_states = [object()]
         instance.interpolated_states = [[object()]] * 6
         instance.set_active_states = Mock()

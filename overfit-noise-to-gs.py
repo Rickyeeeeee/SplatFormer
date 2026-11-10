@@ -81,7 +81,8 @@ def evaluate_scene(model, scene, standardizer, flow_cfg, output_dir, ground_trut
         gaussians = noise_to_gs.sample_flow_model(
             model, count, scene["scene_idx"], flow_cfg["flow_steps"], standardizer,
             noise_seed=flow_cfg["eval_noise_seed"], t_eps=flow_cfg["flow_t_eps"],
-            reference_means=reference_means, coupling=flow_cfg["coupling"]
+            reference_means=reference_means, coupling=flow_cfg["coupling"],
+            model_output_type=flow_cfg["model_output_type"]
         )
     os.makedirs(output_dir, exist_ok=True)
     sh_degree_zero = gaussians["features_rest"].shape[1] == 0
@@ -262,12 +263,16 @@ def training(dataset, scene_indices, output_dir, logger, device, total_steps=400
                      for target, time in zip(targets, times)]
             reference_means = [target["means"] for target in targets] if gt_conditioned else None
             with torch.cuda.amp.autocast(enabled=enable_amp):
-                predictions = noise_to_gs.predict_velocity(
+                outputs = noise_to_gs.predict_model_output(
                     model, [query for query, _ in paths], [scene["scene_idx"] for scene in microbatch],
                     torch.stack(times), standardizer, reference_means=reference_means
                 )
-                losses = [noise_to_gs_training.attribute_mse(prediction, velocity, flow_cfg["feature_loss_weights"])
-                          for prediction, (_, velocity) in zip(predictions, paths)]
+                predictions = [noise_to_gs.convert_prediction(output, query, time, flow_cfg["model_output_type"],
+                                                               flow_cfg["prediction_type"])
+                               for output, (query, _), time in zip(outputs, paths, times)]
+                loss_targets = targets if flow_cfg["prediction_type"] == "x" else [velocity for _, velocity in paths]
+                losses = [noise_to_gs_training.attribute_mse(prediction, target, flow_cfg["feature_loss_weights"])
+                          for prediction, target in zip(predictions, loss_targets)]
                 loss = sum(parts[0] for parts in losses) / FLAGS.batch_size
             if enable_amp:
                 scaler.scale(loss).backward()

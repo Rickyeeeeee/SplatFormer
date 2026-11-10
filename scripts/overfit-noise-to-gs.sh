@@ -24,6 +24,8 @@ SAVE_INTERVAL=${SAVE_INTERVAL:-10000}
 LOG_INTERVAL=${LOG_INTERVAL:-20}
 FLOW_STEPS=${FLOW_STEPS:-50}
 FLOW_COUPLING=${FLOW_COUPLING:-random}
+MODEL_OUTPUT_TYPE=${MODEL_OUTPUT_TYPE:-velocity}
+PREDICTION_TYPE=${PREDICTION_TYPE:-velocity}
 FLOW_T_EPS=${FLOW_T_EPS:-1e-4}
 EVAL_NOISE_SEED=${EVAL_NOISE_SEED:-0}
 EVAL_MAX_VIEWS=${EVAL_MAX_VIEWS:-0}
@@ -123,6 +125,8 @@ CUDA_VISIBLE_DEVICES="${GPU_ID}" python overfit-noise-to-gs.py \
     --gin_param="flow_matching.gs_statistics_path='${GS_STATISTICS_PATH}'" \
     --gin_param="flow_matching.flow_steps=${FLOW_STEPS}" \
     --gin_param="flow_matching.coupling='${FLOW_COUPLING}'" \
+    --gin_param="flow_matching.model_output_type='${MODEL_OUTPUT_TYPE}'" \
+    --gin_param="flow_matching.prediction_type='${PREDICTION_TYPE}'" \
     --gin_param="flow_matching.flow_t_eps=${FLOW_T_EPS}" \
     --gin_param="flow_matching.eval_noise_seed=${EVAL_NOISE_SEED}" \
     --gin_param="training_augmentation.random_rotate=${RANDOM_ROTATE}" \
