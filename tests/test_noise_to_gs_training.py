@@ -9,7 +9,7 @@ from unittest import mock
 import torch
 
 from models.gaussian_dit_predictor import GaussianDiTPredictor
-from utils.noise_to_gs_training import (PAD_OPACITY_LOGIT, evenly_spaced_camera_indices,
+from utils.noise_to_gs_training import (PAD_OPACITY_LOGIT, epoch_training_steps, evenly_spaced_camera_indices,
                                         evaluation_seed, mean_feature_losses, prepare_fixed_count_target,
                                         select_available_scenes)
 from utils.spatial_coordinates import morton_order
@@ -17,6 +17,19 @@ from utils.gs_normalization import STATISTIC_KEYS
 
 
 class NoiseToGSTrainingTests(unittest.TestCase):
+    def test_epoch_budget_uses_full_global_batches(self):
+        for epochs, scenes, batch_size, world_size, expected in (
+            (3, 128, 32, 2, 6), (3, 129, 32, 2, 7),
+            (5, 3, 32, 2, 1), (2, 5000, 64, 1, 157),
+            (5000, 1, 32, 1, 157), (5000, 10, 32, 1, 1563),
+            (5000, 1000, 32, 1, 156250),
+        ):
+            with self.subTest(scenes=scenes, world_size=world_size):
+                self.assertEqual(epoch_training_steps(epochs, scenes, batch_size, world_size), expected)
+        for values in ((0, 1, 1, 1), (1, 0, 1, 1), (1, 1, 0, 1), (1, 1, 1, 0)):
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                epoch_training_steps(*values)
+
     def test_feature_loss_sums_preserve_microbatch_and_rank_averages(self):
         # Two ranks each process two unequal microbatches, three scenes per rank.
         scenes = torch.arange(1., 37.).reshape(6, len(STATISTIC_KEYS))
@@ -107,9 +120,13 @@ class NoiseToGSTrainingTests(unittest.TestCase):
         self.assertEqual(evenly_spaced_camera_indices(8), list(range(8)))
         indices = evenly_spaced_camera_indices(128)
         self.assertEqual((indices[0], indices[-1], len(set(indices))), (0, 127, 8))
-        seeds = [evaluation_seed(42, slot) for slot in range(16)]
-        two_ranks = sorted(evaluation_seed(42, slot) for rank in range(2) for slot in range(rank, 16, 2))
-        self.assertEqual(seeds, two_ranks)
+        for count in (1, 7, 16, 19):
+            seeds = [evaluation_seed(42, slot) for slot in range(count)]
+            for world_size in (1, 2, 4):
+                rank_seeds = sorted(evaluation_seed(42, slot) for rank in range(world_size)
+                                    for slot in range(rank, count, world_size))
+                self.assertEqual(seeds, rank_seeds)
+            self.assertEqual(seeds, [evaluation_seed(42, slot) for slot in range(count)])
 
 
 if __name__ == "__main__":

@@ -91,7 +91,7 @@ class RotationTrainingTests(unittest.TestCase):
                                      batch_size=2, grad_accum_steps=1, eval_subdir="eval_final")
 
     def run_training(self, seed, rotate=True, coordinate_mode="morton_rank", scene_indices=(0,), steps=1,
-                     eval_interval=1, save_interval=None):
+                     eval_interval=1, save_interval=None, ema_enabled=False):
         torch.manual_seed(seed)
         self.dataset.load_tgt_images = True
         self.dataset.loaded_images = []
@@ -130,13 +130,28 @@ class RotationTrainingTests(unittest.TestCase):
             SCRIPT.training(self.dataset, scene_indices, output_dir, mock.Mock(), torch.device("cpu"),
                             total_steps=steps, eval_interval=eval_interval,
                             save_interval=save_interval or steps + 1,
-                            log_interval=1, enable_amp=False)
+                            log_interval=1, enable_amp=False, ema_enabled=ema_enabled)
             report_path = Path(output_dir) / "eval_final" / "metrics.json"
             report = json.loads(report_path.read_text()) if report_path.exists() else None
             calls = evaluate_mock.call_args_list[:]
             checkpoints = [call.args[1] for call in save_mock.call_args_list]
             loaded_images = self.dataset.loaded_images[:]
         return captured, FakeStandardizer.encoded[:], models[0], report, calls, checkpoints, loaded_images
+
+    def test_ema_evaluation_updates_and_checkpoints(self):
+        self.flags.grad_accum_steps = 2
+        with mock.patch.object(SCRIPT, "update_ema_model", wraps=SCRIPT.update_ema_model) as update:
+            _, _, model, _, calls, checkpoints, _ = self.run_training(
+                12, rotate=True, steps=2, save_interval=2, ema_enabled=True
+            )
+        self.assertEqual(update.call_count, 2)
+        evaluated = [call.args[0] for call in calls]
+        self.assertTrue(all(item is not model and not item.training for item in evaluated))
+        self.assertTrue(any(path.endswith("model_ema_00000001.pth") for path in checkpoints))
+        self.assertTrue(any(path.endswith("model_ema_last.pth") for path in checkpoints))
+        _, _, model, _, calls, checkpoints, _ = self.run_training(12, rotate=True)
+        self.assertTrue(all(call.args[0] is model for call in calls))
+        self.assertFalse(any("model_ema_" in path for path in checkpoints))
 
     def test_rotates_each_draw_before_encoding_and_resorts_morton_slots(self):
         targets, encoded, _, _, _, _, _ = self.run_training(12)

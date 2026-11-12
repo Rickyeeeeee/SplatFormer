@@ -29,6 +29,14 @@ def mean_feature_losses(feature_loss_sum, scene_count, weights):
     return raw, weighted
 
 
+def epoch_training_steps(epochs, scene_count, batch_size, world_size):
+    """Convert epochs to full global-batch optimizer steps."""
+    if min(epochs, scene_count, batch_size, world_size) < 1:
+        raise ValueError("epochs, scene_count, batch_size, and world_size must be positive")
+    global_batch_size = batch_size * world_size
+    return (epochs * scene_count + global_batch_size - 1) // global_batch_size
+
+
 def select_available_scenes(dataset, splat_dir, scene_count=-1):
     """Keep listed scenes with a checkpoint in the supplied splat directory."""
     if scene_count != -1 and (scene_count < 1 or scene_count > len(dataset.folders)):

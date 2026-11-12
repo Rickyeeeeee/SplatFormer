@@ -19,6 +19,7 @@ from utils import gpu_utils, gs_utils, noise_to_gs_training
 from utils.data_augmentation import (rotate_gaussians, sample_uniform_rotation_quaternion,
                                      sample_uniform_z_rotation_quaternion, validate_rotation_max_degrees)
 from utils.gpu_utils import seed_everything
+from utils.ema import create_ema_model, update_ema_model
 from utils.gs_normalization import GaussianStandardizer, STATISTIC_KEYS
 from utils.log_utils import ProcessSafeLogger
 from utils.loss_utils import SUPPORTED_GS_KEYS
@@ -129,7 +130,8 @@ def evaluate_scene(model, scene, standardizer, flow_cfg, output_dir, ground_trut
 
 @gin.configurable
 def training(dataset, scene_indices, output_dir, logger, device, total_steps=4000, eval_interval=500,
-             save_interval=4000, log_interval=20, grad_clip_norm=2.0, enable_amp=True):
+             save_interval=4000, log_interval=20, grad_clip_norm=2.0, enable_amp=True,
+             ema_enabled=False, ema_decay=0.9999):
     if total_steps < 1 or eval_interval < 1 or save_interval < 1 or log_interval < 1:
         raise ValueError("Training and reporting intervals must be positive")
     flow_cfg = flow_matching()
@@ -145,6 +147,8 @@ def training(dataset, scene_indices, output_dir, logger, device, total_steps=400
         dataset.load_tgt_images = False
 
     model = GaussianDiTPredictor().to(device)
+    ema_model = create_ema_model(model, ema_enabled, ema_decay)
+    logger.info(f"ema_enabled={ema_enabled} ema_decay={ema_decay}")
     noise_to_gs.validate_coupling(model, flow_cfg["coupling"])
     if augmentation_cfg["random_rotate"] and model.sh_degree > 1:
         raise ValueError("Random rotation supports Gaussian SH degree 0 or 1")
@@ -301,6 +305,8 @@ def training(dataset, scene_indices, output_dir, logger, device, total_steps=400
             optimizer_stepped = True
         if optimizer_stepped:
             scheduler.step()
+            if ema_model is not None:
+                update_ema_model(ema_model, model, ema_decay)
         if step % log_interval == 0:
             raw, weighted = mean_feature_losses(feature_loss_sum, FLAGS.batch_size, flow_cfg["feature_loss_weights"])
             logger.info(f"step={step} loss={weighted_loss:.6f} lr={optimizer.param_groups[0]['lr']:.8f} "
@@ -316,7 +322,8 @@ def training(dataset, scene_indices, output_dir, logger, device, total_steps=400
             with torch.random.fork_rng(devices=[device]):
                 for scene in prepared:
                     scene_dir = os.path.join(eval_dir, scene["scene_name"])
-                    result = evaluate_scene(model, scene, standardizer, flow_cfg, scene_dir, ply_only=ply_only)
+                    result = evaluate_scene(ema_model if ema_model is not None else model, scene, standardizer, flow_cfg,
+                                            scene_dir, ply_only=ply_only)
                     if ply_only:
                         logger.info(f"PLY step={step} sample_slot={scene['scene_name']}")
                     else:
@@ -334,7 +341,11 @@ def training(dataset, scene_indices, output_dir, logger, device, total_steps=400
                     handle.write("\n")
         if (step + 1) % save_interval == 0:
             torch.save(model.state_dict(), os.path.join(output_dir, "checkpoints", f"model_{step:08d}.pth"))
+            if ema_model is not None:
+                torch.save(ema_model.state_dict(), os.path.join(output_dir, "checkpoints", f"model_ema_{step:08d}.pth"))
     torch.save(model.state_dict(), os.path.join(output_dir, "checkpoints", "model_last.pth"))
+    if ema_model is not None:
+        torch.save(ema_model.state_dict(), os.path.join(output_dir, "checkpoints", "model_ema_last.pth"))
 
 
 def main(argv):

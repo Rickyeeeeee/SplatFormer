@@ -22,6 +22,8 @@ TOTAL_STEPS=${TOTAL_STEPS:-10000}
 EVAL_INTERVAL=${EVAL_INTERVAL:-1000}
 SAVE_INTERVAL=${SAVE_INTERVAL:-10000}
 LOG_INTERVAL=${LOG_INTERVAL:-20}
+EMA_ENABLED=${EMA_ENABLED:-False}
+EMA_DECAY=${EMA_DECAY:-0.9999}
 FLOW_STEPS=${FLOW_STEPS:-50}
 FLOW_COUPLING=${FLOW_COUPLING:-random}
 MODEL_OUTPUT_TYPE=${MODEL_OUTPUT_TYPE:-v}
@@ -138,6 +140,8 @@ CUDA_VISIBLE_DEVICES="${GPU_ID}" python overfit-noise-to-gs.py \
     --gin_param="training.eval_interval=${EVAL_INTERVAL}" \
     --gin_param="training.save_interval=${SAVE_INTERVAL}" \
     --gin_param="training.log_interval=${LOG_INTERVAL}" \
+    --gin_param="training.ema_enabled=${EMA_ENABLED}" \
+    --gin_param="training.ema_decay=${EMA_DECAY}" \
     --gin_param="train2D/build_scheduler.total_step=${TOTAL_STEPS}" \
     --gin_param="train2D/build_scheduler.warmup_step=${LR_WARMUP_STEPS}" \
     --gin_param="train2D/build_scheduler.warmup_start_factor=${LR_WARMUP_START_FACTOR}" \

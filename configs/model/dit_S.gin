@@ -1,3 +1,5 @@
 GaussianDiT.depth = 12
 GaussianDiT.channels = 384
 GaussianDiT.num_heads = 6
+# GaussianDiT.channels = 192
+# GaussianDiT.num_heads = 3
