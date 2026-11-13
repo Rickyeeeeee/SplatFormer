@@ -98,15 +98,13 @@ export CACHE_DATASET_ON_GPU=True GPU_CACHE_HEADROOM_GIB=4
 # OUTPUT_DIR=/project2/ricky/outputs/$(date +%m%d)/shapenet_noise_to_gs_B_100_scenes_ema_p32_vloss \
 # bash scripts/train-noise-to-gs-on-shapenet.sh
 
-TRAIN_SCENE_COUNT=100 EPOCHS=25600 DIT_PATCH_SIZE=32 BATCH_SIZE=256 FLOW_COUPLING=random DIT_SIZE=B \
-PREDICTION_TYPE=v \
-OUTPUT_DIR=/project2/ricky/outputs/$(date +%m%d)/shapenet_noise_to_gs_B_100_scenes_ema_p32_random \
-bash scripts/train-noise-to-gs-on-shapenet.sh
+# TRAIN_SCENE_COUNT=100 EPOCHS=25600 DIT_PATCH_SIZE=32 BATCH_SIZE=256 FLOW_COUPLING=random DIT_SIZE=B \
+# PREDICTION_TYPE=v \
+# OUTPUT_DIR=/project2/ricky/outputs/$(date +%m%d)/shapenet_noise_to_gs_B_100_scenes_ema_p32_random \
+# bash scripts/train-noise-to-gs-on-shapenet.sh
 
 TRAIN_SCENE_COUNT=1000 EPOCHS=51200 DIT_PATCH_SIZE=32 BATCH_SIZE=512 GRAD_ACCUM_STEPS=2 DIT_SIZE=B \
 PREDICTION_TYPE=v FLOW_COUPLING=random \
-LR_WARMUP_STEPS=2000 \
-LR_WARMUP_START_FACTOR=0.03333333333333333 \
 OUTPUT_DIR=/project2/ricky/outputs/$(date +%m%d)/shapenet_noise_to_gs_B_1000_scenes_ema_p32_random \
 bash scripts/train-noise-to-gs-on-shapenet.sh
 
